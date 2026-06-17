@@ -86,15 +86,20 @@ jobs:
           ./configure --with-compat --with-http_ssl_module \
             --add-dynamic-module="$GITHUB_WORKSPACE" > /tmp/conf.log 2>&1 \
             || { tail -40 /tmp/conf.log; exit 1; }
-          make modules > /tmp/make.log 2>&1 || { tail -40 /tmp/make.log; exit 1; }
+          # Full build (not `make modules`): the load test needs the server
+          # binary too. angie names it objs/angie, nginx names it objs/nginx.
+          make > /tmp/make.log 2>&1 || { tail -40 /tmp/make.log; exit 1; }
           test -f objs/ngx_http_autocert_module.so
-          echo "✓ built ngx_http_autocert_module.so"
+          BIN=objs/nginx; [ -x objs/angie ] && BIN=objs/angie
+          test -x "$BIN"
+          echo "SERVER_BIN=$PWD/$BIN" >> "$GITHUB_ENV"
+          echo "✓ built ngx_http_autocert_module.so + $BIN"
 
       - name: Load smoke test (config parse)
         run: |
           set -euo pipefail
           cd "${{ matrix.dir }}"
-          BIN=objs/nginx
+          BIN="$SERVER_BIN"
           MOD="$PWD/objs/ngx_http_autocert_module.so"
           PREFIX=/tmp/ngx-test
           mkdir -p "$PREFIX/logs" "$PREFIX/conf"
@@ -123,7 +128,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "${{ matrix.dir }}"
-          BIN=objs/nginx
+          BIN="$SERVER_BIN"
           MOD="$PWD/objs/ngx_http_autocert_module.so"
           PREFIX=/tmp/ngx-bad
           mkdir -p "$PREFIX/logs" "$PREFIX/conf"
