@@ -6,10 +6,17 @@ ngx_addon_name=ngx_http_autocert_module
 if test -n "$ngx_module_link"; then
     ngx_module_type=HTTP
     ngx_module_name=ngx_http_autocert_module
-    ngx_module_srcs="$ngx_addon_dir/src/ngx_http_autocert_module.c"
-    ngx_module_libs=
+    ngx_module_srcs="$ngx_addon_dir/src/ngx_http_autocert_module.c \
+                     $ngx_addon_dir/src/ngx_http_autocert_crypto.c"
+    ngx_module_libs="-lssl -lcrypto"
     . auto/module
 else
     HTTP_MODULES="$HTTP_MODULES ngx_http_autocert_module"
-    NGX_ADDON_SRCS="$NGX_ADDON_SRCS $ngx_addon_dir/src/ngx_http_autocert_module.c"
+    NGX_ADDON_SRCS="$NGX_ADDON_SRCS \
+                    $ngx_addon_dir/src/ngx_http_autocert_module.c \
+                    $ngx_addon_dir/src/ngx_http_autocert_crypto.c"
+    CORE_LIBS="$CORE_LIBS -lssl -lcrypto"
 fi
+
+# Header dependency so the crypto TU rebuilds when its API changes.
+ngx_addon_deps="$ngx_addon_deps $ngx_addon_dir/src/ngx_http_autocert_crypto.h"
