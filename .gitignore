@@ -1,0 +1,7 @@
+*.o
+*.so
+*.lo
+*.la
+.libs/
+tmp/
+objs/
