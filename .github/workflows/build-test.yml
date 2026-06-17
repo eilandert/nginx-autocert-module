@@ -95,7 +95,7 @@ jobs:
           echo "SERVER_BIN=$PWD/$BIN" >> "$GITHUB_ENV"
           echo "✓ built ngx_http_autocert_module.so + $BIN"
 
-      - name: Load smoke test (config parse)
+      - name: Load smoke test (parse + name collection)
         run: |
           set -euo pipefail
           cd "${{ matrix.dir }}"
@@ -108,23 +108,46 @@ jobs:
           events {}
           http {
               autocert on admin@example.com;   # global
+              # M2 global tuning knobs (all non-default values).
+              autocert_ca https://acme-staging-v02.api.letsencrypt.org/directory;
+              autocert_renew_before 10d;
+              autocert_key_type secp256r1;
+              autocert_store certbot;
+              autocert_path /var/lib/autocert;
+              autocert_challenge tls-alpn-01;
               server {
                   listen 8080;
-                  server_name a.example.com;
-                  autocert on;                  # per-vhost override
+                  server_name a.example.com www.a.example.com;
+                  autocert on;                  # per-vhost override, 2 names
               }
               server {
                   listen 8081;
                   server_name b.example.com;
-                  autocert off;                 # opt out
+                  autocert off;                 # opt out, name NOT collected
+              }
+              server {
+                  listen 8082;
+                  # regex + leading/suffix wildcard names are skipped (not issuable).
+                  server_name ~^re\.example\.com$ *.wild.example.com www.suffix.*;
+                  autocert on;
               }
           }
           EOF
-          # -t parses config and loads the module; exits non-zero on any error.
+          # 1) -t: config parses, module loads, postconfig walk runs clean.
           "$BIN" -t -p "$PREFIX" -c "$PREFIX/conf/nginx.conf"
-          echo "✓ ${{ matrix.flavor }} ${{ matrix.version }} loaded module + parsed autocert directives"
+          # 2) The postconfig name-count NOTICE is only emitted on a real start
+          #    (nginx gates notice-level output under -t), so briefly start,
+          #    grep the error log, then stop. High ports → no root needed.
+          "$BIN" -p "$PREFIX" -c "$PREFIX/conf/nginx.conf"
+          for i in $(seq 1 20); do [ -s "$PREFIX/logs/error.log" ] && break; sleep 0.2; done
+          "$BIN" -p "$PREFIX" -c "$PREFIX/conf/nginx.conf" -s stop || true
+          cat "$PREFIX/logs/error.log"
+          # Exactly the 2 concrete names of the enabled vhost must be collected:
+          # b.* is off; regex + wildcard are skipped; dedup across vhosts.
+          grep -q 'autocert: 2 name(s) enabled for issuance' "$PREFIX/logs/error.log"
+          echo "✓ ${{ matrix.flavor }} ${{ matrix.version }} parsed autocert_* + collected enabled names"
 
-      - name: Reject invalid config (negative test)
+      - name: Reject invalid config (negative tests)
         run: |
           set -euo pipefail
           cd "${{ matrix.dir }}"
@@ -132,18 +155,28 @@ jobs:
           MOD="$PWD/objs/ngx_http_autocert_module.so"
           PREFIX=/tmp/ngx-bad
           mkdir -p "$PREFIX/logs" "$PREFIX/conf"
-          cat > "$PREFIX/conf/nginx.conf" <<EOF
-          load_module $MOD;
-          events {}
-          http {
-              server {
-                  listen 8080;
-                  autocert on not-an-email;
-              }
+
+          # Each case: a description, the http{} body, and the substring the
+          # rejection message must contain. Every one must fail `nginx -t`.
+          run_neg() {
+            local desc="$1" body="$2" want="$3"
+            printf 'load_module %s;\nevents {}\nhttp {\n%s\n}\n' \
+              "$MOD" "$body" > "$PREFIX/conf/nginx.conf"
+            if "$BIN" -t -p "$PREFIX" -c "$PREFIX/conf/nginx.conf" 2>/tmp/err; then
+              echo "::error::[$desc] invalid config was accepted"; cat /tmp/err
+              exit 1
+            fi
+            if ! grep -q "$want" /tmp/err; then
+              echo "::error::[$desc] wrong error message (wanted: $want)"
+              cat /tmp/err; exit 1
+            fi
+            echo "✓ rejected: $desc"
           }
-          EOF
-          if "$BIN" -t -p "$PREFIX" -c "$PREFIX/conf/nginx.conf" 2>/tmp/err; then
-            echo "::error::invalid email was accepted"; cat /tmp/err; exit 1
-          fi
-          grep -q 'invalid email' /tmp/err
-          echo "✓ invalid email rejected as expected"
+
+          run_neg "invalid email"     'server { listen 8080; autocert on x@; }'                          'invalid email'
+          run_neg "bad key_type"      'autocert_key_type rsa2048;'                                       'invalid key type'
+          run_neg "bad store"         'autocert_store vault;'                                            'invalid store'
+          run_neg "bad challenge"     'autocert_challenge dns-01;'                                       'invalid challenge'
+          run_neg "duplicate key"     'autocert_key_type secp384r1; autocert_key_type secp256r1;'        'is duplicate'
+          run_neg "knob in server{}"  'server { listen 8080; autocert_ca http://x/; }'                   'directive is not allowed'
+          echo "✓ all negative cases rejected"

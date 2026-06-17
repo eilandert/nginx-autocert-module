@@ -11,15 +11,16 @@ certificate from an ACME CA (Let's Encrypt by default) for that vhost's
   workers; the on-disk store is root-only (or certbot-compatible) by choice.
 - Builds and runs on both **nginx** and **angie**.
 
-> **Status: under construction.** M0 (module scaffold + `autocert` directive)
-> is in place and builds/loads on nginx + angie. ACME issuance lands in later
-> milestones — see the roadmap. Not yet usable for real certificates.
+> **Status: under construction.** M0 (`autocert` directive) and M2 (the global
+> `autocert_*` config model + enabled-name collection) are in place and
+> build/load on nginx + angie. The directives parse and validate, and the set
+> of `server_name`s to provision is resolved at config time — but no ACME
+> issuance happens yet (helper + client land in later milestones). Not yet
+> usable for real certificates.
 
-## Directive (current)
+## Directives
 
-```nginx
-autocert on|off [email];
-```
+### `autocert on|off [email];`
 
 Valid in `http` (global) and `server` (per-vhost). Optional `email` is the ACME
 account contact. A per-vhost value overrides the global one.
@@ -30,8 +31,8 @@ http {
 
     server {
         listen 443 ssl;
-        server_name a.example.com;
-        autocert on;                   # inherits/uses the global account
+        server_name a.example.com www.a.example.com;
+        autocert on;                   # both names provisioned
     }
 
     server {
@@ -42,16 +43,29 @@ http {
 }
 ```
 
-## Planned directives (later milestones)
+### Global tuning knobs
+
+These are `http{}`-only (a single ACME policy for the instance):
 
 ```nginx
-autocert_ca <url>;                  # default: Let's Encrypt production
-autocert_renew_before 7d;           # renew this long before expiry
-autocert_key_type secp384r1;        # secp384r1 (default) | secp256r1
-autocert_store secure|certbot;      # 0700 root-only | certbot live/+archive/
-autocert_path <dir>;                # store location
-autocert_challenge http-01|tls-alpn-01;
+autocert_ca <url>;                  # ACME directory URL
+                                    #   default: Let's Encrypt production
+autocert_renew_before 7d;           # renew this long before expiry (default 7d)
+autocert_key_type secp384r1;        # secp384r1 (default) | secp256r1 — ECDSA only
+autocert_store secure|certbot;      # secure = 0700 root-only (default)
+                                    #   certbot = live/ + archive/ symlink layout
+autocert_path <dir>;                # store location (default: autocert)
+autocert_challenge http-01|tls-alpn-01;  # default: http-01
 ```
+
+### Which names get provisioned
+
+For every vhost with `autocert on`, the module collects its concrete
+`server_name`s (deduplicated across vhosts). **Skipped**: vhosts set `autocert
+off`, the empty catch-all `""`, and wildcard (`*.x` / `.x`) or regex (`~…`)
+`server_name`s — a single ACME order can't cover those (DNS-01 wildcard support
+is deferred). The resolved name set is published to a shared-memory zone for the
+ACME helper to consume.
 
 ## Architecture (target)
 
