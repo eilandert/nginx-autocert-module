@@ -90,10 +90,11 @@ jobs:
           # binary too. angie names it objs/angie, nginx names it objs/nginx.
           make > /tmp/make.log 2>&1 || { tail -40 /tmp/make.log; exit 1; }
           test -f objs/ngx_http_autocert_module.so
+          test -f objs/ngx_autocert_process_module.so   # CORE module (M4a helper)
           BIN=objs/nginx; [ -x objs/angie ] && BIN=objs/angie
           test -x "$BIN"
           echo "SERVER_BIN=$PWD/$BIN" >> "$GITHUB_ENV"
-          echo "✓ built ngx_http_autocert_module.so + $BIN"
+          echo "✓ built autocert .so (http + process) + $BIN"
 
       - name: Load smoke test (parse + name collection)
         run: |
@@ -101,9 +102,11 @@ jobs:
           cd "${{ matrix.dir }}"
           BIN="$SERVER_BIN"
           MOD="$PWD/objs/ngx_http_autocert_module.so"
+          PROC="$PWD/objs/ngx_autocert_process_module.so"
           PREFIX=/tmp/ngx-test
           mkdir -p "$PREFIX/logs" "$PREFIX/conf"
           cat > "$PREFIX/conf/nginx.conf" <<EOF
+          load_module $PROC;
           load_module $MOD;
           events {}
           http {
@@ -180,6 +183,17 @@ jobs:
           run_neg "duplicate key"     'autocert_key_type secp384r1; autocert_key_type secp256r1;'        'is duplicate'
           run_neg "knob in server{}"  'server { listen 8080; autocert_ca http://x/; }'                   'directive is not allowed'
           echo "✓ all negative cases rejected"
+
+      - name: Helper process lifecycle (M4a)
+        run: |
+          set -euo pipefail
+          # Channel-managed ACME helper: start spawns one, reload x2 keeps exactly
+          # one (old retired, new respawned), crash auto-respawns, stop tears down
+          # cleanly with no SIGKILL/hang. Runs against this matrix flavor's build
+          # (nginx mainline+stable AND angie), reusing the dir from the build step.
+          NGX_BUILD_DIR="$GITHUB_WORKSPACE/${{ matrix.dir }}" \
+            AC_TEST_PORT=18177 \
+            bash "$GITHUB_WORKSPACE/tests/helper-lifecycle.sh"
 
   crypto-unit:
     name: Crypto unit tests (M3)
