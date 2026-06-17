@@ -1,22 +1,36 @@
 ngx_addon_name=ngx_http_autocert_module
 
-# Built as a dynamic module (load_module). The else branch is the legacy
-# static-link path for pre-1.9.11 nginx that lacks $ngx_module_link / auto/module;
-# kept for completeness but the module is intended to be loaded dynamically.
+# Two modules ship from this addon:
+#   - ngx_autocert_process_module : CORE module; spawns the privileged ACME
+#                                   helper process from the master.
+#   - ngx_http_autocert_module    : HTTP module; directives, config model,
+#                                   crypto, and (later) per-SNI cert serving.
+#
+# Built as dynamic modules (load_module); each auto/module call emits its own
+# .so. The else branch is the legacy static-link path for pre-1.9.11 nginx that
+# lacks $ngx_module_link / auto/module; kept for completeness but the modules
+# are intended to be loaded dynamically.
 if test -n "$ngx_module_link"; then
+    ngx_module_type=CORE
+    ngx_module_name=ngx_autocert_process_module
+    ngx_module_srcs="$ngx_addon_dir/src/ngx_autocert_process.c"
+    ngx_module_libs=
+    ngx_module_deps=
+    . auto/module
+
     ngx_module_type=HTTP
     ngx_module_name=ngx_http_autocert_module
     ngx_module_srcs="$ngx_addon_dir/src/ngx_http_autocert_module.c \
                      $ngx_addon_dir/src/ngx_http_autocert_crypto.c"
     ngx_module_libs="-lssl -lcrypto"
+    ngx_module_deps="$ngx_addon_dir/src/ngx_http_autocert_crypto.h"
     . auto/module
 else
+    CORE_MODULES="$CORE_MODULES ngx_autocert_process_module"
     HTTP_MODULES="$HTTP_MODULES ngx_http_autocert_module"
     NGX_ADDON_SRCS="$NGX_ADDON_SRCS \
+                    $ngx_addon_dir/src/ngx_autocert_process.c \
                     $ngx_addon_dir/src/ngx_http_autocert_module.c \
                     $ngx_addon_dir/src/ngx_http_autocert_crypto.c"
     CORE_LIBS="$CORE_LIBS -lssl -lcrypto"
 fi
-
-# Header dependency so the crypto TU rebuilds when its API changes.
-ngx_addon_deps="$ngx_addon_deps $ngx_addon_dir/src/ngx_http_autocert_crypto.h"

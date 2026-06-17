@@ -11,11 +11,13 @@ certificate from an ACME CA (Let's Encrypt by default) for that vhost's
   workers; the on-disk store is root-only (or certbot-compatible) by choice.
 - Builds and runs on both **nginx** and **angie**.
 
-> **Status: under construction.** M0 (`autocert` directive) and M2 (the global
-> `autocert_*` config model + enabled-name collection) are in place and
-> build/load on nginx + angie. The directives parse and validate, and the set
-> of `server_name`s to provision is resolved at config time — but no ACME
-> issuance happens yet (helper + client land in later milestones). Not yet
+> **Status: under construction.** M0 (`autocert` directive), M2 (the global
+> `autocert_*` config model + enabled-name collection), M3 (ECDSA crypto/JWS
+> primitives) and M4a (the privilege-separated helper **process**) are in place
+> and build/load on nginx + angie. The directives parse and validate, the set
+> of `server_name`s to provision is resolved at config time, and the master now
+> runs a dedicated helper process that survives reloads and crashes — but no
+> ACME issuance happens yet (the outbound ACME client lands in M4b+). Not yet
 > usable for real certificates.
 
 ## Directives
