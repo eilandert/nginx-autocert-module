@@ -1,0 +1,144 @@
+name: Build & Test
+
+# Third-party actions pinned to commit SHAs for supply-chain safety.
+# Pin table (canonical for all workflow files — keep consistent):
+# actions/checkout@v4        -> 34e114876b0b11c390a56381ad16ebd13914f8d5
+# actions/cache@v4           -> 0057852bfaa89a56745cba8c7296529d2fc39830
+# actions/upload-artifact@v4 -> ea165f8d65b6e75b540449e92b4886f43607fa02
+
+# nginx version is NOT pinned: the `resolve` job scrapes nginx.org for the
+# current mainline + stable at run time and feeds them to the build matrix,
+# alongside the pinned Angie fork. The module must build and LOAD on all three.
+
+on:
+  push:
+    branches: [master, main, dev]
+  pull_request:
+    branches: [master, main]
+  schedule:
+    # Weekly Monday 04:17 UTC — catch nginx/angie API drift with no commits.
+    - cron: "17 4 * * 1"
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+
+  resolve:
+    name: Resolve nginx version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.v.outputs.matrix }}
+    steps:
+      - name: Resolve latest mainline + stable nginx
+        id: v
+        run: |
+          set -euo pipefail
+          vers=$(curl -fsSL https://nginx.org/en/download.html \
+            | grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.gz)' \
+            | sort -V)
+          ver=$(echo "$vers" | tail -1)
+          if [ -z "$ver" ]; then
+            echo "::error::could not resolve mainline nginx version"
+            exit 1
+          fi
+          stable=$(echo "$vers" | awk -F. '($2 % 2)==0' | sort -V | tail -1)
+          [ -z "$stable" ] && stable="$ver"
+          echo "Resolved nginx mainline: $ver  stable: $stable"
+          # Angie fork pinned; bump alongside nginx as releases ship.
+          matrix=$(printf 'matrix={"include":[{"flavor":"nginx","version":"%s","url":"https://nginx.org/download/nginx-%s.tar.gz","dir":"nginx-%s"},{"flavor":"nginx","version":"%s","url":"https://nginx.org/download/nginx-%s.tar.gz","dir":"nginx-%s"},{"flavor":"angie","version":"1.11.5","url":"https://download.angie.software/files/angie-1.11.5.tar.gz","dir":"angie-1.11.5"}]}' \
+            "$ver" "$ver" "$ver" "$stable" "$stable" "$stable")
+          { echo "$matrix"; } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build & load (${{ matrix.flavor }} ${{ matrix.version }})
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libpcre2-dev zlib1g-dev libssl-dev
+
+      - name: Fetch ${{ matrix.flavor }} ${{ matrix.version }}
+        run: |
+          set -euo pipefail
+          curl -fsSL -o src.tar.gz "${{ matrix.url }}"
+          tar -xzf src.tar.gz
+
+      - name: Configure + build module
+        run: |
+          set -euo pipefail
+          cd "${{ matrix.dir }}"
+          ./configure --with-compat --with-http_ssl_module \
+            --add-dynamic-module="$GITHUB_WORKSPACE" > /tmp/conf.log 2>&1 \
+            || { tail -40 /tmp/conf.log; exit 1; }
+          make modules > /tmp/make.log 2>&1 || { tail -40 /tmp/make.log; exit 1; }
+          test -f objs/ngx_http_autocert_module.so
+          echo "✓ built ngx_http_autocert_module.so"
+
+      - name: Load smoke test (config parse)
+        run: |
+          set -euo pipefail
+          cd "${{ matrix.dir }}"
+          BIN=objs/nginx
+          MOD="$PWD/objs/ngx_http_autocert_module.so"
+          PREFIX=/tmp/ngx-test
+          mkdir -p "$PREFIX/logs" "$PREFIX/conf"
+          cat > "$PREFIX/conf/nginx.conf" <<EOF
+          load_module $MOD;
+          events {}
+          http {
+              autocert on admin@example.com;   # global
+              server {
+                  listen 8080;
+                  server_name a.example.com;
+                  autocert on;                  # per-vhost override
+              }
+              server {
+                  listen 8081;
+                  server_name b.example.com;
+                  autocert off;                 # opt out
+              }
+          }
+          EOF
+          # -t parses config and loads the module; exits non-zero on any error.
+          "$BIN" -t -p "$PREFIX" -c "$PREFIX/conf/nginx.conf"
+          echo "✓ ${{ matrix.flavor }} ${{ matrix.version }} loaded module + parsed autocert directives"
+
+      - name: Reject invalid config (negative test)
+        run: |
+          set -euo pipefail
+          cd "${{ matrix.dir }}"
+          BIN=objs/nginx
+          MOD="$PWD/objs/ngx_http_autocert_module.so"
+          PREFIX=/tmp/ngx-bad
+          mkdir -p "$PREFIX/logs" "$PREFIX/conf"
+          cat > "$PREFIX/conf/nginx.conf" <<EOF
+          load_module $MOD;
+          events {}
+          http {
+              server {
+                  listen 8080;
+                  autocert on not-an-email;
+              }
+          }
+          EOF
+          if "$BIN" -t -p "$PREFIX" -c "$PREFIX/conf/nginx.conf" 2>/tmp/err; then
+            echo "::error::invalid email was accepted"; cat /tmp/err; exit 1
+          fi
+          grep -q 'invalid email' /tmp/err
+          echo "✓ invalid email rejected as expected"

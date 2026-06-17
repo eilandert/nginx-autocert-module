@@ -1,0 +1,15 @@
+ngx_addon_name=ngx_http_autocert_module
+
+# Built as a dynamic module (load_module). The else branch is the legacy
+# static-link path for pre-1.9.11 nginx that lacks $ngx_module_link / auto/module;
+# kept for completeness but the module is intended to be loaded dynamically.
+if test -n "$ngx_module_link"; then
+    ngx_module_type=HTTP
+    ngx_module_name=ngx_http_autocert_module
+    ngx_module_srcs="$ngx_addon_dir/src/ngx_http_autocert_module.c"
+    ngx_module_libs=
+    . auto/module
+else
+    HTTP_MODULES="$HTTP_MODULES ngx_http_autocert_module"
+    NGX_ADDON_SRCS="$NGX_ADDON_SRCS $ngx_addon_dir/src/ngx_http_autocert_module.c"
+fi
