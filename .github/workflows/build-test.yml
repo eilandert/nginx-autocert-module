@@ -180,3 +180,44 @@ jobs:
           run_neg "duplicate key"     'autocert_key_type secp384r1; autocert_key_type secp256r1;'        'is duplicate'
           run_neg "knob in server{}"  'server { listen 8080; autocert_ca http://x/; }'                   'directive is not allowed'
           echo "✓ all negative cases rejected"
+
+  crypto-unit:
+    name: Crypto unit tests (M3)
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libpcre2-dev zlib1g-dev libssl-dev
+
+      - name: Fetch + configure nginx (for ngx_palloc/string/times objects)
+        run: |
+          set -euo pipefail
+          ver=$(curl -fsSL https://nginx.org/en/download.html \
+            | grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.gz)' \
+            | sort -V | tail -1)
+          curl -fsSL -o src.tar.gz "https://nginx.org/download/nginx-$ver.tar.gz"
+          tar -xzf src.tar.gz
+          echo "NGX=$PWD/nginx-$ver" >> "$GITHUB_ENV"
+          # configure + a full build so the core .o files we link exist.
+          ( cd "nginx-$ver" \
+            && ./configure --with-compat --with-http_ssl_module > /tmp/c.log 2>&1 \
+            && make > /tmp/m.log 2>&1 ) || { tail -40 /tmp/c.log /tmp/m.log; exit 1; }
+
+      - name: Build + run crypto unit tests
+        run: |
+          set -euo pipefail
+          INC="-I$NGX/src/core -I$NGX/src/event -I$NGX/src/os/unix -I$NGX/objs"
+          OBJS="$NGX/objs/src/core/ngx_palloc.o $NGX/objs/src/core/ngx_string.o \
+                $NGX/objs/src/os/unix/ngx_time.o $NGX/objs/src/core/ngx_times.o \
+                $NGX/objs/src/os/unix/ngx_alloc.o"
+          gcc -Wall -Wextra -Werror $INC -o test_crypto \
+            "$GITHUB_WORKSPACE/test/test_crypto.c" \
+            "$GITHUB_WORKSPACE/src/ngx_http_autocert_crypto.c" \
+            $OBJS -lssl -lcrypto
+          ./test_crypto
