@@ -683,7 +683,33 @@ ngx_autocert_account_post(ngx_autocert_account_t *acct, ngx_str_t *url,
     acct->post_data = data;
     acct->post_retried = 0;
 
+    /* Reserve the last-resort failure req/pool NOW, while we can still fail
+     * synchronously (the caller handles a NGX_ERROR return without needing a
+     * req). Once the POST is in flight, the only way to report failure is via
+     * the handler, which must receive a non-NULL req — so this allocation must
+     * not be deferred to the failure path where OOM could leave us with none. */
+    acct->post_fail_pool = ngx_create_pool(NGX_MIN_POOL_SIZE, acct->log);
+    if (acct->post_fail_pool == NULL) {
+        ngx_destroy_pool(acct->post_pool);
+        acct->post_pool = NULL;
+        return NGX_ERROR;
+    }
+    acct->post_fail_req = ngx_pcalloc(acct->post_fail_pool,
+                                      sizeof(ngx_autocert_acme_request_t));
+    if (acct->post_fail_req == NULL) {
+        ngx_destroy_pool(acct->post_fail_pool);
+        acct->post_fail_pool = NULL;
+        ngx_destroy_pool(acct->post_pool);
+        acct->post_pool = NULL;
+        return NGX_ERROR;
+    }
+    acct->post_fail_req->pool = acct->post_fail_pool;
+    acct->post_fail_req->log = acct->log;
+
     if (ngx_autocert_account_send_post(acct) != NGX_OK) {
+        ngx_destroy_pool(acct->post_fail_pool);
+        acct->post_fail_pool = NULL;
+        acct->post_fail_req = NULL;
         ngx_destroy_pool(acct->post_pool);
         acct->post_pool = NULL;
         return NGX_ERROR;
@@ -842,7 +868,6 @@ ngx_autocert_account_post_fail(ngx_autocert_account_t *acct)
 {
     ngx_autocert_acme_handler_pt  handler = acct->post_handler;
     void                         *data = acct->post_data;
-    ngx_pool_t                   *pool;
     ngx_autocert_acme_request_t  *req;
 
     if (acct->post_pool) {
@@ -850,24 +875,29 @@ ngx_autocert_account_post_fail(ngx_autocert_account_t *acct)
         acct->post_pool = NULL;
     }
 
+    /* Hand back the failure req reserved at submit. It is always present once a
+     * POST is in flight, so the caller's handler never sees NULL (which it
+     * ignores, stalling the order). The caller now owns req->pool and destroys
+     * it, as on the success path — so drop our pointers to it here. */
+    req = acct->post_fail_req;
+    acct->post_fail_req = NULL;
+    acct->post_fail_pool = NULL;
+
     if (handler == NULL) {
+        if (req != NULL) {
+            ngx_destroy_pool(req->pool);
+        }
         return;
     }
 
-    pool = ngx_create_pool(NGX_MIN_POOL_SIZE, acct->log);
-    if (pool == NULL) {
-        /* last resort: no pool to build a req — caller must tolerate NULL */
-        handler(NULL, NGX_ERROR);
-        return;
-    }
-    req = ngx_pcalloc(pool, sizeof(ngx_autocert_acme_request_t));
     if (req == NULL) {
-        ngx_destroy_pool(pool);
+        /* Should not happen: a POST is in flight => the req was reserved. */
+        ngx_log_error(NGX_LOG_ERR, acct->log, 0,
+                      "autocert: no reserved failure req");
         handler(NULL, NGX_ERROR);
         return;
     }
-    req->pool = pool;
-    req->log = acct->log;
+
     req->data = data;
     req->status = 0;
 
@@ -933,11 +963,17 @@ ngx_autocert_account_post_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
         return;
     }
 
-    /* Terminal: hand the finished request to the caller, then it owns req->pool
-     * (it must destroy it). Release the per-POST signing pool first. */
+    /* Terminal success: hand the finished request to the caller, then it owns
+     * req->pool (it must destroy it). Release the per-POST signing pool and the
+     * unused reserved failure pool first. */
     if (acct->post_pool) {
         ngx_destroy_pool(acct->post_pool);
         acct->post_pool = NULL;
+    }
+    if (acct->post_fail_pool) {
+        ngx_destroy_pool(acct->post_fail_pool);
+        acct->post_fail_pool = NULL;
+        acct->post_fail_req = NULL;
     }
 
     /* The request carried acct as its data (this handler reads it); hand the
@@ -1015,6 +1051,18 @@ ngx_autocert_account_free(ngx_autocert_account_t *acct)
     if (acct->nonce_pool) {
         ngx_destroy_pool(acct->nonce_pool);
         acct->nonce_pool = NULL;
+    }
+    /* In-flight POST pools (normally NULL when the account is freed — it is
+     * freed only on register failure, before any kid POST — but release them
+     * defensively so a future caller can't leak them). */
+    if (acct->post_pool) {
+        ngx_destroy_pool(acct->post_pool);
+        acct->post_pool = NULL;
+    }
+    if (acct->post_fail_pool) {
+        ngx_destroy_pool(acct->post_fail_pool);
+        acct->post_fail_pool = NULL;
+        acct->post_fail_req = NULL;
     }
     if (acct->pool) {
         ngx_destroy_pool(acct->pool);

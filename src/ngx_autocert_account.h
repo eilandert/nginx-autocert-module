@@ -74,6 +74,15 @@ struct ngx_autocert_account_s {
     void                            *post_data;      /* caller context */
     ngx_uint_t                       post_retried;   /* badNonce retry guard */
     ngx_uint_t                       register_retried; /* newAccount badNonce guard */
+
+    /* Last-resort failure request, reserved up front at submit so the terminal
+     * failure path can ALWAYS hand the caller a non-NULL req even under OOM.
+     * Without it an allocation failure on the failure path delivered a NULL req,
+     * which the order handlers ignore -> the order never finishes and the
+     * single-in-flight scheduler stalls forever. Consumed by post_fail (then
+     * owned by the caller), or freed on the success terminal. */
+    ngx_pool_t                      *post_fail_pool;
+    ngx_autocert_acme_request_t     *post_fail_req;
 };
 
 
