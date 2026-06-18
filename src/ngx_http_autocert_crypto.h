@@ -20,6 +20,7 @@
 #include <ngx_core.h>
 
 #include <openssl/evp.h>
+#include <openssl/x509.h>
 
 
 /* Curve selector — values match ngx_http_autocert_key_type_e in the module. */
@@ -114,6 +115,18 @@ const char *ngx_http_autocert_jws_alg(EVP_PKEY *pkey);
  */
 ngx_int_t ngx_http_autocert_csr_der(ngx_pool_t *pool, EVP_PKEY *pkey,
     ngx_str_t *domain, ngx_str_t *out);
+
+
+/*
+ * Generate a throwaway self-signed certificate for `pkey` (M7 bootstrap): the
+ * SSL_CTX of an `autocert on;` server needs *a* valid cert/key pair so the
+ * listener comes up before the real cert is issued; cert_cb swaps the real
+ * per-SNI cert in at handshake. Subject/issuer CN = "localhost", serial 1,
+ * notBefore now, notAfter +1 day (long enough for the bootstrap window; the
+ * dummy never reaches a client — cert_cb replaces it). Returns an X509* (caller
+ * frees with X509_free) or NULL. No nginx/pool dependency.
+ */
+X509 *ngx_http_autocert_dummy_cert(EVP_PKEY *pkey);
 
 
 #endif /* _NGX_HTTP_AUTOCERT_CRYPTO_H_INCLUDED_ */

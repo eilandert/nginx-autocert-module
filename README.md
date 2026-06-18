@@ -11,18 +11,20 @@ certificate from an ACME CA (Let's Encrypt by default) for that vhost's
   workers; the on-disk store is root-only (or certbot-compatible) by choice.
 - Builds and runs on both **nginx** and **angie**.
 
-> **Status: under construction.** M0 (`autocert` directive), M2 (the global
-> `autocert_*` config model + enabled-name collection), M3 (ECDSA crypto/JWS
-> primitives), M4a (the privilege-separated helper **process**) and M4b (the
-> outbound **HTTP/1.1-over-TLS client**) are in place and build/load on nginx +
-> angie. The directives parse and validate, the set of `server_name`s to
-> provision is resolved at config time, the master runs a dedicated helper
-> process that survives reloads and crashes, and that helper can now reach the
-> ACME server: it resolves the CA hostname (`ngx_resolver`), connects, completes
-> a verified TLS handshake, and performs an HTTP request — proven by fetching the
-> CA **directory** at startup. The full ACME issuance flow (account, orders,
-> challenges, certificate download) lands in M4c+. Not yet usable for real
-> certificates.
+> **Status: under construction — end-to-end issuance + serving work.** Done and
+> building/loading on nginx + angie: the `autocert` directives and global
+> `autocert_*` config model (M0/M2), ECDSA crypto/JWS (M3), the
+> privilege-separated helper **process** (M4a), the outbound
+> **HTTP/1.1-over-TLS client** (M4b), JSON parsing (M4c), ACME account
+> registration (M4d), the HTTP-01 challenge responder (M5), and the full
+> **RFC 8555 order flow** — newOrder → authz → http-01 → finalize (ECDSA CSR) →
+> download → store (M6). M7 adds **certificate serving**: a `listen 443 ssl;
+> autocert on;` server needs **no `ssl_certificate`** — the module gives it a
+> self-signed bootstrap cert so the listener comes up, then swaps in the real
+> certificate **per-SNI at the TLS handshake**, reloading automatically when a
+> renewal rewrites the files (no config reload). Verified end-to-end against
+> Pebble in CI. Still ahead: timed **renewal** (M8), robustness/retry (M9),
+> TLS-ALPN-01 (M10), and a packaged Debian sub-package (M11).
 
 ## Directives
 
@@ -43,11 +45,29 @@ http {
 
     server {
         listen 443 ssl;
-        server_name b.example.com;
-        autocert off;                   # opt this vhost out
+        server_name c.example.com;
+        ssl_certificate /etc/ssl/c.crt;  # real cert -> overridden per-SNI;
+        ssl_certificate_key /etc/ssl/c.key;  # kept as the fallback
+        autocert off;                    # opt this vhost out (real cert needed)
     }
 }
 ```
+
+> The no-`ssl_certificate` bootstrap is seeded for a **server-level**
+> `autocert on` (the form above). A vhost enabled only by the `http`-level
+> global `autocert on` still needs its own `autocert on;` line (or an
+> `ssl_certificate`) to serve TLS — the global sets the issuance default but
+> does not seed every inherited vhost's TLS context.
+
+A `listen ... ssl;` server with `autocert on` needs **no `ssl_certificate`**:
+the module gives it a self-signed bootstrap certificate so the listener starts,
+then serves the real certificate per-SNI once issued (and on every renewal,
+with no reload). If you *do* set `ssl_certificate`, it is kept as the
+pre-issuance fallback and overridden per-SNI. Two combinations are rejected at
+config time: a `listen ssl;` server with **`autocert off` and no
+`ssl_certificate`** (nothing would serve it), and `autocert on` together with a
+**variable** `ssl_certificate` (e.g. `ssl_certificate $var;` — the module
+can't honour the dynamic lookup).
 
 ### Global tuning knobs
 
