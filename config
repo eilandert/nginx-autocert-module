@@ -15,9 +15,11 @@ if test -n "$ngx_module_link"; then
     ngx_module_name=ngx_autocert_process_module
     ngx_module_srcs="$ngx_addon_dir/src/ngx_autocert_process.c \
                      $ngx_addon_dir/src/ngx_autocert_acme.c \
+                     $ngx_addon_dir/src/ngx_autocert_json.c \
                      $ngx_addon_dir/src/ngx_autocert_conf.c"
     ngx_module_libs="-lssl -lcrypto"
     ngx_module_deps="$ngx_addon_dir/src/ngx_autocert_acme.h \
+                     $ngx_addon_dir/src/ngx_autocert_json.h \
                      $ngx_addon_dir/src/ngx_autocert_shared.h \
                      $ngx_addon_dir/src/ngx_http_autocert_conf.h"
     . auto/module
@@ -36,6 +38,7 @@ else
     NGX_ADDON_SRCS="$NGX_ADDON_SRCS \
                     $ngx_addon_dir/src/ngx_autocert_process.c \
                     $ngx_addon_dir/src/ngx_autocert_acme.c \
+                    $ngx_addon_dir/src/ngx_autocert_json.c \
                     $ngx_addon_dir/src/ngx_autocert_conf.c \
                     $ngx_addon_dir/src/ngx_http_autocert_module.c \
                     $ngx_addon_dir/src/ngx_http_autocert_crypto.c"
