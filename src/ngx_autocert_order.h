@@ -64,6 +64,12 @@ struct ngx_autocert_order_s {
     ngx_str_t                        order_url;      /* order resource URL */
     ngx_str_t                        finalize_url;   /* finalize endpoint */
 
+    /* Set when the CA rate-limited a request (HTTP 429): the absolute time
+     * (ngx_time() base) before which this name must not be retried, taken from
+     * the Retry-After header. 0 = no rate-limit hint. The scheduler folds this
+     * into the per-name backoff so it waits exactly as long as the CA asks. */
+    time_t                           retry_after;
+
     /* internals */
     ngx_pool_t                      *pool;           /* whole-order pool */
     ngx_str_t                        new_order_url;

@@ -828,6 +828,7 @@ static ngx_int_t ngx_autocert_name_due(ngx_cycle_t *cycle,
 static ngx_int_t ngx_autocert_start_order_for(ngx_cycle_t *cycle,
     ngx_autocert_conf_t *acf, ngx_str_t *name);
 static void ngx_autocert_backoff_record(ngx_uint_t index, ngx_uint_t success);
+static void ngx_autocert_backoff_hold(ngx_uint_t index, time_t when);
 
 
 /*
@@ -1043,6 +1044,29 @@ ngx_autocert_backoff_record(ngx_uint_t index, ngx_uint_t success)
 
 
 /*
+ * Override a name's next-eligible time with a CA-supplied Retry-After deadline
+ * (HTTP 429 rate limit). We push next_eligible no earlier than `when` — taking
+ * the later of the exponential backoff already recorded and the CA's request —
+ * so honouring the rate limit never shortens the hold. fails is left as the
+ * failure path set it.
+ */
+static void
+ngx_autocert_backoff_hold(ngx_uint_t index, time_t when)
+{
+    ngx_autocert_backoff_t  *b;
+
+    if (ngx_autocert_backoff == NULL || index >= ngx_autocert_backoff_n) {
+        return;
+    }
+
+    b = &ngx_autocert_backoff[index];
+    if (when > b->next_eligible) {
+        b->next_eligible = when;
+    }
+}
+
+
+/*
  * Decide whether `name` needs an order now: true if no fullchain.pem is stored
  * yet, if it is unreadable/corrupt, or if it is inside the renew_before window
  * (now >= notAfter - renew_before).
@@ -1197,6 +1221,12 @@ ngx_autocert_order_complete(ngx_autocert_order_t *order, ngx_int_t rc)
     /* Record the outcome for the in-flight name's backoff: success clears it,
      * failure grows the per-name retry delay (don't hammer a failing name). */
     ngx_autocert_backoff_record(ngx_autocert_sched_cur, rc == NGX_OK);
+
+    /* If the CA rate-limited us (429), honour its Retry-After: hold this name
+     * at least until then, on top of the exponential backoff just recorded. */
+    if (rc != NGX_OK && order->retry_after > 0) {
+        ngx_autocert_backoff_hold(ngx_autocert_sched_cur, order->retry_after);
+    }
 
     ngx_autocert_order_free(order);     /* drops token, frees order pool... */
     ngx_autocert_order = NULL;
