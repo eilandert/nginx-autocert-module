@@ -57,8 +57,8 @@ docker run -d --name "$DNS_NAME" --network "$NET_NAME" \
     -p ${DNS_PORT}:53/udp -p ${DNS_PORT}:53/tcp \
     --entrypoint dnsmasq andyshinn/dnsmasq:2.83 \
     -k --address=/pebble/127.0.0.1 \
-    --address=/${DOMAIN_A}/${HOST_IP} \
-    --address=/${DOMAIN_B}/${HOST_IP} >/dev/null
+    --address=/${DOMAIN_A}/"${HOST_IP}" \
+    --address=/${DOMAIN_B}/"${HOST_IP}" >/dev/null
 DNS_CONTAINER_IP=$(docker inspect -f \
     '{{ (index .NetworkSettings.Networks "'"$NET_NAME"'").IPAddress }}' "$DNS_NAME")
 
@@ -194,7 +194,7 @@ echo "✓ healthy certs not reissued under small renew_before (control)"
 # at once). A: parse fails -> NGX_ERROR -> due. B: open ENOENT -> NGX_DECLINED
 # -> due. Both must be reissued into a fresh, valid cert.
 echo "== corrupt A + remove B, reload =="
-echo "-----BEGIN CERTIFICATE-----\nnot a real cert\n-----END CERTIFICATE-----" \
+printf '%s\n' '-----BEGIN CERTIFICATE-----' 'not a real cert' '-----END CERTIFICATE-----' \
     > "$CHAIN_A"
 rm -rf "$PREFIX/store/${DOMAIN_B}"
 "$SERVER_BIN" -p "$PREFIX" -c "$PREFIX/conf/nginx.conf" -s reload

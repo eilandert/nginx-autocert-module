@@ -67,7 +67,7 @@ docker run -d --name "$DNS_NAME" --network "$NET_NAME" \
     -p ${DNS_PORT}:53/udp -p ${DNS_PORT}:53/tcp \
     --entrypoint dnsmasq andyshinn/dnsmasq:2.83 \
     -k --address=/pebble/127.0.0.1 \
-    --address=/${ORDER_DOMAIN}/${HOST_IP} >/dev/null
+    --address=/${ORDER_DOMAIN}/"${HOST_IP}" >/dev/null
 DNS_CONTAINER_IP=$(docker inspect -f \
     '{{ (index .NetworkSettings.Networks "'"$NET_NAME"'").IPAddress }}' "$DNS_NAME")
 

@@ -42,7 +42,7 @@ RETRY_AFTER=90
 MOCK_PID=""
 cleanup() {
     "$SERVER_BIN" -p "$PREFIX" -c "$PREFIX/conf/nginx.conf" -s stop 2>/dev/null || true
-    [ -n "$MOCK_PID" ] && kill "$MOCK_PID" 2>/dev/null || true
+    if [ -n "$MOCK_PID" ]; then kill "$MOCK_PID" 2>/dev/null || true; fi
     docker rm -f "$DNS_NAME" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT

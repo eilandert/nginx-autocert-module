@@ -77,10 +77,13 @@ jobs:
           OBJS="$NGX/objs/src/core/ngx_palloc.o $NGX/objs/src/core/ngx_string.o \
                 $NGX/objs/src/os/unix/ngx_time.o $NGX/objs/src/core/ngx_times.o \
                 $NGX/objs/src/os/unix/ngx_alloc.o"
+          # INC and OBJS are flag/object lists that must word-split.
+          # shellcheck disable=SC2086
           gcc -Wall -Wextra -Werror -g3 -O0 $INC -o test_crypto \
             "$GITHUB_WORKSPACE/test/test_crypto.c" \
             "$GITHUB_WORKSPACE/src/ngx_http_autocert_crypto.c" \
             $OBJS -lssl -lcrypto
+          # shellcheck disable=SC2086
           gcc -Wall -Wextra -Werror -g3 -O0 $INC -o test_json \
             "$GITHUB_WORKSPACE/test/test_json.c" \
             "$GITHUB_WORKSPACE/src/ngx_autocert_json.c" \

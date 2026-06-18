@@ -58,7 +58,7 @@ echo "== start =="
 "$SERVER_BIN" -p "$PREFIX" -c "$PREFIX/conf/nginx.conf"
 
 # wait for the helper to seed the token
-for i in $(seq 1 30); do
+for _ in $(seq 1 30); do
     grep -q 'seeded test challenge token' "$PREFIX/logs/error.log" && break
     sleep 0.3
 done

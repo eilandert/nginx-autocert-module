@@ -114,7 +114,7 @@ served_serial() {
 
 echo "== start (no cert on disk yet) =="
 "$SERVER_BIN" -p "$PREFIX" -c "$PREFIX/conf/nginx.conf"
-for i in $(seq 1 30); do
+for _ in $(seq 1 30); do
     echo | openssl s_client -connect "127.0.0.1:$PORT" 2>/dev/null | grep -q CONNECTED && break
     sleep 0.2
 done
@@ -149,7 +149,7 @@ sleep 1.2
 gen_cert "$DOMAIN"          # new serial, same name
 sleep 1.2
 after=$(served_serial "$DOMAIN")
-[ -n "$before" ] && [ -n "$after" ] || { echo "::error::missing serial"; exit 1; }
+if ! { [ -n "$before" ] && [ -n "$after" ]; }; then echo "::error::missing serial"; exit 1; fi
 [ "$before" != "$after" ] || {
     echo "::error::serial unchanged after renew ($before) — no hot-reload"; exit 1; }
 echo "✓ renewed cert picked up without reload ($before -> $after)"

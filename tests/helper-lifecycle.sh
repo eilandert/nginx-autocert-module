@@ -64,7 +64,7 @@ sleep 1
 MPID=$(cat "$P/logs/nginx.pid" 2>/dev/null)
 H1=$(hpid)
 echo "START: master=$MPID helper=$H1"
-[ -n "$H1" ] && alive "$H1" || fail "helper not running"
+if ! { [ -n "$H1" ] && alive "$H1"; }; then fail "helper not running"; fi
 grep -q 'autocert: helper started' "$P/logs/error.log" || fail "no 'helper started' log"
 [ "$(hcount)" -eq 1 ] || fail "expected one helper, got $(hcount)"
 echo "  one helper on event loop: OK"
@@ -80,22 +80,22 @@ done
 # Crash-respawn: kill the helper, master must bring a fresh one back.
 HC=$(hpid)
 kill -9 "$HC";
-for i in $(seq 1 25); do
+for _ in $(seq 1 25); do
     HN=$(hpid); [ -n "$HN" ] && [ "$HN" != "$HC" ] && break
     sleep 0.2
 done
 HN=$(hpid)
-[ -n "$HN" ] && [ "$HN" != "$HC" ] || fail "helper not respawned after crash (was $HC, now ${HN:-none})"
+if ! { [ -n "$HN" ] && [ "$HN" != "$HC" ]; }; then fail "helper not respawned after crash (was $HC, now ${HN:-none})"; fi
 [ "$(hcount)" -eq 1 ] || fail "after respawn helper count=$(hcount)"
 echo "CRASH: respawned (pid $HC -> $HN): OK"
 
 # Stop: clean teardown.
 "$N/$SRV" -p "$P" -c "$P/conf/nginx.conf" -s stop 2>&1
 echo "STOP:"
-for i in $(seq 1 25); do [ -f "$P/logs/nginx.pid" ] || break; sleep 0.2; done
+for _ in $(seq 1 25); do [ -f "$P/logs/nginx.pid" ] || break; sleep 0.2; done
 [ -f "$P/logs/nginx.pid" ] && fail "pidfile remains, master alive"
 echo "  master exited (pidfile removed): OK"
-for i in $(seq 1 15); do [ "$(hcount)" -eq 0 ] && break; sleep 0.2; done
+for _ in $(seq 1 15); do [ "$(hcount)" -eq 0 ] && break; sleep 0.2; done
 [ "$(hcount)" -eq 0 ] || fail "helper still alive after stop"
 echo "  helper gone: OK"
 # The final (shutdown) helper must have exited cleanly, not been SIGKILLed.
@@ -116,14 +116,13 @@ echo "DAEMON-OFF:"
 writeconf "daemon off;"
 "$N/$SRV" -p "$P" -c "$P/conf/nginx.conf" >/tmp/s2.err 2>&1 &
 DPID=$!
-for i in $(seq 1 25); do [ "$(hcount)" -eq 1 ] && break; sleep 0.2; done
+for _ in $(seq 1 25); do [ "$(hcount)" -eq 1 ] && break; sleep 0.2; done
 [ "$(hcount)" -eq 1 ] || fail "daemon-off: expected one helper, got $(hcount)"
 echo "  one helper (channel-managed, real child): OK"
-HD=$(hpid)
 kill -QUIT "$DPID"
-for i in $(seq 1 25); do alive "$DPID" || break; sleep 0.2; done
+for _ in $(seq 1 25); do alive "$DPID" || break; sleep 0.2; done
 alive "$DPID" && fail "daemon-off: master did not exit on QUIT"
-for i in $(seq 1 15); do [ "$(hcount)" -eq 0 ] && break; sleep 0.2; done
+for _ in $(seq 1 15); do [ "$(hcount)" -eq 0 ] && break; sleep 0.2; done
 [ "$(hcount)" -eq 0 ] || fail "daemon-off: helper still alive after master quit"
 echo "  master + helper exited cleanly on QUIT: OK"
 # restore default (daemon on) conf so cleanup's -s stop targets the right file
@@ -138,7 +137,7 @@ writeconf
 # (e.g. accidental respawn=1) is caught, and proves recovery via reload.
 echo "COLD-CRASH:"
 setsid "$N/$SRV" -p "$P" -c "$P/conf/nginx.conf" >/tmp/s3.err 2>&1 </dev/null
-for i in $(seq 1 25); do [ "$(hcount)" -eq 1 ] && break; sleep 0.2; done
+for _ in $(seq 1 25); do [ "$(hcount)" -eq 1 ] && break; sleep 0.2; done
 [ "$(hcount)" -eq 1 ] || fail "cold-crash: no cold helper to start with"
 HX=$(hpid)
 kill -9 "$HX"
@@ -151,7 +150,7 @@ echo "  cold helper not auto-respawned (expected; respawn=0): OK"
 [ "$(hcount)" -eq 1 ] || fail "cold-crash: reload did not recover helper (count=$(hcount))"
 echo "  reload recovers a fresh helper: OK"
 "$N/$SRV" -p "$P" -c "$P/conf/nginx.conf" -s stop 2>&1
-for i in $(seq 1 25); do [ -f "$P/logs/nginx.pid" ] || break; sleep 0.2; done
+for _ in $(seq 1 25); do [ -f "$P/logs/nginx.pid" ] || break; sleep 0.2; done
 
 echo "ALL OK"
 echo "--- autocert log lines ---"

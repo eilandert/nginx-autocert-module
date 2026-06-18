@@ -161,7 +161,7 @@ EOF
 # Fresh store so the account-key step succeeds and the flow reaches the TLS
 # handshake (where verification must fail).
 rm -rf "$PREFIX/store"; mkdir -p "$PREFIX/store"
-> "$PREFIX/logs/error.log"
+: > "$PREFIX/logs/error.log"
 "$SERVER_BIN" -p "$PREFIX" -c "$PREFIX/conf/nginx.conf"
 
 bad=

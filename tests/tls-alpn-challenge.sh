@@ -66,7 +66,7 @@ echo "✓ config accepted"
 "$SERVER_BIN" -p "$PREFIX" -c "$PREFIX/conf/nginx.conf"
 
 # Wait for the helper to seed the challenge cert into the shared store.
-for i in $(seq 1 50); do
+for _ in $(seq 1 50); do
     grep -q "seeded test tls-alpn-01 cert" "$PREFIX/logs/error.log" && break
     sleep 0.1
 done
@@ -79,7 +79,7 @@ ACME_OID="1.3.6.1.5.5.7.1.31"
 fetch_cert() {
     # $1 = extra s_client args ; prints the served leaf cert as PEM
     printf '' | openssl s_client -connect "127.0.0.1:$PORT" \
-        -servername "$DOMAIN" $1 2>/dev/null \
+        -servername "$DOMAIN" "$1" 2>/dev/null \
         | openssl x509 2>/dev/null
 }
 
