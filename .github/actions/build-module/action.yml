@@ -28,12 +28,27 @@ runs:
       with:
         ccache-key: build-${{ inputs.flavor }}-${{ inputs.version }}
 
+    - name: Restore source tarball cache
+      id: tarball-cache
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: ~/.cache/src-tarballs
+        key: src-tarball-${{ inputs.flavor }}-${{ inputs.version }}
+
     - name: Fetch ${{ inputs.flavor }} ${{ inputs.version }}
+      if: steps.tarball-cache.outputs.cache-hit != 'true'
       shell: bash
       run: |
         set -euo pipefail
-        curl -fsSL -o src.tar.gz "${{ inputs.url }}"
-        tar -xzf src.tar.gz
+        mkdir -p ~/.cache/src-tarballs
+        curl -fsSL -o ~/.cache/src-tarballs/${{ inputs.flavor }}-${{ inputs.version }}.tar.gz \
+          "${{ inputs.url }}"
+
+    - name: Extract ${{ inputs.flavor }} ${{ inputs.version }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        tar -xzf ~/.cache/src-tarballs/${{ inputs.flavor }}-${{ inputs.version }}.tar.gz
 
     - name: Configure + build module
       shell: bash

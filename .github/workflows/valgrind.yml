@@ -1,5 +1,9 @@
 name: Valgrind
 
+# Action pins:
+# actions/checkout@v5 -> 93cb6efe18208431cddfb8368fd83d5badbf9bfd
+# actions/cache@v4    -> 0057852bfaa89a56745cba8c7296529d2fc39830
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   NGINX_VERSION: ""
@@ -45,11 +49,26 @@ jobs:
           packages: build-essential ccache curl libpcre2-dev libssl-dev valgrind zlib1g-dev
           ccache-key: valgrind-nginx
 
+      - name: Restore nginx tarball cache
+        id: nginx-tarball
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/src-tarballs
+          key: src-tarball-nginx-${{ env.NGINX_VERSION }}
+
       - name: Fetch nginx
+        if: steps.nginx-tarball.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
-          curl -fsSL -o src.tar.gz "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
-          tar -xzf src.tar.gz
+          mkdir -p ~/.cache/src-tarballs
+          curl -fsSL \
+            -o ~/.cache/src-tarballs/nginx-${NGINX_VERSION}.tar.gz \
+            "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
+
+      - name: Extract nginx
+        run: |
+          set -euo pipefail
+          tar -xzf ~/.cache/src-tarballs/nginx-${NGINX_VERSION}.tar.gz
 
       - name: Configure + build debug nginx with autocert
         run: |

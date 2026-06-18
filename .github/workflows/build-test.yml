@@ -156,11 +156,26 @@ jobs:
         with:
           ccache-key: build-angie-${{ needs.resolve.outputs.angie_version }}
 
+      - name: Restore angie tarball cache
+        id: angie-tarball
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/src-tarballs
+          key: src-tarball-angie-${{ needs.resolve.outputs.angie_version }}
+
       - name: Fetch angie ${{ needs.resolve.outputs.angie_version }}
+        if: steps.angie-tarball.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
-          curl -fsSL -o src.tar.gz "${{ needs.resolve.outputs.angie_url }}"
-          tar -xzf src.tar.gz
+          mkdir -p ~/.cache/src-tarballs
+          curl -fsSL \
+            -o ~/.cache/src-tarballs/angie-${{ needs.resolve.outputs.angie_version }}.tar.gz \
+            "${{ needs.resolve.outputs.angie_url }}"
+
+      - name: Extract angie ${{ needs.resolve.outputs.angie_version }}
+        run: |
+          set -euo pipefail
+          tar -xzf ~/.cache/src-tarballs/angie-${{ needs.resolve.outputs.angie_version }}.tar.gz
 
       - name: Configure + compile module against angie
         run: |

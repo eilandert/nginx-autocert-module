@@ -6,6 +6,7 @@ name: Fuzzing
 #
 # Action pins:
 # actions/checkout@v5        -> 93cb6efe18208431cddfb8368fd83d5badbf9bfd
+# actions/cache@v4           -> 0057852bfaa89a56745cba8c7296529d2fc39830
 # actions/upload-artifact@v5 -> 330a01c490aca151604b8cf639adc76d48f6c5d4
 
 env:
@@ -57,13 +58,27 @@ jobs:
           fi
           echo "NGINX_VERSION=$ver" >> "$GITHUB_ENV"
 
+      - name: Restore nginx tarball cache
+        id: nginx-tarball
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/src-tarballs
+          key: src-tarball-nginx-${{ env.NGINX_VERSION }}
+
+      - name: Fetch nginx source
+        if: steps.nginx-tarball.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.cache/src-tarballs
+          curl -fsSL \
+            -o ~/.cache/src-tarballs/nginx-${NGINX_VERSION}.tar.gz \
+            "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
+
       - name: Build nginx objects used by the parser harness
         run: |
           set -euo pipefail
           mkdir -p .build
-          curl -fsSL -o ".build/nginx-${NGINX_VERSION}.tar.gz" \
-            "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
-          tar -xzf ".build/nginx-${NGINX_VERSION}.tar.gz" -C .build
+          tar -xzf ~/.cache/src-tarballs/nginx-${NGINX_VERSION}.tar.gz -C .build
           cd ".build/nginx-${NGINX_VERSION}"
           ./configure --with-http_ssl_module
           make -j"$(nproc)"
@@ -81,6 +96,17 @@ jobs:
             echo "FUZZ_SECS=900" >> "$GITHUB_ENV"
           fi
 
+      # Restore corpus from prior scheduled run so the fuzzer extends existing
+      # coverage rather than starting from scratch each month.
+      - name: Restore fuzz corpus cache
+        id: corpus-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-
+
       - name: Run fuzzers
         run: |
           cd fuzz
@@ -90,6 +116,8 @@ jobs:
             -artifact_prefix="crash-json-" \
             corpus/
 
+      # Merge-minimize into corpus/ so the cache stays compact and the next run
+      # seeds from the distilled set.
       - name: Minimize and persist corpus growth
         if: success() && github.event_name == 'schedule'
         run: |
@@ -97,6 +125,9 @@ jobs:
           mkdir -p corpus-min
           ./fuzz_json -merge=1 corpus-min/ corpus/
           echo "Merged corpus: $(find corpus-min -type f | wc -l) units"
+          # Replace corpus with minimized set for cache save.
+          rm -rf corpus
+          mv corpus-min corpus
 
       - name: Upload crash artifacts
         if: failure()
@@ -106,10 +137,10 @@ jobs:
           path: ${{ github.workspace }}/fuzz/crash-*
           retention-days: 30
 
-      - name: Upload minimized corpus
+      - name: Upload minimized corpus artifact
         if: success() && github.event_name == 'schedule'
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: fuzz-corpus
-          path: ${{ github.workspace }}/fuzz/corpus-min
+          path: ${{ github.workspace }}/fuzz/corpus
           retention-days: 30
