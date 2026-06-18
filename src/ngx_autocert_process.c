@@ -913,6 +913,18 @@ ngx_autocert_sched_pump(ngx_cycle_t *cycle)
     if (ngx_autocert_backoff == NULL
         || ngx_autocert_backoff_n != acf.names->nelts)
     {
+        /* Guard the size multiply against wrap before allocating (nelts is
+         * operator-controlled). A wrap would underallocate and later
+         * backoff[i] would read/write out of bounds. */
+        if (acf.names->nelts
+            > NGX_MAX_SIZE_T_VALUE / sizeof(ngx_autocert_backoff_t))
+        {
+            ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
+                          "autocert: implausible server name count");
+            ngx_autocert_backoff_n = 0;
+            goto rearm;
+        }
+
         ngx_autocert_backoff = ngx_pcalloc(cycle->pool,
             acf.names->nelts * sizeof(ngx_autocert_backoff_t));
         if (ngx_autocert_backoff == NULL) {
