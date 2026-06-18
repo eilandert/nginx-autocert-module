@@ -130,6 +130,22 @@ X509 *ngx_http_autocert_dummy_cert(EVP_PKEY *pkey);
 
 
 /*
+ * Build the RFC 8737 tls-alpn-01 challenge certificate (M10): a self-signed
+ * cert for `domain` carrying
+ *   - a subjectAltName dNSName == domain, and
+ *   - a CRITICAL id-pe-acmeIdentifier extension (OID 1.3.6.1.5.5.7.1.31) whose
+ *     value is the DER encoding of an OCTET STRING containing SHA-256(keyauth).
+ * `pkey` is the (throwaway) cert key. `keyauth` is the ACME key authorization
+ * (token "." base64url(JWK thumbprint)). The CA validates domain control by
+ * connecting with ALPN "acme-tls/1" + SNI=domain and checking this extension —
+ * no port 80 needed. Returns a new X509* (free with X509_free) or NULL. No
+ * nginx/pool dependency.
+ */
+X509 *ngx_http_autocert_acme_tls_cert(EVP_PKEY *pkey, ngx_str_t *domain,
+    ngx_str_t *keyauth);
+
+
+/*
  * Read the leaf certificate's notAfter from a PEM fullchain file at `path`
  * (NUL-terminated C string) and convert it to a Unix `time_t` in *out. The
  * leaf is the FIRST certificate in the file (per the store layout). Returns

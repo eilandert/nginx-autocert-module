@@ -340,6 +340,98 @@ test_csr(ngx_uint_t curve, const char *domain)
 }
 
 
+/*
+ * Build a tls-alpn-01 challenge cert for `domain` with key authorization
+ * `keyauth`, then verify: it self-verifies, lists `domain` in its SAN, and
+ * carries a CRITICAL id-pe-acmeIdentifier extension whose value is the DER
+ * OCTET STRING of SHA-256(keyauth).
+ */
+static void
+test_acme_tls_cert(ngx_uint_t curve, const char *domain, const char *keyauth)
+{
+    EVP_PKEY          *pkey;
+    ngx_str_t          dom, ka;
+    X509              *x;
+    GENERAL_NAMES     *gns;
+    int                found, i, crit;
+    unsigned char      expect[SHA256_DIGEST_LENGTH];
+    ASN1_OBJECT       *want;
+
+    pkey = ngx_http_autocert_key_generate(curve);
+    CHECK(pkey != NULL, "acme-tls: key generate");
+    if (pkey == NULL) {
+        return;
+    }
+
+    dom = S(domain);
+    ka = S(keyauth);
+    x = ngx_http_autocert_acme_tls_cert(pkey, &dom, &ka);
+    CHECK(x != NULL, "acme-tls: cert built");
+    if (x == NULL) {
+        ngx_http_autocert_key_free(pkey);
+        return;
+    }
+
+    CHECK(X509_verify(x, pkey) == 1, "acme-tls: self-signature verifies");
+
+    /* SAN lists exactly the domain. */
+    found = 0;
+    gns = X509_get_ext_d2i(x, NID_subject_alt_name, NULL, NULL);
+    if (gns != NULL) {
+        for (i = 0; i < sk_GENERAL_NAME_num(gns); i++) {
+            GENERAL_NAME  *gn = sk_GENERAL_NAME_value(gns, i);
+            if (gn->type == GEN_DNS) {
+                ASN1_IA5STRING  *ia5 = gn->d.dNSName;
+                if ((size_t) ASN1_STRING_length(ia5) == dom.len
+                    && memcmp(ASN1_STRING_get0_data(ia5), dom.data, dom.len)
+                       == 0)
+                {
+                    found = 1;
+                }
+            }
+        }
+        GENERAL_NAMES_free(gns);
+    }
+    CHECK(found, "acme-tls: SAN lists the domain");
+
+    /* critical id-pe-acmeIdentifier extension == OCTET STRING of SHA256(keyauth) */
+    SHA256((const unsigned char *) keyauth, strlen(keyauth), expect);
+    want = OBJ_txt2obj("1.3.6.1.5.5.7.1.31", 1);
+    found = 0;
+    crit = 0;
+    for (i = 0; i < X509_get_ext_count(x); i++) {
+        X509_EXTENSION     *ext = X509_get_ext(x, i);
+        ASN1_OBJECT        *o = X509_EXTENSION_get_object(ext);
+        ASN1_OCTET_STRING  *data;
+        const unsigned char *dp;
+        ASN1_OCTET_STRING  *got;
+
+        if (OBJ_cmp(o, want) != 0) {
+            continue;
+        }
+        crit = X509_EXTENSION_get_critical(ext);
+        data = X509_EXTENSION_get_data(ext);
+        dp = ASN1_STRING_get0_data(data);
+        got = d2i_ASN1_OCTET_STRING(NULL, &dp, ASN1_STRING_length(data));
+        if (got != NULL) {
+            if (ASN1_STRING_length(got) == (int) sizeof(expect)
+                && memcmp(ASN1_STRING_get0_data(got), expect, sizeof(expect))
+                   == 0)
+            {
+                found = 1;
+            }
+            ASN1_OCTET_STRING_free(got);
+        }
+    }
+    ASN1_OBJECT_free(want);
+    CHECK(crit, "acme-tls: acmeIdentifier extension is critical");
+    CHECK(found, "acme-tls: acmeIdentifier == SHA256(keyauth)");
+
+    X509_free(x);
+    ngx_http_autocert_key_free(pkey);
+}
+
+
 int
 main(void)
 {
@@ -361,6 +453,10 @@ main(void)
     test_jws_sign_verify(NGX_HTTP_AUTOCERT_CRYPTO_P384, "ES384");
     test_csr(NGX_HTTP_AUTOCERT_CRYPTO_P256, "le.example.com");
     test_csr(NGX_HTTP_AUTOCERT_CRYPTO_P384, "example.org");
+    test_acme_tls_cert(NGX_HTTP_AUTOCERT_CRYPTO_P256, "le.example.com",
+                       "tok-abc.thumbprint-xyz");
+    test_acme_tls_cert(NGX_HTTP_AUTOCERT_CRYPTO_P384, "example.org",
+                       "another-token.another-thumb");
 
     ngx_destroy_pool(p);
 
