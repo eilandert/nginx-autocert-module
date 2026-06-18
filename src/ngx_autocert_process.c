@@ -829,6 +829,8 @@ ngx_autocert_start_order(ngx_cycle_t *cycle)
     order->directory_url = acf.ca;
     order->domain = *first;
     order->challenge_zone = acf.challenge_zone;
+    order->key_type = acf.key_type;
+    order->store_path = acf.path;
     order->handler = ngx_autocert_order_complete;
     order->data = cycle;
 
@@ -849,17 +851,16 @@ ngx_autocert_start_order(ngx_cycle_t *cycle)
 
 
 /*
- * Terminal callback of the order flow (M6a ends at authz=valid). M6b will take
- * order->order_url / order->finalize_url from here to finish issuance. For now
- * we free the order and log the outcome (the CI asserts on the success line).
+ * Terminal callback of the order flow. M6b runs the full issuance (finalize →
+ * download → store), so NGX_OK here means the certificate is on disk.
  */
 static void
 ngx_autocert_order_complete(ngx_autocert_order_t *order, ngx_int_t rc)
 {
     if (rc == NGX_OK) {
         ngx_log_error(NGX_LOG_NOTICE, order->log, 0,
-                      "autocert: order ready to finalize for \"%V\" "
-                      "(order %V)", &order->domain, &order->order_url);
+                      "autocert: certificate provisioned for \"%V\"",
+                      &order->domain);
     } else {
         ngx_log_error(NGX_LOG_ERR, order->log, 0,
                       "autocert: ACME order failed for \"%V\"", &order->domain);

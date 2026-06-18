@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 #
-# ACME order + authorization e2e test (M6a).
+# ACME order + authorization + issuance e2e test (M6a/M6b).
 #
 # Builds on acme-directory.sh: brings up Pebble + dnsmasq, registers an account,
-# then drives the full order flow for one domain —
+# then drives the full issuance for one domain —
 #   newOrder -> fetch authz -> http-01 token -> keyauth -> publish to the
-#   challenge store -> POST the challenge -> poll the authorization until valid.
+#   challenge store -> POST the challenge -> poll the authorization until valid
+#   -> finalize {csr} -> poll order valid -> download chain -> store to disk.
+# Finally it verifies the stored privkey.pem (0600, EC) and fullchain.pem
+# (valid cert, SAN=domain, pubkey matches the key).
 #
 # The crux is that Pebble's validation authority (VA), running in the Pebble
 # container, must fetch
@@ -151,9 +154,59 @@ if [ -z "$ok" ]; then
 fi
 echo "✓ authorization reached valid (http-01 served, VA fetched our token)"
 
-# The order is now ready to finalize — the success line carries the order URL.
-if ! grep -q 'autocert: order ready to finalize' "$PREFIX/logs/error.log"; then
-    echo "::error::order-ready line missing"
+# M6b: the flow continues into finalize -> order poll -> download -> store.
+# Wait for the terminal success (or a failure) line.
+issued=
+for i in $(seq 1 60); do
+    if grep -q 'autocert: certificate provisioned for' "$PREFIX/logs/error.log"; then
+        issued=1; break
+    fi
+    if grep -Eq 'autocert: (finalize failed|order poll timed out|order did not become valid|certificate download failed|ACME order failed)' \
+            "$PREFIX/logs/error.log"; then
+        break
+    fi
+    sleep 0.5
+done
+
+echo "== helper log (issuance) =="
+grep autocert "$PREFIX/logs/error.log" || true
+
+if [ -z "$issued" ]; then
+    echo "::error::certificate was not provisioned"
+    docker logs "$PEBBLE_NAME" 2>&1 | tail -40 || true
     exit 1
 fi
-echo "✓ order ready to finalize (order/finalize URLs captured for M6b)"
+echo "✓ certificate provisioned (finalize -> poll -> download -> store)"
+
+# Verify the stored files exist with the right permissions and content.
+KEY="$PREFIX/store/${ORDER_DOMAIN}/privkey.pem"
+CHAIN="$PREFIX/store/${ORDER_DOMAIN}/fullchain.pem"
+
+[ -f "$KEY" ]   || { echo "::error::missing $KEY"; exit 1; }
+[ -f "$CHAIN" ] || { echo "::error::missing $CHAIN"; exit 1; }
+
+KEY_MODE=$(stat -c '%a' "$KEY")
+[ "$KEY_MODE" = "600" ] || { echo "::error::privkey.pem mode is $KEY_MODE, want 600"; exit 1; }
+echo "✓ privkey.pem is 0600"
+
+# The private key must be an EC key (no RSA) and parse cleanly.
+openssl pkey -in "$KEY" -noout -text 2>/dev/null | grep -qi 'ASN1 OID\|NIST CURVE' \
+    || { echo "::error::privkey.pem is not a valid EC key"; openssl pkey -in "$KEY" -noout -text; exit 1; }
+echo "✓ privkey.pem is a valid EC key"
+
+# The fullchain must be a valid PEM cert whose SAN carries the order domain.
+openssl x509 -in "$CHAIN" -noout -subject >/dev/null 2>&1 \
+    || { echo "::error::fullchain.pem is not a valid certificate"; exit 1; }
+openssl x509 -in "$CHAIN" -noout -ext subjectAltName 2>/dev/null \
+    | grep -q "DNS:${ORDER_DOMAIN}" \
+    || { echo "::error::cert SAN does not list ${ORDER_DOMAIN}"; \
+         openssl x509 -in "$CHAIN" -noout -text | grep -A1 'Subject Alternative'; exit 1; }
+echo "✓ fullchain.pem certifies ${ORDER_DOMAIN}"
+
+# The leaf cert's public key must match the stored private key.
+CERT_PUB=$(openssl x509 -in "$CHAIN" -noout -pubkey 2>/dev/null | openssl md5)
+KEY_PUB=$(openssl pkey -in "$KEY" -pubout 2>/dev/null | openssl md5)
+[ "$CERT_PUB" = "$KEY_PUB" ] || { echo "::error::cert pubkey != stored privkey"; exit 1; }
+echo "✓ certificate public key matches the stored private key"
+
+echo "✓✓ full ACME issuance verified end-to-end"

@@ -103,6 +103,7 @@ struct ngx_autocert_acme_request_s {
 
     /* response parse state */
     ngx_uint_t                    headers_done;
+    ngx_uint_t                    chunked;         /* Transfer-Encoding: chunked */
     off_t                         content_length;  /* -1 if unknown */
     off_t                         body_received;
     size_t                        body_offset;     /* start of body in recv */

@@ -12,6 +12,8 @@
 #include <openssl/sha.h>
 #include <openssl/pem.h>
 #include <openssl/ecdsa.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
 
 #if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
 #include <openssl/core_names.h>
@@ -587,5 +589,121 @@ ngx_http_autocert_jws_sign(ngx_pool_t *pool, EVP_PKEY *pkey,
 
 done:
     EVP_MD_CTX_free(mdctx);
+    return rc;
+}
+
+
+/*
+ * Build a PKCS#10 CSR for `domain`, signed with `pkey` (the certificate key),
+ * and emit its DER encoding into *out (pool-allocated).
+ *
+ * The subject is left EMPTY — ACME ignores the CSR subject and takes the names
+ * exclusively from the subjectAltName extension (RFC 8555 §7.4). Per RFC 5280
+ * §4.2.1.6 a SAN with an empty subject MUST be marked critical, so it is.
+ * Signed with the curve-matched digest (SHA-256 for P-256, SHA-384 for P-384).
+ */
+ngx_int_t
+ngx_http_autocert_csr_der(ngx_pool_t *pool, EVP_PKEY *pkey, ngx_str_t *domain,
+    ngx_str_t *out)
+{
+    ngx_int_t                          rc = NGX_ERROR;
+    int                                der_len;
+    u_char                            *der = NULL;
+    X509_REQ                          *req = NULL;
+    STACK_OF(X509_EXTENSION)          *exts = NULL;
+    X509_EXTENSION                    *san = NULL;
+    GENERAL_NAME                      *gn = NULL;
+    GENERAL_NAMES                     *gns = NULL;
+    ASN1_IA5STRING                    *ia5 = NULL;
+    const ngx_http_autocert_curve_t   *cv;
+
+    cv = ngx_http_autocert_curve_of(pkey);
+    if (cv == NULL || domain->len == 0) {
+        return NGX_ERROR;
+    }
+
+    req = X509_REQ_new();
+    if (req == NULL) {
+        return NGX_ERROR;
+    }
+    if (X509_REQ_set_version(req, 0) != 1            /* v1 */
+        || X509_REQ_set_pubkey(req, pkey) != 1)
+    {
+        goto done;
+    }
+
+    /* subjectAltName = DNS:<domain>, built by hand to bound the name length
+     * (no NUL-terminated input assumed). */
+    gns = GENERAL_NAMES_new();
+    gn = GENERAL_NAME_new();
+    ia5 = ASN1_IA5STRING_new();
+    if (gns == NULL || gn == NULL || ia5 == NULL) {
+        goto done;
+    }
+    if (domain->len > INT_MAX
+        || ASN1_STRING_set(ia5, domain->data, (int) domain->len) != 1)
+    {
+        goto done;
+    }
+    GENERAL_NAME_set0_value(gn, GEN_DNS, ia5);
+    ia5 = NULL;                                      /* owned by gn now */
+    if (sk_GENERAL_NAME_push(gns, gn) <= 0) {
+        goto done;
+    }
+    gn = NULL;                                       /* owned by gns now */
+
+    san = X509V3_EXT_i2d(NID_subject_alt_name, 1 /* critical */, gns);
+    if (san == NULL) {
+        goto done;
+    }
+
+    exts = sk_X509_EXTENSION_new_null();
+    if (exts == NULL || sk_X509_EXTENSION_push(exts, san) <= 0) {
+        goto done;
+    }
+    san = NULL;                                      /* owned by exts now */
+    if (X509_REQ_add_extensions(req, exts) != 1) {
+        goto done;
+    }
+
+    if (X509_REQ_sign(req, pkey, cv->md()) == 0) {
+        goto done;
+    }
+
+    der_len = i2d_X509_REQ(req, &der);
+    if (der_len <= 0 || der == NULL) {
+        goto done;
+    }
+
+    out->data = ngx_pnalloc(pool, der_len);
+    if (out->data == NULL) {
+        goto done;
+    }
+    ngx_memcpy(out->data, der, der_len);
+    out->len = der_len;
+    rc = NGX_OK;
+
+done:
+    if (der != NULL) {
+        OPENSSL_free(der);
+    }
+    if (ia5 != NULL) {
+        ASN1_STRING_free(ia5);
+    }
+    if (gn != NULL) {
+        GENERAL_NAME_free(gn);
+    }
+    if (gns != NULL) {
+        GENERAL_NAMES_free(gns);
+    }
+    if (san != NULL) {
+        X509_EXTENSION_free(san);
+    }
+    if (exts != NULL) {
+        sk_X509_EXTENSION_pop_free(exts, X509_EXTENSION_free);
+    }
+    if (req != NULL) {
+        X509_REQ_free(req);
+    }
     return rc;
 }

@@ -23,6 +23,8 @@
 #include <openssl/ecdsa.h>
 #include <openssl/sha.h>
 #include <openssl/pem.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -260,6 +262,84 @@ ngx_log_error_core(ngx_uint_t level, ngx_log_t *log, ngx_err_t err,
 }
 
 
+/*
+ * Generate a key on `curve`, build a CSR for `domain`, then parse the DER back
+ * and verify: it is a valid PKCS#10, its signature verifies under its own
+ * public key, and its subjectAltName lists exactly the domain.
+ */
+static void
+test_csr(ngx_uint_t curve, const char *domain)
+{
+    EVP_PKEY                  *pkey;
+    ngx_str_t                  dom, der;
+    const unsigned char       *dp;
+    X509_REQ                  *req;
+    EVP_PKEY                  *reqpub;
+    GENERAL_NAMES             *gns;
+    int                        found, i;
+
+    pkey = ngx_http_autocert_key_generate(curve);
+    CHECK(pkey != NULL, "csr: key generate");
+    if (pkey == NULL) {
+        return;
+    }
+
+    dom = S(domain);
+    CHECK(ngx_http_autocert_csr_der(pool, pkey, &dom, &der) == NGX_OK
+          && der.len > 0,
+          "csr: DER produced");
+    if (der.len == 0) {
+        ngx_http_autocert_key_free(pkey);
+        return;
+    }
+
+    dp = der.data;
+    req = d2i_X509_REQ(NULL, &dp, (long) der.len);
+    CHECK(req != NULL, "csr: DER parses as X509_REQ");
+    if (req == NULL) {
+        ngx_http_autocert_key_free(pkey);
+        return;
+    }
+
+    reqpub = X509_REQ_get_pubkey(req);
+    CHECK(reqpub != NULL && X509_REQ_verify(req, reqpub) == 1,
+          "csr: self-signature verifies");
+
+    /* subjectAltName carries exactly the domain as a DNS name. */
+    found = 0;
+    {
+        STACK_OF(X509_EXTENSION)  *exts = X509_REQ_get_extensions(req);
+
+        gns = X509V3_get_d2i(exts, NID_subject_alt_name, NULL, NULL);
+        if (exts != NULL) {
+            sk_X509_EXTENSION_pop_free(exts, X509_EXTENSION_free);
+        }
+    }
+    if (gns != NULL) {
+        for (i = 0; i < sk_GENERAL_NAME_num(gns); i++) {
+            GENERAL_NAME  *gn = sk_GENERAL_NAME_value(gns, i);
+            if (gn->type == GEN_DNS) {
+                ASN1_IA5STRING  *ia5 = gn->d.dNSName;
+                if ((size_t) ASN1_STRING_length(ia5) == dom.len
+                    && memcmp(ASN1_STRING_get0_data(ia5), dom.data, dom.len)
+                       == 0)
+                {
+                    found = 1;
+                }
+            }
+        }
+        GENERAL_NAMES_free(gns);
+    }
+    CHECK(found, "csr: SAN lists the domain");
+
+    if (reqpub != NULL) {
+        EVP_PKEY_free(reqpub);
+    }
+    X509_REQ_free(req);
+    ngx_http_autocert_key_free(pkey);
+}
+
+
 int
 main(void)
 {
@@ -279,6 +359,8 @@ main(void)
     test_jwk_and_thumbprint();
     test_jws_sign_verify(NGX_HTTP_AUTOCERT_CRYPTO_P256, "ES256");
     test_jws_sign_verify(NGX_HTTP_AUTOCERT_CRYPTO_P384, "ES384");
+    test_csr(NGX_HTTP_AUTOCERT_CRYPTO_P256, "le.example.com");
+    test_csr(NGX_HTTP_AUTOCERT_CRYPTO_P384, "example.org");
 
     ngx_destroy_pool(p);
 
