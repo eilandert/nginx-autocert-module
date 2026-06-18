@@ -318,8 +318,33 @@ ngx_autocert_order_authz_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
     order = req->data;
 
     if (rc == NGX_OK && req->status == 200) {
+        ngx_str_t  azstatus;
+
         root = ngx_autocert_json_parse(req->pool, req->body_out.data,
                                        req->body_out.len);
+
+        /*
+         * If the CA already considers this authorization valid (it caches a
+         * recent successful validation — common on reissue/renewal), there is
+         * no pending challenge to answer: POSTing the challenge would 400.
+         * Skip straight to finalize. (RFC 8555 §7.5.1: an order may reuse an
+         * existing valid authz.)
+         */
+        if (root != NULL
+            && ngx_autocert_json_object_str(root, "status", &azstatus) == NGX_OK
+            && azstatus.len == sizeof("valid") - 1
+            && ngx_strncmp(azstatus.data, "valid", azstatus.len) == 0)
+        {
+            ngx_destroy_pool(req->pool);
+            ngx_log_error(NGX_LOG_NOTICE, order->log, 0,
+                          "autocert: authorization for \"%V\" already valid; "
+                          "skipping challenge", &order->domain);
+            if (ngx_autocert_order_finalize(order) != NGX_OK) {
+                ngx_autocert_order_finish(order, NGX_ERROR);
+            }
+            return;
+        }
+
         challenges = (root != NULL)
                      ? ngx_autocert_json_object_get(root, "challenges") : NULL;
 

@@ -129,4 +129,16 @@ ngx_int_t ngx_http_autocert_csr_der(ngx_pool_t *pool, EVP_PKEY *pkey,
 X509 *ngx_http_autocert_dummy_cert(EVP_PKEY *pkey);
 
 
+/*
+ * Read the leaf certificate's notAfter from a PEM fullchain file at `path`
+ * (NUL-terminated C string) and convert it to a Unix `time_t` in *out. The
+ * leaf is the FIRST certificate in the file (per the store layout). Returns
+ * NGX_OK on success; NGX_DECLINED if the file is absent (ENOENT/ENOTDIR);
+ * NGX_ERROR on any other open/parse failure. Used by the renewal scheduler
+ * (M8) to decide whether a stored cert is inside its renew window. No nginx
+ * pool dependency.
+ */
+ngx_int_t ngx_http_autocert_cert_not_after(const char *path, time_t *out);
+
+
 #endif /* _NGX_HTTP_AUTOCERT_CRYPTO_H_INCLUDED_ */

@@ -22,9 +22,14 @@ certificate from an ACME CA (Let's Encrypt by default) for that vhost's
 > autocert on;` server needs **no `ssl_certificate`** — the module gives it a
 > self-signed bootstrap cert so the listener comes up, then swaps in the real
 > certificate **per-SNI at the TLS handshake**, reloading automatically when a
-> renewal rewrites the files (no config reload). Verified end-to-end against
-> Pebble in CI. Still ahead: timed **renewal** (M8), robustness/retry (M9),
-> TLS-ALPN-01 (M10), and a packaged Debian sub-package (M11).
+> renewal rewrites the files (no config reload). M8 adds **timed renewal across
+> all configured names**: a scheduler on the helper reads each stored
+> certificate's `notAfter` and reissues it once it enters the
+> `autocert_renew_before` window (default 7d), writing the fresh cert into the
+> store where the per-SNI serve path hot-reloads it — no config reload, no
+> downtime. Verified end-to-end against Pebble in CI. Still ahead:
+> robustness/retry (M9), TLS-ALPN-01 (M10), and a packaged Debian sub-package
+> (M11).
 
 ## Directives
 
