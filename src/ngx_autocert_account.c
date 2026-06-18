@@ -479,6 +479,422 @@ ngx_autocert_account_register_done(ngx_autocert_acme_request_t *req,
 }
 
 
+/* --- M6a: kid-signed POST primitive ------------------------------------- */
+
+static ngx_int_t ngx_autocert_account_send_post(ngx_autocert_account_t *acct);
+static void ngx_autocert_account_post_done(ngx_autocert_acme_request_t *req,
+    ngx_int_t rc);
+static void ngx_autocert_account_renonce_done(ngx_autocert_acme_request_t *req,
+    ngx_int_t rc);
+static ngx_uint_t ngx_autocert_account_is_bad_nonce(
+    ngx_autocert_acme_request_t *req);
+static void ngx_autocert_account_post_fail(ngx_autocert_account_t *acct);
+static ngx_int_t ngx_autocert_account_set_nonce(ngx_autocert_account_t *acct,
+    ngx_str_t *nonce);
+
+
+/*
+ * The kid/nonce/url bytes we embed verbatim in the protected JWS JSON come from
+ * ACME responses (Location/Replay-Nonce headers, directory URLs). They must not
+ * contain a JSON-string-breaking byte: a control char (< 0x20), a double quote,
+ * or a backslash would corrupt the protected header or inject a field. ACME
+ * tokens/URLs/nonces never legitimately contain these, so reject rather than
+ * escape — a value with them is a malformed/hostile server response.
+ */
+static ngx_uint_t
+ngx_autocert_account_json_safe(ngx_str_t *s)
+{
+    size_t  i;
+
+    for (i = 0; i < s->len; i++) {
+        u_char c = s->data[i];
+        if (c < 0x20 || c == '"' || c == '\\') {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+
+/*
+ * Replace the account's current nonce with `nonce`, copied into a dedicated
+ * pool that is reset (not grown) on every refresh — so the long-lived session
+ * pool doesn't accumulate one dead nonce per signed POST/poll/retry.
+ */
+static ngx_int_t
+ngx_autocert_account_set_nonce(ngx_autocert_account_t *acct, ngx_str_t *nonce)
+{
+    if (acct->nonce_pool == NULL) {
+        acct->nonce_pool = ngx_create_pool(NGX_MIN_POOL_SIZE, acct->log);
+        if (acct->nonce_pool == NULL) {
+            return NGX_ERROR;
+        }
+    } else {
+        ngx_reset_pool(acct->nonce_pool);
+    }
+
+    acct->nonce.data = ngx_pnalloc(acct->nonce_pool, nonce->len);
+    if (acct->nonce.data == NULL) {
+        ngx_str_null(&acct->nonce);
+        return NGX_ERROR;
+    }
+    ngx_memcpy(acct->nonce.data, nonce->data, nonce->len);
+    acct->nonce.len = nonce->len;
+    return NGX_OK;
+}
+
+
+ngx_int_t
+ngx_autocert_account_post(ngx_autocert_account_t *acct, ngx_str_t *url,
+    ngx_str_t *payload, ngx_autocert_acme_handler_pt handler, void *data)
+{
+    if (acct->kid.len == 0 || acct->key == NULL) {
+        ngx_log_error(NGX_LOG_ERR, acct->log, 0,
+                      "autocert: kid-signed POST before account ready");
+        return NGX_ERROR;
+    }
+
+    /* One in-flight kid-signed POST per account: the POST state lives on the
+     * account struct, so a second concurrent call would clobber the first. The
+     * order state machine is strictly sequential, so this is an invariant, not
+     * a queue — reject a violation loudly rather than corrupt state. */
+    if (acct->post_pool != NULL) {
+        ngx_log_error(NGX_LOG_ERR, acct->log, 0,
+                      "autocert: concurrent kid-signed POST rejected");
+        return NGX_ERROR;
+    }
+
+    /* Reject a URL that would break the protected JSON (the payload is opaque
+     * and base64url-encoded by the JWS, so only the URL needs the check here;
+     * kid/nonce are checked at sign time). */
+    if (!ngx_autocert_account_json_safe(url)) {
+        ngx_log_error(NGX_LOG_ERR, acct->log, 0,
+                      "autocert: unsafe bytes in POST url");
+        return NGX_ERROR;
+    }
+
+    /* Each signed POST gets its own pool, freed in the internal completion
+     * before the caller's handler runs. */
+    acct->post_pool = ngx_create_pool(NGX_MIN_POOL_SIZE, acct->log);
+    if (acct->post_pool == NULL) {
+        return NGX_ERROR;
+    }
+
+    acct->post_url.data = ngx_pnalloc(acct->post_pool, url->len);
+    acct->post_payload.data = ngx_pnalloc(acct->post_pool, payload->len);
+    if (acct->post_url.data == NULL
+        || (payload->len != 0 && acct->post_payload.data == NULL))
+    {
+        ngx_destroy_pool(acct->post_pool);
+        acct->post_pool = NULL;
+        return NGX_ERROR;
+    }
+    ngx_memcpy(acct->post_url.data, url->data, url->len);
+    acct->post_url.len = url->len;
+    ngx_memcpy(acct->post_payload.data, payload->data, payload->len);
+    acct->post_payload.len = payload->len;
+
+    acct->post_handler = handler;
+    acct->post_data = data;
+    acct->post_retried = 0;
+
+    if (ngx_autocert_account_send_post(acct) != NGX_OK) {
+        ngx_destroy_pool(acct->post_pool);
+        acct->post_pool = NULL;
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+
+/*
+ * Build the kid-signed JWS for the pending post_url/post_payload with the
+ * account's current nonce and send it. Reused for the badNonce retry.
+ */
+static ngx_int_t
+ngx_autocert_account_send_post(ngx_autocert_account_t *acct)
+{
+    ngx_str_t    protected, jws;
+    ngx_str_t    ctype = ngx_string("application/jose+json");
+    ngx_str_t    post = ngx_string("POST");
+    const char  *alg;
+    u_char      *p;
+    size_t       size;
+
+    alg = ngx_http_autocert_jws_alg(acct->key);
+    if (alg == NULL) {
+        return NGX_ERROR;
+    }
+
+    /* kid and nonce are embedded verbatim in the protected JSON; reject any
+     * value that could break the string (the url was checked at submit). */
+    if (!ngx_autocert_account_json_safe(&acct->kid)
+        || !ngx_autocert_account_json_safe(&acct->nonce))
+    {
+        ngx_log_error(NGX_LOG_ERR, acct->log, 0,
+                      "autocert: unsafe bytes in kid/nonce");
+        return NGX_ERROR;
+    }
+
+    /* protected = {"alg":"<alg>","kid":"<kid>","nonce":"<nonce>","url":"<url>"} */
+    size = sizeof("{\"alg\":\"\",\"kid\":\"\",\"nonce\":\"\",\"url\":\"\"}") - 1
+           + ngx_strlen(alg) + acct->kid.len + acct->nonce.len
+           + acct->post_url.len;
+
+    protected.data = ngx_pnalloc(acct->post_pool, size);
+    if (protected.data == NULL) {
+        return NGX_ERROR;
+    }
+
+    p = ngx_cpymem(protected.data, "{\"alg\":\"", sizeof("{\"alg\":\"") - 1);
+    p = ngx_cpymem(p, alg, ngx_strlen(alg));
+    p = ngx_cpymem(p, "\",\"kid\":\"", sizeof("\",\"kid\":\"") - 1);
+    p = ngx_cpymem(p, acct->kid.data, acct->kid.len);
+    p = ngx_cpymem(p, "\",\"nonce\":\"", sizeof("\",\"nonce\":\"") - 1);
+    p = ngx_cpymem(p, acct->nonce.data, acct->nonce.len);
+    p = ngx_cpymem(p, "\",\"url\":\"", sizeof("\",\"url\":\"") - 1);
+    p = ngx_cpymem(p, acct->post_url.data, acct->post_url.len);
+    p = ngx_cpymem(p, "\"}", sizeof("\"}") - 1);
+    protected.len = p - protected.data;
+
+    if (ngx_http_autocert_jws_sign(acct->post_pool, acct->key, &protected,
+                                   &acct->post_payload, &jws)
+        != NGX_OK)
+    {
+        ngx_log_error(NGX_LOG_ERR, acct->log, 0,
+                      "autocert: kid-signed JWS signing failed");
+        return NGX_ERROR;
+    }
+
+    /* The signed POST request runs on its own request pool (child of nothing —
+     * a fresh pool per request, as account_start does). */
+    {
+        ngx_pool_t                   *pool;
+        ngx_autocert_acme_request_t  *req;
+
+        pool = ngx_create_pool(NGX_MIN_POOL_SIZE, acct->log);
+        if (pool == NULL) {
+            return NGX_ERROR;
+        }
+
+        req = ngx_pcalloc(pool, sizeof(ngx_autocert_acme_request_t));
+        if (req == NULL) {
+            ngx_destroy_pool(pool);
+            return NGX_ERROR;
+        }
+
+        req->client = acct->client;
+        req->pool = pool;
+        req->log = acct->log;
+        req->method = post;
+        req->content_type = ctype;
+        req->handler = ngx_autocert_account_post_done;
+        req->data = acct;
+
+        /* Copy url + signed body into the REQUEST pool so the request (and the
+         * req handed to the caller's completion handler) does not alias the
+         * per-POST signing pool, which is destroyed before that handler runs. */
+        req->url.data = ngx_pnalloc(pool, acct->post_url.len);
+        req->body.data = ngx_pnalloc(pool, jws.len);
+        if (req->url.data == NULL || (jws.len != 0 && req->body.data == NULL)) {
+            ngx_destroy_pool(pool);
+            return NGX_ERROR;
+        }
+        ngx_memcpy(req->url.data, acct->post_url.data, acct->post_url.len);
+        req->url.len = acct->post_url.len;
+        ngx_memcpy(req->body.data, jws.data, jws.len);
+        req->body.len = jws.len;
+
+        if (ngx_autocert_acme_request(req) != NGX_OK) {
+            ngx_destroy_pool(pool);
+            return NGX_ERROR;
+        }
+    }
+
+    return NGX_OK;
+}
+
+
+/* True if the response is an ACME badNonce error (type ends with
+ * ":badNonce"). ACME errors are 4xx with a problem+json body. */
+static ngx_uint_t
+ngx_autocert_account_is_bad_nonce(ngx_autocert_acme_request_t *req)
+{
+    ngx_autocert_json_value_t  *root;
+    ngx_str_t                   type;
+    static const u_char         suffix[] = ":badNonce";
+
+    if (req->status < 400 || req->body_out.len == 0) {
+        return 0;
+    }
+
+    root = ngx_autocert_json_parse(req->pool, req->body_out.data,
+                                   req->body_out.len);
+    if (root == NULL
+        || ngx_autocert_json_object_str(root, "type", &type) != NGX_OK)
+    {
+        return 0;
+    }
+
+    if (type.len < sizeof(suffix) - 1) {
+        return 0;
+    }
+
+    return ngx_strncmp(type.data + type.len - (sizeof(suffix) - 1),
+                       suffix, sizeof(suffix) - 1) == 0;
+}
+
+
+/*
+ * Deliver a terminal failure to the caller's post handler. The contract gives
+ * the caller a non-NULL req carrying its own post_data (so its handler can read
+ * req->data and finish its state machine); status 0 marks "no HTTP response".
+ * The caller owns and destroys req->pool, as on the success path.
+ */
+static void
+ngx_autocert_account_post_fail(ngx_autocert_account_t *acct)
+{
+    ngx_autocert_acme_handler_pt  handler = acct->post_handler;
+    void                         *data = acct->post_data;
+    ngx_pool_t                   *pool;
+    ngx_autocert_acme_request_t  *req;
+
+    if (acct->post_pool) {
+        ngx_destroy_pool(acct->post_pool);
+        acct->post_pool = NULL;
+    }
+
+    if (handler == NULL) {
+        return;
+    }
+
+    pool = ngx_create_pool(NGX_MIN_POOL_SIZE, acct->log);
+    if (pool == NULL) {
+        /* last resort: no pool to build a req — caller must tolerate NULL */
+        handler(NULL, NGX_ERROR);
+        return;
+    }
+    req = ngx_pcalloc(pool, sizeof(ngx_autocert_acme_request_t));
+    if (req == NULL) {
+        ngx_destroy_pool(pool);
+        handler(NULL, NGX_ERROR);
+        return;
+    }
+    req->pool = pool;
+    req->log = acct->log;
+    req->data = data;
+    req->status = 0;
+
+    handler(req, NGX_ERROR);
+}
+
+
+static void
+ngx_autocert_account_post_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
+{
+    ngx_autocert_account_t  *acct = req->data;
+    ngx_str_t               *nonce;
+
+    /* Refresh the account nonce from any response that carries one (success or
+     * error — ACME returns a fresh nonce on most replies). Stored in the
+     * resettable nonce pool so nonces don't accumulate. */
+    if (rc == NGX_OK) {
+        nonce = ngx_autocert_acme_header(req, "Replay-Nonce");
+        if (nonce != NULL && nonce->len > 0) {
+            (void) ngx_autocert_account_set_nonce(acct, nonce);
+        }
+    }
+
+    /* badNonce: re-fetch newNonce and retry the same POST once. */
+    if (rc == NGX_OK && !acct->post_retried
+        && ngx_autocert_account_is_bad_nonce(req))
+    {
+        acct->post_retried = 1;
+        ngx_destroy_pool(req->pool);
+
+        ngx_log_error(NGX_LOG_NOTICE, acct->log, 0,
+                      "autocert: badNonce, re-fetching nonce and retrying POST");
+
+        {
+            ngx_pool_t                   *pool;
+            ngx_autocert_acme_request_t  *nreq;
+            ngx_str_t                     get = ngx_string("GET");
+
+            pool = ngx_create_pool(NGX_MIN_POOL_SIZE, acct->log);
+            if (pool == NULL) {
+                ngx_autocert_account_post_fail(acct);
+                return;
+            }
+            nreq = ngx_pcalloc(pool, sizeof(ngx_autocert_acme_request_t));
+            if (nreq == NULL) {
+                ngx_destroy_pool(pool);
+                ngx_autocert_account_post_fail(acct);
+                return;
+            }
+            nreq->client = acct->client;
+            nreq->pool = pool;
+            nreq->log = acct->log;
+            nreq->method = get;
+            nreq->url = acct->new_nonce_url;
+            nreq->handler = ngx_autocert_account_renonce_done;
+            nreq->data = acct;
+
+            if (ngx_autocert_acme_request(nreq) != NGX_OK) {
+                ngx_destroy_pool(pool);
+                ngx_autocert_account_post_fail(acct);
+            }
+        }
+        return;
+    }
+
+    /* Terminal: hand the finished request to the caller, then it owns req->pool
+     * (it must destroy it). Release the per-POST signing pool first. */
+    if (acct->post_pool) {
+        ngx_destroy_pool(acct->post_pool);
+        acct->post_pool = NULL;
+    }
+
+    /* The request carried acct as its data (this handler reads it); hand the
+     * caller's own context back through req->data so the caller's handler sees
+     * what it passed to ngx_autocert_account_post(). */
+    req->data = acct->post_data;
+
+    if (acct->post_handler) {
+        acct->post_handler(req, rc);
+    } else {
+        ngx_destroy_pool(req->pool);
+    }
+}
+
+
+static void
+ngx_autocert_account_renonce_done(ngx_autocert_acme_request_t *req,
+    ngx_int_t rc)
+{
+    ngx_autocert_account_t  *acct = req->data;
+    ngx_str_t               *nonce;
+    ngx_int_t                ok = NGX_ERROR;
+
+    if (rc == NGX_OK && (req->status == 200 || req->status == 204)) {
+        nonce = ngx_autocert_acme_header(req, "Replay-Nonce");
+        if (nonce != NULL && nonce->len > 0
+            && ngx_autocert_account_set_nonce(acct, nonce) == NGX_OK)
+        {
+            ok = NGX_OK;
+        }
+    }
+
+    ngx_destroy_pool(req->pool);
+
+    if (ok != NGX_OK || ngx_autocert_account_send_post(acct) != NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, acct->log, 0,
+                      "autocert: badNonce retry failed");
+        ngx_autocert_account_post_fail(acct);
+    }
+}
+
+
 static void
 ngx_autocert_account_finish(ngx_autocert_account_t *acct, ngx_int_t rc)
 {
@@ -510,6 +926,10 @@ ngx_autocert_account_free(ngx_autocert_account_t *acct)
     if (acct->key) {
         ngx_http_autocert_key_free(acct->key);
         acct->key = NULL;
+    }
+    if (acct->nonce_pool) {
+        ngx_destroy_pool(acct->nonce_pool);
+        acct->nonce_pool = NULL;
     }
     if (acct->pool) {
         ngx_destroy_pool(acct->pool);

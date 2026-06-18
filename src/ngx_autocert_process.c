@@ -42,6 +42,7 @@
 #include "ngx_autocert_acme.h"
 #include "ngx_autocert_account.h"
 #include "ngx_autocert_challenge.h"
+#include "ngx_autocert_order.h"
 
 
 #define NGX_AUTOCERT_PROC_NAME    "autocert helper"
@@ -62,6 +63,9 @@ static void ngx_autocert_close_listening(ngx_cycle_t *cycle);
 static void ngx_autocert_kick_handler(ngx_event_t *ev);
 static void ngx_autocert_account_done(ngx_autocert_account_t *acct,
     ngx_int_t rc);
+static void ngx_autocert_start_order(ngx_cycle_t *cycle);
+static void ngx_autocert_order_complete(ngx_autocert_order_t *order,
+    ngx_int_t rc);
 
 
 /*
@@ -72,6 +76,9 @@ static void ngx_autocert_account_done(ngx_autocert_account_t *acct,
 static ngx_autocert_acme_client_t  ngx_autocert_client;
 static ngx_uint_t                   ngx_autocert_client_ready;
 static ngx_autocert_account_t      *ngx_autocert_account;
+static ngx_pool_t                  *ngx_autocert_account_pool;
+static ngx_autocert_order_t        *ngx_autocert_order;
+static ngx_pool_t                  *ngx_autocert_order_pool;
 static ngx_uint_t                   ngx_autocert_test_seeded;
 
 
@@ -701,6 +708,7 @@ ngx_autocert_kick_handler(ngx_event_t *ev)
         ngx_destroy_pool(pool);
         return;
     }
+    ngx_autocert_account_pool = pool;
 
     acct = ngx_autocert_account;
     acct->client = &ngx_autocert_client;
@@ -709,7 +717,7 @@ ngx_autocert_kick_handler(ngx_event_t *ev)
     acct->directory_url = acf.ca;
     acct->key_type = acf.key_type;
     acct->handler = ngx_autocert_account_done;
-    acct->data = pool;                  /* outer pool, freed in _done */
+    acct->data = cycle;                 /* used to chain into the order flow */
 
     /* account key path = <autocert_path>/account.key */
     acct->key_path.len = acf.path.len + sizeof("/account.key") - 1;
@@ -717,6 +725,7 @@ ngx_autocert_kick_handler(ngx_event_t *ev)
     if (acct->key_path.data == NULL) {
         ngx_destroy_pool(pool);
         ngx_autocert_account = NULL;
+        ngx_autocert_account_pool = NULL;
         return;
     }
     {
@@ -733,28 +742,135 @@ ngx_autocert_kick_handler(ngx_event_t *ev)
                       "autocert: could not start ACME account registration");
         ngx_destroy_pool(pool);
         ngx_autocert_account = NULL;
+        ngx_autocert_account_pool = NULL;
     }
 }
 
 
 /*
- * Terminal callback of the account bootstrap. Frees the account (its key + the
- * bootstrap pool) and the outer pool that holds the account struct itself. The
- * CI asserts on the success line emitted by the account module.
+ * Terminal callback of the account bootstrap. On failure the account is freed.
+ * On success the account is kept ALIVE as the ACME session (it owns the kid,
+ * key and current nonce that every later POST is signed with — M6a) and the
+ * order flow is started for the first collected name. The CI asserts on the
+ * success line emitted by the account module.
  */
 static void
 ngx_autocert_account_done(ngx_autocert_account_t *acct, ngx_int_t rc)
 {
-    ngx_pool_t  *outer = acct->data;
+    ngx_cycle_t  *cycle = acct->data;
 
     if (rc != NGX_OK) {
         ngx_log_error(NGX_LOG_ERR, acct->log, 0,
                       "autocert: ACME account registration failed");
+        ngx_autocert_account_free(acct);            /* key + bootstrap pool */
+        ngx_autocert_account = NULL;
+        if (ngx_autocert_account_pool) {
+            ngx_destroy_pool(ngx_autocert_account_pool);
+            ngx_autocert_account_pool = NULL;
+        }
+        return;
     }
 
-    ngx_autocert_account_free(acct);    /* key + bootstrap pool */
-    ngx_autocert_account = NULL;
-    ngx_destroy_pool(outer);            /* the acct struct + key_path */
+    /* Keep the account alive; chain into the order flow. */
+    ngx_autocert_start_order(cycle);
+}
+
+
+/*
+ * Start the M6a order flow for the FIRST collected server name, reusing the
+ * live account as the ACME session. One order at a time; multi-name iteration
+ * is a later milestone.
+ */
+static void
+ngx_autocert_start_order(ngx_cycle_t *cycle)
+{
+    ngx_autocert_conf_t    acf;
+    ngx_str_t             *names, *first;
+    ngx_pool_t            *pool;
+    ngx_autocert_order_t  *order;
+
+    if (ngx_autocert_order != NULL) {
+        return;                         /* already running */
+    }
+
+    if (ngx_autocert_get_conf(cycle, &acf) != NGX_OK || !acf.configured) {
+        return;
+    }
+
+    if (acf.names == NULL || acf.names->nelts == 0) {
+        ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
+                      "autocert: no server names collected; nothing to order");
+        return;
+    }
+    if (acf.challenge_zone == NULL) {
+        ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
+                      "autocert: no challenge zone; cannot run order");
+        return;
+    }
+
+    names = acf.names->elts;
+    first = &names[0];
+
+    pool = ngx_create_pool(NGX_MIN_POOL_SIZE, cycle->log);
+    if (pool == NULL) {
+        return;
+    }
+
+    order = ngx_pcalloc(pool, sizeof(ngx_autocert_order_t));
+    if (order == NULL) {
+        ngx_destroy_pool(pool);
+        return;
+    }
+
+    /* The domain string aliases the HTTP main-conf pool, which outlives the
+     * order; the order copies what it needs into its own pool internally. */
+    order->account = ngx_autocert_account;
+    order->log = cycle->log;
+    order->directory_url = acf.ca;
+    order->domain = *first;
+    order->challenge_zone = acf.challenge_zone;
+    order->handler = ngx_autocert_order_complete;
+    order->data = cycle;
+
+    ngx_autocert_order = order;
+    ngx_autocert_order_pool = pool;
+
+    ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
+                  "autocert: starting ACME order for \"%V\"", first);
+
+    if (ngx_autocert_order_start(order) != NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
+                      "autocert: could not start ACME order");
+        ngx_destroy_pool(pool);
+        ngx_autocert_order = NULL;
+        ngx_autocert_order_pool = NULL;
+    }
+}
+
+
+/*
+ * Terminal callback of the order flow (M6a ends at authz=valid). M6b will take
+ * order->order_url / order->finalize_url from here to finish issuance. For now
+ * we free the order and log the outcome (the CI asserts on the success line).
+ */
+static void
+ngx_autocert_order_complete(ngx_autocert_order_t *order, ngx_int_t rc)
+{
+    if (rc == NGX_OK) {
+        ngx_log_error(NGX_LOG_NOTICE, order->log, 0,
+                      "autocert: order ready to finalize for \"%V\" "
+                      "(order %V)", &order->domain, &order->order_url);
+    } else {
+        ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                      "autocert: ACME order failed for \"%V\"", &order->domain);
+    }
+
+    ngx_autocert_order_free(order);     /* drops token, frees order pool... */
+    ngx_autocert_order = NULL;
+    if (ngx_autocert_order_pool) {
+        ngx_destroy_pool(ngx_autocert_order_pool);
+        ngx_autocert_order_pool = NULL;
+    }
 }
 
 

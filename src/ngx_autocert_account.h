@@ -59,7 +59,20 @@ struct ngx_autocert_account_s {
     ngx_str_t                        new_nonce_url;
     ngx_str_t                        new_account_url;
     ngx_str_t                        nonce;          /* current Replay-Nonce */
+    ngx_pool_t                      *nonce_pool;      /* holds nonce; reset on
+                                                       * each refresh (M6a) so
+                                                       * nonces don't accumulate
+                                                       * in the session pool */
     ngx_uint_t                       done;
+
+    /* in-flight kid-signed POST state (M6a). One signed POST per account at a
+     * time; the order state machine chains them. */
+    ngx_pool_t                      *post_pool;      /* per-POST pool */
+    ngx_str_t                        post_url;       /* target (in post_pool) */
+    ngx_str_t                        post_payload;   /* raw body (in post_pool) */
+    ngx_autocert_acme_handler_pt     post_handler;   /* caller completion */
+    void                            *post_data;      /* caller context */
+    ngx_uint_t                       post_retried;   /* badNonce retry guard */
 };
 
 
@@ -76,6 +89,33 @@ struct ngx_autocert_account_s {
 ngx_int_t ngx_autocert_account_register(ngx_autocert_account_t *acct);
 
 void ngx_autocert_account_free(ngx_autocert_account_t *acct);
+
+
+/*
+ * Kid-signed ACME POST (M6a) — the account owns the kid, key and current nonce,
+ * so every authenticated request (newOrder, authz/order POST-as-GET, challenge
+ * respond, finalize) goes through here. Builds the protected header
+ *   {"alg":…,"kid":"<acct kid>","nonce":"<acct nonce>","url":"<url>"}
+ * signs a flattened JWS over `payload` (pass an EMPTY payload for POST-as-GET),
+ * and POSTs application/jose+json. On a 2xx the account nonce is refreshed from
+ * the response Replay-Nonce header. On an ACME "badNonce" error the request is
+ * retried ONCE after re-fetching newNonce.
+ *
+ * The completion handler is invoked exactly once with the finished request (so
+ * the caller can read req->status / req->body_out / response headers) and rc
+ * (NGX_OK if a response was received — inspect status — or NGX_ERROR on a
+ * transport failure or if the retry was also exhausted). On NGX_OK the request
+ * pool is the caller's to destroy from inside the handler, as with the raw
+ * client; on NGX_ERROR the req argument may be NULL (no request survived) so
+ * the handler MUST null-check before touching it.
+ *
+ * acct must be a registered account (acct->kid set). Returns NGX_OK once the
+ * request is started (handler fires later) or NGX_ERROR if it could not start
+ * (handler NOT called).
+ */
+ngx_int_t ngx_autocert_account_post(ngx_autocert_account_t *acct,
+    ngx_str_t *url, ngx_str_t *payload, ngx_autocert_acme_handler_pt handler,
+    void *data);
 
 
 #endif /* _NGX_AUTOCERT_ACCOUNT_H_INCLUDED_ */
