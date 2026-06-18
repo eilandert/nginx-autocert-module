@@ -13,13 +13,21 @@ ngx_addon_name=ngx_http_autocert_module
 if test -n "$ngx_module_link"; then
     ngx_module_type=CORE
     ngx_module_name=ngx_autocert_process_module
+    # The crypto TU (ngx_http_autocert_crypto.c) is compiled into BOTH modules:
+    # it is self-contained (own .h + ngx_core + OpenSSL, no HTTP-module symbols)
+    # and the two dynamic .so do not cross-resolve symbols, so the helper (this
+    # CORE module) needs its own copy to sign the ACME newAccount JWS.
     ngx_module_srcs="$ngx_addon_dir/src/ngx_autocert_process.c \
                      $ngx_addon_dir/src/ngx_autocert_acme.c \
                      $ngx_addon_dir/src/ngx_autocert_json.c \
+                     $ngx_addon_dir/src/ngx_autocert_account.c \
+                     $ngx_addon_dir/src/ngx_http_autocert_crypto.c \
                      $ngx_addon_dir/src/ngx_autocert_conf.c"
     ngx_module_libs="-lssl -lcrypto"
     ngx_module_deps="$ngx_addon_dir/src/ngx_autocert_acme.h \
                      $ngx_addon_dir/src/ngx_autocert_json.h \
+                     $ngx_addon_dir/src/ngx_autocert_account.h \
+                     $ngx_addon_dir/src/ngx_http_autocert_crypto.h \
                      $ngx_addon_dir/src/ngx_autocert_shared.h \
                      $ngx_addon_dir/src/ngx_http_autocert_conf.h"
     . auto/module
@@ -39,6 +47,7 @@ else
                     $ngx_addon_dir/src/ngx_autocert_process.c \
                     $ngx_addon_dir/src/ngx_autocert_acme.c \
                     $ngx_addon_dir/src/ngx_autocert_json.c \
+                    $ngx_addon_dir/src/ngx_autocert_account.c \
                     $ngx_addon_dir/src/ngx_autocert_conf.c \
                     $ngx_addon_dir/src/ngx_http_autocert_module.c \
                     $ngx_addon_dir/src/ngx_http_autocert_crypto.c"

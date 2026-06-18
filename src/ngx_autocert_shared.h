@@ -21,6 +21,8 @@ typedef struct {
     ngx_resolver_t  *resolver;       /* may be NULL if autocert_resolver unset */
     time_t           resolver_timeout;
     ngx_str_t        ca_certificate; /* PEM trust bundle path, "" => system */
+    ngx_uint_t       key_type;       /* ngx_http_autocert_key_type_e (acct key) */
+    ngx_str_t        path;           /* cert store dir (holds the account key) */
 } ngx_autocert_conf_t;
 
 
