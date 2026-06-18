@@ -41,6 +41,7 @@
 #include "ngx_autocert_shared.h"
 #include "ngx_autocert_acme.h"
 #include "ngx_autocert_account.h"
+#include "ngx_autocert_challenge.h"
 
 
 #define NGX_AUTOCERT_PROC_NAME    "autocert helper"
@@ -71,6 +72,7 @@ static void ngx_autocert_account_done(ngx_autocert_account_t *acct,
 static ngx_autocert_acme_client_t  ngx_autocert_client;
 static ngx_uint_t                   ngx_autocert_client_ready;
 static ngx_autocert_account_t      *ngx_autocert_account;
+static ngx_uint_t                   ngx_autocert_test_seeded;
 
 
 static ngx_core_module_t  ngx_autocert_process_module_ctx = {
@@ -648,6 +650,25 @@ ngx_autocert_kick_handler(ngx_event_t *ev)
         ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
                       "autocert: no http{} autocert config; helper idle");
         return;
+    }
+
+    /* TEST-ONLY: seed the configured challenge into the shared store once, so
+     * the :80 serve path can be exercised before the order flow exists. */
+    if (!ngx_autocert_test_seeded
+        && acf.challenge_zone != NULL && acf.test_token.len != 0)
+    {
+        ngx_autocert_test_seeded = 1;
+        if (ngx_autocert_challenge_set(acf.challenge_zone, &acf.test_token,
+                                       &acf.test_keyauth)
+            == NGX_OK)
+        {
+            ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
+                          "autocert: seeded test challenge token \"%V\"",
+                          &acf.test_token);
+        } else {
+            ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
+                          "autocert: failed to seed test challenge token");
+        }
     }
 
     if (!ngx_autocert_client_ready) {

@@ -18,10 +18,16 @@
 #include <ngx_http.h>
 
 #include "ngx_http_autocert_conf.h"
+#include "ngx_autocert_challenge.h"
 
 
 #define NGX_HTTP_AUTOCERT_DEFAULT_CA \
     "https://acme-v02.api.letsencrypt.org/directory"
+
+#define NGX_HTTP_AUTOCERT_WK_PREFIX  "/.well-known/acme-challenge/"
+
+/* Challenge token store zone: small; one node per in-flight authorization. */
+#define NGX_HTTP_AUTOCERT_CHALLENGE_ZONE_SIZE  (128 * 1024)
 
 /* Default zone size: enough for a few thousand names; admin-tunable later. */
 #define NGX_HTTP_AUTOCERT_ZONE_SIZE  (256 * 1024)
@@ -46,6 +52,9 @@ static char *ngx_http_autocert_merge_srv_conf(ngx_conf_t *cf, void *parent,
 static ngx_int_t ngx_http_autocert_postconfig(ngx_conf_t *cf);
 static ngx_int_t ngx_http_autocert_init_zone(ngx_shm_zone_t *shm_zone,
     void *data);
+static ngx_int_t ngx_http_autocert_challenge_handler(ngx_http_request_t *r);
+static char *ngx_http_autocert_test_challenge(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
 
 static char *ngx_http_autocert(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static char *ngx_http_autocert_key_type(ngx_conf_t *cf, ngx_command_t *cmd,
@@ -138,6 +147,16 @@ static ngx_command_t  ngx_http_autocert_commands[] = {
       ngx_conf_set_str_slot,
       NGX_HTTP_MAIN_CONF_OFFSET,
       offsetof(ngx_http_autocert_main_conf_t, ca_certificate),
+      NULL },
+
+    /* TEST-ONLY: seed one token->keyauth into the challenge store at startup so
+     * the HTTP-01 serve path can be tested before the order flow (M6) exists.
+     * Not for production use. */
+    { ngx_string("autocert_test_challenge"),
+      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE2,
+      ngx_http_autocert_test_challenge,
+      NGX_HTTP_MAIN_CONF_OFFSET,
+      0,
       NULL },
 
       ngx_null_command
@@ -347,8 +366,41 @@ ngx_http_autocert_postconfig(ngx_conf_t *cf)
                   "autocert: %ui name(s) enabled for issuance",
                   amcf->names->nelts);
 
+    if (amcf->names->nelts == 0 && amcf->test_token.len == 0) {
+        /* Nothing to provision and no test seed; skip both zones. */
+        return NGX_OK;
+    }
+
+    /*
+     * Challenge token store + the :80 serving handler. Set up whenever there is
+     * something to provision (or a test seed). The zone reuses its tree across
+     * reload (noreuse off) so in-flight challenges survive a reconfigure.
+     */
+    ngx_str_set(&name, "autocert_challenges");
+
+    amcf->challenge_zone = ngx_shared_memory_add(cf, &name,
+                               NGX_HTTP_AUTOCERT_CHALLENGE_ZONE_SIZE,
+                               &ngx_http_autocert_module);
+    if (amcf->challenge_zone == NULL) {
+        return NGX_ERROR;
+    }
+    amcf->challenge_zone->init = ngx_autocert_challenge_init_zone;
+    amcf->challenge_zone->data = amcf;
+
+    {
+        ngx_http_handler_pt        *h;
+        ngx_http_core_main_conf_t  *cmcf2;
+
+        cmcf2 = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
+        h = ngx_array_push(&cmcf2->phases[NGX_HTTP_CONTENT_PHASE].handlers);
+        if (h == NULL) {
+            return NGX_ERROR;
+        }
+        *h = ngx_http_autocert_challenge_handler;
+    }
+
     if (amcf->names->nelts == 0) {
-        /* Nothing to provision; skip the zone entirely. */
+        /* Test-seed only: no name zone needed. */
         return NGX_OK;
     }
 
@@ -366,6 +418,80 @@ ngx_http_autocert_postconfig(ngx_conf_t *cf)
     amcf->shm_zone->noreuse = 1;
 
     return NGX_OK;
+}
+
+
+/*
+ * Content-phase handler for HTTP-01 validation. If the request URI is
+ * /.well-known/acme-challenge/<token>, look the token up in the challenge store
+ * and return its key authorization as text/plain; otherwise decline so the
+ * normal location handling proceeds. The token store is shared with the helper
+ * which fills it during the order flow (M6); M5 proves the serve path.
+ */
+static ngx_int_t
+ngx_http_autocert_challenge_handler(ngx_http_request_t *r)
+{
+    ngx_http_autocert_main_conf_t  *amcf;
+    ngx_str_t                       token, keyauth;
+    ngx_buf_t                      *b;
+    ngx_chain_t                     out;
+    ngx_int_t                       rc;
+    static const size_t             pfxlen =
+                                        sizeof(NGX_HTTP_AUTOCERT_WK_PREFIX) - 1;
+
+    if (r->uri.len <= pfxlen
+        || ngx_strncmp(r->uri.data, NGX_HTTP_AUTOCERT_WK_PREFIX, pfxlen) != 0)
+    {
+        return NGX_DECLINED;
+    }
+
+    amcf = ngx_http_get_module_main_conf(r, ngx_http_autocert_module);
+    if (amcf->challenge_zone == NULL) {
+        return NGX_DECLINED;
+    }
+
+    /* the token is the path segment after the prefix (no further slashes) */
+    token.data = r->uri.data + pfxlen;
+    token.len = r->uri.len - pfxlen;
+    if (ngx_strlchr(token.data, token.data + token.len, '/') != NULL) {
+        return NGX_DECLINED;
+    }
+
+    rc = ngx_autocert_challenge_get(amcf->challenge_zone, &token, r->pool,
+                                    &keyauth);
+    if (rc == NGX_DECLINED) {
+        return NGX_HTTP_NOT_FOUND;
+    }
+    if (rc != NGX_OK) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    if (r->method == NGX_HTTP_HEAD) {
+        keyauth.len = 0;                 /* headers only */
+    }
+
+    r->headers_out.status = NGX_HTTP_OK;
+    r->headers_out.content_length_n = keyauth.len;
+    ngx_str_set(&r->headers_out.content_type, "application/octet-stream");
+    r->headers_out.content_type_len = r->headers_out.content_type.len;
+
+    rc = ngx_http_send_header(r);
+    if (rc == NGX_ERROR || rc > NGX_OK || r->header_only || keyauth.len == 0) {
+        return rc;
+    }
+
+    b = ngx_create_temp_buf(r->pool, keyauth.len);
+    if (b == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    b->last = ngx_cpymem(b->pos, keyauth.data, keyauth.len);
+    b->last_buf = (r == r->main) ? 1 : 0;
+    b->last_in_chain = 1;
+
+    out.buf = b;
+    out.next = NULL;
+
+    return ngx_http_output_filter(r, &out);
 }
 
 
@@ -599,6 +725,49 @@ ngx_http_autocert_challenge(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                            &value[1]);
         return NGX_CONF_ERROR;
     }
+
+    return NGX_CONF_OK;
+}
+
+
+/*
+ * autocert_test_challenge <token> <keyauth>;  (TEST-ONLY)
+ *
+ * Records a single token/keyauth pair in the main conf; the helper inserts it
+ * into the challenge store at startup. Lets CI fetch
+ * /.well-known/acme-challenge/<token> and assert <keyauth> without running a
+ * real ACME order. Bounded to the same limits the store enforces.
+ */
+static char *
+ngx_http_autocert_test_challenge(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_autocert_main_conf_t  *amcf = conf;
+    ngx_str_t                      *value = cf->args->elts;
+
+    if (amcf->test_token.len != 0) {
+        return "is duplicate";
+    }
+
+    if (value[1].len == 0 || value[1].len > NGX_AUTOCERT_TOKEN_MAX
+        || value[2].len == 0 || value[2].len > NGX_AUTOCERT_KEYAUTH_MAX)
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "invalid token/keyauth length in "
+                           "\"autocert_test_challenge\"");
+        return NGX_CONF_ERROR;
+    }
+
+    if (ngx_strlchr(value[1].data, value[1].data + value[1].len, '/')
+        != NULL)
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "token must not contain '/' in "
+                           "\"autocert_test_challenge\"");
+        return NGX_CONF_ERROR;
+    }
+
+    amcf->test_token = value[1];
+    amcf->test_keyauth = value[2];
 
     return NGX_CONF_OK;
 }

@@ -195,6 +195,18 @@ jobs:
             AC_TEST_PORT=18177 \
             bash "$GITHUB_WORKSPACE/tests/helper-lifecycle.sh"
 
+      - name: HTTP-01 challenge serve (M5)
+        run: |
+          set -euo pipefail
+          # Seed a token via autocert_test_challenge, fetch
+          # /.well-known/acme-challenge/<token>, assert exact keyauth + 404s.
+          # No network/docker — pure nginx/angie. Reuses the matrix build dir.
+          SERVER_BIN="$GITHUB_WORKSPACE/${{ matrix.dir }}/$( \
+            [ -x "${{ matrix.dir }}/objs/angie" ] && echo objs/angie || echo objs/nginx)" \
+            NGX_BUILD_DIR="$GITHUB_WORKSPACE/${{ matrix.dir }}" \
+            AC_TEST_PORT=18178 \
+            bash "$GITHUB_WORKSPACE/tests/http01-challenge.sh"
+
   crypto-unit:
     name: Crypto unit tests (M3)
     needs: resolve
