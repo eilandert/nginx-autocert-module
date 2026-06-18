@@ -26,6 +26,11 @@ typedef struct {
 
     /* M5: the challenge token store the helper writes (NULL if not set up). */
     ngx_shm_zone_t  *challenge_zone;
+    /* M6a: the collected enabled server names (ngx_str_t array, NULL/empty if
+     * none). The order flow issues for the first name for now; multi-name
+     * iteration is later (M6+). Points into the HTTP main-conf pool, which
+     * outlives the helper run. */
+    ngx_array_t     *names;
     /* M5 test seed (token.len == 0 when unset). */
     ngx_str_t        test_token;
     ngx_str_t        test_keyauth;
