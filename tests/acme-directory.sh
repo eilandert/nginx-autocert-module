@@ -104,6 +104,16 @@ fi
 
 echo "✓ helper fetched the ACME directory over verified TLS"
 
+# The success line echoes a response header captured by the client
+# (ngx_autocert_acme_header). Pebble serves the directory as application/json,
+# so a captured, non-empty Content-Type proves header capture works e2e.
+if ! grep -q 'ACME directory OK.*content-type "application/json' "$PREFIX/logs/error.log"; then
+    echo "::error::Content-Type response header was not captured"
+    grep 'ACME directory OK' "$PREFIX/logs/error.log" || true
+    exit 1
+fi
+echo "✓ response header (Content-Type) captured by the client"
+
 # --- negative: without Pebble's CA, the self-signed cert must be REJECTED.
 # Proves TLS verification is actually enabled (not verify-none).
 echo "== negative: untrusted CA must fail verification =="

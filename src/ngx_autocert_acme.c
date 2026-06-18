@@ -823,6 +823,32 @@ ngx_autocert_memmem(u_char *hay, size_t n, const char *needle, size_t m)
  * chunked rejected), then body by length. Bodies with no Content-Length are
  * framed by Connection: close and end at EOF (handled in the read handler).
  */
+ngx_str_t *
+ngx_autocert_acme_header(ngx_autocert_acme_request_t *r, const char *name)
+{
+    ngx_autocert_acme_header_t  *h;
+    ngx_uint_t                   i;
+    size_t                       len;
+
+    if (r->headers == NULL) {
+        return NULL;
+    }
+
+    len = ngx_strlen(name);
+    h = r->headers->elts;
+
+    for (i = 0; i < r->headers->nelts; i++) {
+        if (h[i].name.len == len
+            && ngx_strncasecmp(h[i].name.data, (u_char *) name, len) == 0)
+        {
+            return &h[i].value;
+        }
+    }
+
+    return NULL;
+}
+
+
 static ngx_int_t
 ngx_autocert_acme_parse_response(ngx_autocert_acme_request_t *r)
 {
@@ -870,12 +896,51 @@ ngx_autocert_acme_parse_response(ngx_autocert_acme_request_t *r)
         }
 
         /* scan header lines */
+        r->headers = ngx_array_create(r->pool, 8,
+                                      sizeof(ngx_autocert_acme_header_t));
+        if (r->headers == NULL) {
+            return NGX_ERROR;
+        }
+
         line = eol + sizeof(CRLF) - 1;
         while (line < limit) {
+            u_char  *colon;
+
             eol = ngx_autocert_memmem(line, limit - line, CRLF,
                                       sizeof(CRLF) - 1);
             if (eol == NULL) {
                 eol = limit;
+            }
+
+            /* capture "Name: value" generically (value LWS-trimmed). A line
+             * without a colon is malformed; skip it rather than abort. */
+            colon = ngx_autocert_memmem(line, eol - line, ":", 1);
+            if (colon != NULL && colon > line) {
+                ngx_autocert_acme_header_t  *h;
+                u_char                      *v = colon + 1, *vend = eol;
+
+                while (v < vend && (*v == ' ' || *v == '\t')) v++;
+                while (vend > v && (vend[-1] == ' ' || vend[-1] == '\t')) vend--;
+
+                h = ngx_array_push(r->headers);
+                if (h == NULL) {
+                    return NGX_ERROR;
+                }
+
+                /* Copy into the pool: the recv buffer can be reallocated as the
+                 * body streams in (read handler grows it), which would dangle a
+                 * pointer aliased into it. */
+                h->name.len = colon - line;
+                h->name.data = ngx_pnalloc(r->pool, h->name.len);
+                h->value.len = vend - v;
+                h->value.data = ngx_pnalloc(r->pool, h->value.len);
+                if (h->name.data == NULL
+                    || (h->value.len && h->value.data == NULL))
+                {
+                    return NGX_ERROR;
+                }
+                ngx_memcpy(h->name.data, line, h->name.len);
+                ngx_memcpy(h->value.data, v, h->value.len);
             }
 
             if ((size_t) (eol - line) > sizeof("Content-Length:") - 1

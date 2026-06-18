@@ -702,9 +702,13 @@ ngx_autocert_directory_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
     ngx_pool_t  *pool = req->pool;
 
     if (rc == NGX_OK && req->status == 200) {
+        ngx_str_t   none = ngx_null_string;
+        ngx_str_t  *ct = ngx_autocert_acme_header(req, "Content-Type");
+
         ngx_log_error(NGX_LOG_NOTICE, req->log, 0,
-                      "autocert: ACME directory OK, status %ui, %uz bytes",
-                      req->status, req->body_out.len);
+                      "autocert: ACME directory OK, status %ui, %uz bytes, "
+                      "content-type \"%V\"",
+                      req->status, req->body_out.len, ct ? ct : &none);
     } else if (rc == NGX_OK) {
         ngx_log_error(NGX_LOG_ERR, req->log, 0,
                       "autocert: ACME directory unexpected status %ui",
