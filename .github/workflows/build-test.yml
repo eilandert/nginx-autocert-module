@@ -71,7 +71,16 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libpcre2-dev zlib1g-dev libssl-dev
+          sudo apt-get install -y build-essential libpcre2-dev zlib1g-dev libssl-dev ccache
+          ccache --max-size=500M
+
+      - name: Restore ccache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-
 
       - name: Fetch ${{ matrix.flavor }} ${{ matrix.version }}
         run: |
@@ -84,6 +93,7 @@ jobs:
           set -euo pipefail
           cd "${{ matrix.dir }}"
           ./configure --with-compat --with-http_ssl_module \
+            --with-cc="ccache cc" \
             --add-dynamic-module="$GITHUB_WORKSPACE" > /tmp/conf.log 2>&1 \
             || { tail -40 /tmp/conf.log; exit 1; }
           # Full build (not `make modules`): the load test needs the server
@@ -231,7 +241,16 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libpcre2-dev zlib1g-dev libssl-dev
+          sudo apt-get install -y build-essential libpcre2-dev zlib1g-dev libssl-dev ccache
+          ccache --max-size=500M
+
+      - name: Restore ccache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-
 
       - name: Fetch + configure nginx (for ngx_palloc/string/times objects)
         run: |
@@ -244,7 +263,7 @@ jobs:
           echo "NGX=$PWD/nginx-$ver" >> "$GITHUB_ENV"
           # configure + a full build so the core .o files we link exist.
           ( cd "nginx-$ver" \
-            && ./configure --with-compat --with-http_ssl_module > /tmp/c.log 2>&1 \
+            && ./configure --with-compat --with-http_ssl_module --with-cc="ccache cc" > /tmp/c.log 2>&1 \
             && make > /tmp/m.log 2>&1 ) || { tail -40 /tmp/c.log /tmp/m.log; exit 1; }
 
       - name: Build + run crypto unit tests
@@ -272,7 +291,16 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libpcre2-dev zlib1g-dev libssl-dev
+          sudo apt-get install -y build-essential libpcre2-dev zlib1g-dev libssl-dev ccache
+          ccache --max-size=500M
+
+      - name: Restore ccache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-
 
       - name: Fetch + configure nginx (for ngx_palloc/string/times objects)
         run: |
@@ -284,7 +312,7 @@ jobs:
           tar -xzf src.tar.gz
           echo "NGX=$PWD/nginx-$ver" >> "$GITHUB_ENV"
           ( cd "nginx-$ver" \
-            && ./configure --with-compat --with-http_ssl_module > /tmp/c.log 2>&1 \
+            && ./configure --with-compat --with-http_ssl_module --with-cc="ccache cc" > /tmp/c.log 2>&1 \
             && make > /tmp/m.log 2>&1 ) || { tail -40 /tmp/c.log /tmp/m.log; exit 1; }
 
       - name: Build + run JSON unit tests
@@ -312,7 +340,16 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libpcre2-dev zlib1g-dev libssl-dev
+          sudo apt-get install -y build-essential libpcre2-dev zlib1g-dev libssl-dev ccache
+          ccache --max-size=500M
+
+      - name: Restore ccache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-
 
       - name: Fetch + build nginx with the module
         run: |
@@ -324,6 +361,7 @@ jobs:
           tar -xzf src.tar.gz
           cd "nginx-$ver"
           ./configure --with-compat --with-http_ssl_module \
+            --with-cc="ccache cc" \
             --add-dynamic-module="$GITHUB_WORKSPACE" > /tmp/conf.log 2>&1 \
             || { tail -40 /tmp/conf.log; exit 1; }
           make > /tmp/make.log 2>&1 || { tail -40 /tmp/make.log; exit 1; }
@@ -348,7 +386,16 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libpcre2-dev zlib1g-dev libssl-dev
+          sudo apt-get install -y build-essential libpcre2-dev zlib1g-dev libssl-dev ccache
+          ccache --max-size=500M
+
+      - name: Restore ccache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-
 
       - name: Fetch + build nginx with the module
         run: |
@@ -360,6 +407,7 @@ jobs:
           tar -xzf src.tar.gz
           cd "nginx-$ver"
           ./configure --with-compat --with-http_ssl_module \
+            --with-cc="ccache cc" \
             --add-dynamic-module="$GITHUB_WORKSPACE" > /tmp/conf.log 2>&1 \
             || { tail -40 /tmp/conf.log; exit 1; }
           make > /tmp/make.log 2>&1 || { tail -40 /tmp/make.log; exit 1; }
@@ -388,7 +436,16 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libpcre2-dev zlib1g-dev libssl-dev
+          sudo apt-get install -y build-essential libpcre2-dev zlib1g-dev libssl-dev ccache
+          ccache --max-size=500M
+
+      - name: Restore ccache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-
 
       - name: Fetch + build nginx with the module
         run: |
@@ -400,6 +457,7 @@ jobs:
           tar -xzf src.tar.gz
           cd "nginx-$ver"
           ./configure --with-compat --with-http_ssl_module \
+            --with-cc="ccache cc" \
             --add-dynamic-module="$GITHUB_WORKSPACE" > /tmp/conf.log 2>&1 \
             || { tail -40 /tmp/conf.log; exit 1; }
           make > /tmp/make.log 2>&1 || { tail -40 /tmp/make.log; exit 1; }
@@ -428,7 +486,16 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libpcre2-dev zlib1g-dev libssl-dev
+          sudo apt-get install -y build-essential libpcre2-dev zlib1g-dev libssl-dev ccache
+          ccache --max-size=500M
+
+      - name: Restore ccache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-
 
       - name: Fetch + build nginx with the module
         run: |
@@ -440,6 +507,7 @@ jobs:
           tar -xzf src.tar.gz
           cd "nginx-$ver"
           ./configure --with-compat --with-http_ssl_module \
+            --with-cc="ccache cc" \
             --add-dynamic-module="$GITHUB_WORKSPACE" > /tmp/conf.log 2>&1 \
             || { tail -40 /tmp/conf.log; exit 1; }
           make > /tmp/make.log 2>&1 || { tail -40 /tmp/make.log; exit 1; }
@@ -467,7 +535,16 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libpcre2-dev zlib1g-dev libssl-dev
+          sudo apt-get install -y build-essential libpcre2-dev zlib1g-dev libssl-dev ccache
+          ccache --max-size=500M
+
+      - name: Restore ccache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-
 
       - name: Fetch + build nginx with the module
         run: |
@@ -479,6 +556,7 @@ jobs:
           tar -xzf src.tar.gz
           cd "nginx-$ver"
           ./configure --with-compat --with-http_ssl_module \
+            --with-cc="ccache cc" \
             --add-dynamic-module="$GITHUB_WORKSPACE" > /tmp/conf.log 2>&1 \
             || { tail -40 /tmp/conf.log; exit 1; }
           make > /tmp/make.log 2>&1 || { tail -40 /tmp/make.log; exit 1; }
