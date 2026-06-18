@@ -48,6 +48,18 @@ struct ngx_autocert_acme_request_s;
 typedef struct ngx_autocert_acme_request_s  ngx_autocert_acme_request_t;
 
 /*
+ * One captured response header, copied into the request pool (NOT aliased into
+ * the recv buffer, which may be reallocated as the body streams in). Valid
+ * until the request pool is destroyed. value has surrounding linear whitespace
+ * trimmed; name keeps its original case but is matched case-insensitively by
+ * ngx_autocert_acme_header().
+ */
+typedef struct {
+    ngx_str_t  name;
+    ngx_str_t  value;
+} ngx_autocert_acme_header_t;
+
+/*
  * Completion callback. rc is NGX_OK if a full HTTP response was read (inspect
  * r->status and r->body), NGX_ERROR on any transport/TLS/resolve failure (a
  * reason is already logged). Invoked exactly once.
@@ -75,6 +87,9 @@ struct ngx_autocert_acme_request_s {
     /* response outputs (valid when handler rc == NGX_OK) */
     ngx_uint_t                    status;   /* HTTP status code */
     ngx_str_t                     body_out; /* response body (pool-allocated) */
+    ngx_array_t                  *headers;  /* ngx_autocert_acme_header_t, the
+                                             * response headers in order; query
+                                             * with ngx_autocert_acme_header() */
 
     ngx_autocert_acme_handler_pt  handler;
     void                         *data;     /* caller context */
@@ -114,6 +129,16 @@ void ngx_autocert_acme_client_destroy(ngx_autocert_acme_client_t *client);
  * no resolver) — in the NGX_ERROR case the handler is NOT called.
  */
 ngx_int_t ngx_autocert_acme_request(ngx_autocert_acme_request_t *r);
+
+
+/*
+ * Look up a response header by name (case-insensitive) on a completed request.
+ * Returns the (whitespace-trimmed) value, or NULL if absent. If a header
+ * appears more than once the first occurrence is returned. Valid only inside
+ * the completion handler, before the request pool is destroyed.
+ */
+ngx_str_t *ngx_autocert_acme_header(ngx_autocert_acme_request_t *r,
+    const char *name);
 
 
 #endif /* _NGX_AUTOCERT_ACME_H_INCLUDED_ */
