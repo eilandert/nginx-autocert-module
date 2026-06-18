@@ -58,6 +58,8 @@ static ngx_int_t ngx_autocert_order_write_tmp(ngx_autocert_order_t *order,
     u_char *tmp, ngx_str_t *data, ngx_uint_t mode);
 static void ngx_autocert_order_finish(ngx_autocert_order_t *order,
     ngx_int_t rc);
+static void ngx_autocert_order_note_retry_after(ngx_autocert_order_t *order,
+    ngx_autocert_acme_request_t *req);
 static ngx_int_t ngx_autocert_order_dup(ngx_autocert_order_t *order,
     ngx_str_t *dst, ngx_str_t *src);
 static ngx_int_t ngx_autocert_order_get(ngx_autocert_order_t *order,
@@ -80,12 +82,80 @@ ngx_autocert_order_dup(ngx_autocert_order_t *order, ngx_str_t *dst,
 }
 
 
+/*
+ * Inspect a completed ACME response for an HTTP 429 (rate limited) and, if so,
+ * stamp order->retry_after with the absolute time before which this name must
+ * not be retried. RFC 7231 Retry-After is either delta-seconds or an HTTP-date;
+ * we honour both. A 429 with no/unparsable Retry-After falls back to a 60s hold
+ * so a rate-limited CA is never hammered. Called at the top of every response
+ * handler (must run before req->pool is destroyed — the header aliases it).
+ * Real Let's Encrypt enforces rate limits; honouring Retry-After avoids
+ * compounding a block with our own exponential guess.
+ */
+static void
+ngx_autocert_order_note_retry_after(ngx_autocert_order_t *order,
+    ngx_autocert_acme_request_t *req)
+{
+    ngx_str_t  *ra;
+    ngx_int_t   secs;
+    time_t      when, now;
+
+    /* Cap any honoured Retry-After at a sane maximum: it bounds how long a name
+     * is held, keeps ngx_time()+delay clear of time_t overflow for absurd
+     * values, and no legitimate ACME rate limit needs longer than a day. */
+    enum { RETRY_AFTER_MAX = 24 * 60 * 60 };
+
+    if (req == NULL || req->status != 429) {
+        return;
+    }
+
+    now = ngx_time();
+    ra = ngx_autocert_acme_header(req, "Retry-After");
+
+    if (ra != NULL && ra->len > 0) {
+        /* delta-seconds: an unsigned decimal count */
+        secs = ngx_atoi(ra->data, ra->len);
+        if (secs != NGX_ERROR) {
+            if (secs > RETRY_AFTER_MAX) {
+                secs = RETRY_AFTER_MAX;
+            }
+            order->retry_after = now + secs;
+            ngx_log_error(NGX_LOG_WARN, order->log, 0,
+                          "autocert: rate limited (429) for \"%V\", "
+                          "honouring Retry-After %i s", &order->domain, secs);
+            return;
+        }
+
+        /* HTTP-date form */
+        when = ngx_parse_http_time(ra->data, ra->len);
+        if (when != NGX_ERROR && when > now) {
+            if (when - now > RETRY_AFTER_MAX) {
+                when = now + RETRY_AFTER_MAX;
+            }
+            order->retry_after = when;
+            ngx_log_error(NGX_LOG_WARN, order->log, 0,
+                          "autocert: rate limited (429) for \"%V\", "
+                          "honouring Retry-After until %T", &order->domain,
+                          when);
+            return;
+        }
+    }
+
+    /* 429 with no usable hint: hold off 60s rather than retrying immediately. */
+    order->retry_after = ngx_time() + 60;
+    ngx_log_error(NGX_LOG_WARN, order->log, 0,
+                  "autocert: rate limited (429) for \"%V\", no usable "
+                  "Retry-After; holding 60 s", &order->domain);
+}
+
+
 ngx_int_t
 ngx_autocert_order_start(ngx_autocert_order_t *order)
 {
     order->done = 0;
     order->challenge_set = 0;
     order->poll_tries = 0;
+    order->retry_after = 0;
     ngx_str_null(&order->order_url);
     ngx_str_null(&order->finalize_url);
     ngx_str_null(&order->new_order_url);
@@ -167,6 +237,8 @@ ngx_autocert_order_directory_done(ngx_autocert_acme_request_t *req,
     ngx_str_t                   no;
     ngx_int_t                   ok = NGX_ERROR;
 
+    ngx_autocert_order_note_retry_after(order, req);
+
     if (rc == NGX_OK && req->status == 200) {
         root = ngx_autocert_json_parse(req->pool, req->body_out.data,
                                        req->body_out.len);
@@ -241,6 +313,7 @@ ngx_autocert_order_new_order_done(ngx_autocert_acme_request_t *req,
     }
 
     order = req->data;
+    ngx_autocert_order_note_retry_after(order, req);
 
     /* newOrder replies 201 Created with the order URL in Location. */
     if (rc == NGX_OK && req->status == 201) {
@@ -316,6 +389,7 @@ ngx_autocert_order_authz_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
     }
 
     order = req->data;
+    ngx_autocert_order_note_retry_after(order, req);
 
     if (rc == NGX_OK && req->status == 200) {
         ngx_str_t  azstatus;
@@ -453,6 +527,7 @@ ngx_autocert_order_respond_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
     }
 
     order = req->data;
+    ngx_autocert_order_note_retry_after(order, req);
 
     /* The CA accepts the challenge with 200 and status "pending"/"processing". */
     if (rc != NGX_OK || (req->status != 200 && req->status != 202)) {
@@ -510,6 +585,7 @@ ngx_autocert_order_poll_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
     }
 
     order = req->data;
+    ngx_autocert_order_note_retry_after(order, req);
     valid = 0;
     pending = 0;
 
@@ -655,6 +731,7 @@ ngx_autocert_order_finalize_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
     }
 
     order = req->data;
+    ngx_autocert_order_note_retry_after(order, req);
 
     /* Finalize returns the order object (200). The order may already be
      * "valid" with a certificate URL, or still "processing" -> poll. */
@@ -714,6 +791,7 @@ ngx_autocert_order_poll_order_done(ngx_autocert_acme_request_t *req,
     }
 
     order = req->data;
+    ngx_autocert_order_note_retry_after(order, req);
     valid = 0;
     pending = 0;
     ngx_str_null(&cert_url);
@@ -793,6 +871,7 @@ ngx_autocert_order_download_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
     }
 
     order = req->data;
+    ngx_autocert_order_note_retry_after(order, req);
 
     if (rc != NGX_OK || req->status != 200 || req->body_out.len == 0) {
         ngx_log_error(NGX_LOG_ERR, order->log, 0,
