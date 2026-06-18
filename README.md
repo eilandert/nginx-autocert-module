@@ -53,6 +53,12 @@ http {
 }
 ```
 
+> The no-`ssl_certificate` bootstrap is seeded for a **server-level**
+> `autocert on` (the form above). A vhost enabled only by the `http`-level
+> global `autocert on` still needs its own `autocert on;` line (or an
+> `ssl_certificate`) to serve TLS — the global sets the issuance default but
+> does not seed every inherited vhost's TLS context.
+
 A `listen ... ssl;` server with `autocert on` needs **no `ssl_certificate`**:
 the module gives it a self-signed bootstrap certificate so the listener starts,
 then serves the real certificate per-SNI once issued (and on every renewal,

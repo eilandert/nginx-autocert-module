@@ -649,13 +649,18 @@ ngx_http_autocert(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
          * blocks a dynamic module from hooking earlier). ssl then creates a
          * fully nginx-wired ctx (ALPN, servername cb, ciphers, session cache)
          * that loads zero certs; ngx_http_autocert_serve_init installs a
-         * bootstrap cert + the per-SNI cert_cb on top. Skip the seeding if the
-         * operator already configured ssl_certificate (we override per-SNI but
-         * keep their cert as the bootstrap fallback). Runs in this directive
-         * handler because the ssl srv conf already exists (ssl create_srv_conf
-         * ran at http{} block start) and parse precedes every later phase.
+         * bootstrap cert + the per-SNI cert_cb on top.
+         *
+         * Seed ONLY for a server{}-level `autocert on` (NGX_HTTP_SRV_CONF in
+         * cmd_type). The http{}-level global occurrence writes the template srv
+         * conf that EVERY server inherits via merge_ptr — seeding there would
+         * give a plain `listen 80;` vhost empty cert arrays too, which makes ssl
+         * build a pointless ctx and trips the no-cert checks. A server that
+         * wants autocert TLS serving therefore carries its own `autocert on`
+         * (the documented form). Skip if the operator already set
+         * ssl_certificate (UNSET_PTR test).
          */
-        {
+        if (cf->cmd_type & NGX_HTTP_SRV_CONF) {
             ngx_http_ssl_srv_conf_t  *sscf;
 
             sscf = ngx_http_conf_get_module_srv_conf(cf, ngx_http_ssl_module);

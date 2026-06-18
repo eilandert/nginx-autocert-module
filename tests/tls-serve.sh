@@ -83,21 +83,6 @@ expect_reject() {
     fi
 }
 
-cat > "$PREFIX/conf/neg-off-ssl.conf" <<EOF
-load_module $PROC_SO;
-load_module $HTTP_SO;
-error_log $PREFIX/logs/neg.log notice;
-events {}
-http {
-    autocert_path $PREFIX/store;
-    autocert on;
-    server { listen $PORT ssl; server_name $DOMAIN; }
-    server { listen $((PORT+1)) ssl; server_name off.example.com; autocert off; }
-}
-EOF
-echo "== reject: child 'autocert off' + listen ssl inherits empty bootstrap certs =="
-expect_reject "$PREFIX/conf/neg-off-ssl.conf" 'autocert off'
-
 cat > "$PREFIX/conf/neg-var-cert.conf" <<EOF
 load_module $PROC_SO;
 load_module $HTTP_SO;
