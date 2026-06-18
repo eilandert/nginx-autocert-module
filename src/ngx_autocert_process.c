@@ -40,6 +40,7 @@
 
 #include "ngx_autocert_shared.h"
 #include "ngx_autocert_acme.h"
+#include "ngx_autocert_account.h"
 
 
 #define NGX_AUTOCERT_PROC_NAME    "autocert helper"
@@ -58,18 +59,18 @@ static void ngx_autocert_watch_handler(ngx_event_t *ev);
 static ngx_uint_t ngx_autocert_master_gone(ngx_cycle_t *cycle);
 static void ngx_autocert_close_listening(ngx_cycle_t *cycle);
 static void ngx_autocert_kick_handler(ngx_event_t *ev);
-static void ngx_autocert_directory_done(ngx_autocert_acme_request_t *req,
+static void ngx_autocert_account_done(ngx_autocert_account_t *acct,
     ngx_int_t rc);
 
 
 /*
- * The outbound ACME client and the in-flight directory request, owned by the
- * helper for its lifetime. M4b fetches the CA directory exactly once at
- * startup to prove the transport; the ACME state machine (M4c+) reuses the
- * same client for every request.
+ * The outbound ACME client, owned by the helper for its lifetime, built once
+ * and reused for every request. The account bootstrap (M4d-2) runs once at
+ * startup: directory -> newNonce -> newAccount.
  */
 static ngx_autocert_acme_client_t  ngx_autocert_client;
 static ngx_uint_t                   ngx_autocert_client_ready;
+static ngx_autocert_account_t      *ngx_autocert_account;
 
 
 static ngx_core_module_t  ngx_autocert_process_module_ctx = {
@@ -634,10 +635,10 @@ ngx_autocert_watch_handler(ngx_event_t *ev)
 static void
 ngx_autocert_kick_handler(ngx_event_t *ev)
 {
-    ngx_cycle_t                  *cycle = ev->data;
-    ngx_pool_t                   *pool;
-    ngx_autocert_conf_t           acf;
-    ngx_autocert_acme_request_t  *req;
+    ngx_cycle_t              *cycle = ev->data;
+    ngx_pool_t               *pool;
+    ngx_autocert_conf_t       acf;
+    ngx_autocert_account_t   *acct;
 
     if (ngx_quit || ngx_terminate || ngx_exiting) {
         return;
@@ -663,62 +664,76 @@ ngx_autocert_kick_handler(ngx_event_t *ev)
         ngx_autocert_client_ready = 1;
     }
 
+    /* Run the account bootstrap once. */
+    if (ngx_autocert_account != NULL) {
+        return;                         /* already registering / registered */
+    }
+
     pool = ngx_create_pool(NGX_MIN_POOL_SIZE, cycle->log);
     if (pool == NULL) {
         return;
     }
 
-    req = ngx_pcalloc(pool, sizeof(ngx_autocert_acme_request_t));
-    if (req == NULL) {
+    ngx_autocert_account = ngx_pcalloc(pool,
+                                       sizeof(ngx_autocert_account_t));
+    if (ngx_autocert_account == NULL) {
         ngx_destroy_pool(pool);
         return;
     }
 
-    req->client = &ngx_autocert_client;
-    req->pool = pool;
-    req->log = cycle->log;
-    req->url = acf.ca;
-    req->handler = ngx_autocert_directory_done;
+    acct = ngx_autocert_account;
+    acct->client = &ngx_autocert_client;
+    acct->cycle = cycle;
+    acct->log = cycle->log;
+    acct->directory_url = acf.ca;
+    acct->key_type = acf.key_type;
+    acct->handler = ngx_autocert_account_done;
+    acct->data = pool;                  /* outer pool, freed in _done */
+
+    /* account key path = <autocert_path>/account.key */
+    acct->key_path.len = acf.path.len + sizeof("/account.key") - 1;
+    acct->key_path.data = ngx_pnalloc(pool, acct->key_path.len + 1);
+    if (acct->key_path.data == NULL) {
+        ngx_destroy_pool(pool);
+        ngx_autocert_account = NULL;
+        return;
+    }
+    {
+        u_char *p = ngx_cpymem(acct->key_path.data, acf.path.data, acf.path.len);
+        p = ngx_cpymem(p, "/account.key", sizeof("/account.key") - 1);
+        *p = '\0';
+    }
 
     ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
-                  "autocert: fetching ACME directory %V", &acf.ca);
+                  "autocert: registering ACME account via %V", &acf.ca);
 
-    if (ngx_autocert_acme_request(req) != NGX_OK) {
+    if (ngx_autocert_account_register(acct) != NGX_OK) {
         ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
-                      "autocert: could not start ACME directory fetch");
+                      "autocert: could not start ACME account registration");
         ngx_destroy_pool(pool);
+        ngx_autocert_account = NULL;
     }
 }
 
 
 /*
- * Completion of the startup directory fetch. Logs the outcome and frees the
- * request pool. A 200 with a non-empty body means the transport works end to
- * end (the CI asserts on this line).
+ * Terminal callback of the account bootstrap. Frees the account (its key + the
+ * bootstrap pool) and the outer pool that holds the account struct itself. The
+ * CI asserts on the success line emitted by the account module.
  */
 static void
-ngx_autocert_directory_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
+ngx_autocert_account_done(ngx_autocert_account_t *acct, ngx_int_t rc)
 {
-    ngx_pool_t  *pool = req->pool;
+    ngx_pool_t  *outer = acct->data;
 
-    if (rc == NGX_OK && req->status == 200) {
-        ngx_str_t   none = ngx_null_string;
-        ngx_str_t  *ct = ngx_autocert_acme_header(req, "Content-Type");
-
-        ngx_log_error(NGX_LOG_NOTICE, req->log, 0,
-                      "autocert: ACME directory OK, status %ui, %uz bytes, "
-                      "content-type \"%V\"",
-                      req->status, req->body_out.len, ct ? ct : &none);
-    } else if (rc == NGX_OK) {
-        ngx_log_error(NGX_LOG_ERR, req->log, 0,
-                      "autocert: ACME directory unexpected status %ui",
-                      req->status);
-    } else {
-        ngx_log_error(NGX_LOG_ERR, req->log, 0,
-                      "autocert: ACME directory fetch failed");
+    if (rc != NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, acct->log, 0,
+                      "autocert: ACME account registration failed");
     }
 
-    ngx_destroy_pool(pool);
+    ngx_autocert_account_free(acct);    /* key + bootstrap pool */
+    ngx_autocert_account = NULL;
+    ngx_destroy_pool(outer);            /* the acct struct + key_path */
 }
 
 

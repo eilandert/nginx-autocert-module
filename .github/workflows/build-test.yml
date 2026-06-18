@@ -277,7 +277,7 @@ jobs:
           ./test_json
 
   acme-directory:
-    name: ACME directory fetch over TLS (M4b)
+    name: ACME account register over TLS (M4b/M4c/M4d)
     needs: resolve
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -305,7 +305,7 @@ jobs:
           make > /tmp/make.log 2>&1 || { tail -40 /tmp/make.log; exit 1; }
           echo "SERVER_BIN=$PWD/objs/nginx" >> "$GITHUB_ENV"
 
-      - name: Helper fetches the CA directory over verified TLS
+      - name: Helper registers an ACME account over verified TLS
         run: |
           # Pebble + dnsmasq run as docker containers (available on GH runners).
           # The script wires them up, points the helper at Pebble with Pebble's

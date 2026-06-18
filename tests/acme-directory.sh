@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 #
-# M4b end-to-end test: the helper fetches the CA directory over TLS.
+# ACME end-to-end test (M4b transport + M4c parse + M4d account bootstrap).
 #
 # Brings up a Pebble ACME server + a tiny dnsmasq (so the helper's ngx_resolver
 # can resolve the Pebble hostname), points the helper at it with Pebble's CA in
-# the trust store, starts nginx, and asserts the helper logged a successful
-# directory fetch over a *verified* TLS connection.
+# the trust store, starts nginx, and asserts the helper registered an ACME
+# account over a *verified* TLS connection — exercising the directory fetch,
+# JSON parse, newNonce header capture, JWS signing and newAccount POST, then
+# the persisted 0600 account key. A negative run (no CA) proves TLS
+# verification is on.
 #
 # Inputs (env):
 #   SERVER_BIN   - path to the built nginx/angie binary (required)
@@ -70,6 +73,7 @@ http {
     autocert_ca https://pebble:14000/dir;
     autocert_resolver 127.0.0.1:${DNS_PORT};
     autocert_ca_certificate $PREFIX/ca.pem;
+    autocert_path $PREFIX/store;
     server {
         listen 8080;
         server_name a.example.com;
@@ -77,18 +81,23 @@ http {
 }
 EOF
 
+mkdir -p "$PREFIX/store"
+
 echo "== config test =="
 "$SERVER_BIN" -t -p "$PREFIX" -c "$PREFIX/conf/nginx.conf"
 
-echo "== start + fetch directory =="
+echo "== start + register ACME account =="
+# The helper does directory -> newNonce -> newAccount (JWS). A success line
+# carrying the account kid proves the whole chain end to end: directory fetch +
+# JSON parse (M4c) + Replay-Nonce header capture (M4d-1) + JWS sign (M3) + POST.
 "$SERVER_BIN" -p "$PREFIX" -c "$PREFIX/conf/nginx.conf"
 
 ok=
-for i in $(seq 1 30); do
-    if grep -q 'autocert: ACME directory OK, status 200' "$PREFIX/logs/error.log"; then
+for i in $(seq 1 40); do
+    if grep -q 'autocert: ACME account registered, kid' "$PREFIX/logs/error.log"; then
         ok=1; break
     fi
-    if grep -q 'autocert: ACME directory fetch failed' "$PREFIX/logs/error.log"; then
+    if grep -q 'autocert: ACME account registration failed' "$PREFIX/logs/error.log"; then
         break
     fi
     sleep 0.5
@@ -98,21 +107,31 @@ echo "== helper log =="
 grep autocert "$PREFIX/logs/error.log" || true
 
 if [ -z "$ok" ]; then
-    echo "::error::helper did not fetch the ACME directory over TLS"
+    echo "::error::helper did not register an ACME account"
     exit 1
 fi
 
-echo "✓ helper fetched the ACME directory over verified TLS"
+echo "✓ helper registered an ACME account over verified TLS"
 
-# The success line echoes a response header captured by the client
-# (ngx_autocert_acme_header). Pebble serves the directory as application/json,
-# so a captured, non-empty Content-Type proves header capture works e2e.
-if ! grep -q 'ACME directory OK.*content-type "application/json' "$PREFIX/logs/error.log"; then
-    echo "::error::Content-Type response header was not captured"
-    grep 'ACME directory OK' "$PREFIX/logs/error.log" || true
+# kid must be a Pebble account URL (Location header was captured + carried out).
+if ! grep -q 'ACME account registered, kid "https://pebble:14000/' "$PREFIX/logs/error.log"; then
+    echo "::error::account kid is not a Pebble account URL"
+    grep 'account registered' "$PREFIX/logs/error.log" || true
     exit 1
 fi
-echo "✓ response header (Content-Type) captured by the client"
+echo "✓ account kid (Location header) captured"
+
+# The account key was generated + persisted with 0600 perms.
+if [ ! -s "$PREFIX/store/account.key" ]; then
+    echo "::error::account key was not persisted"
+    exit 1
+fi
+perms=$(stat -c '%a' "$PREFIX/store/account.key")
+if [ "$perms" != "600" ]; then
+    echo "::error::account key perms are $perms, expected 600"
+    exit 1
+fi
+echo "✓ account key persisted at 0600"
 
 # --- negative: without Pebble's CA, the self-signed cert must be REJECTED.
 # Proves TLS verification is actually enabled (not verify-none).
@@ -129,6 +148,7 @@ http {
     autocert on admin@example.com;
     autocert_ca https://pebble:14000/dir;
     autocert_resolver 127.0.0.1:${DNS_PORT};
+    autocert_path $PREFIX/store;
     # no autocert_ca_certificate => system trust store, which does NOT trust
     # Pebble's self-signed CA.
     server {
@@ -138,15 +158,21 @@ http {
 }
 EOF
 
+# Fresh store so the account-key step succeeds and the flow reaches the TLS
+# handshake (where verification must fail).
+rm -rf "$PREFIX/store"; mkdir -p "$PREFIX/store"
 > "$PREFIX/logs/error.log"
 "$SERVER_BIN" -p "$PREFIX" -c "$PREFIX/conf/nginx.conf"
 
 bad=
 for i in $(seq 1 30); do
-    if grep -q 'autocert: ACME directory fetch failed' "$PREFIX/logs/error.log"; then
+    # The TLS layer rejects Pebble's self-signed CA, and the account bootstrap
+    # then reports failure. Either line confirms verification is on.
+    if grep -Eq 'certificate verify failed|ACME account registration failed' \
+            "$PREFIX/logs/error.log"; then
         bad=1; break
     fi
-    if grep -q 'autocert: ACME directory OK' "$PREFIX/logs/error.log"; then
+    if grep -q 'ACME account registered' "$PREFIX/logs/error.log"; then
         break
     fi
     sleep 0.5
