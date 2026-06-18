@@ -439,22 +439,33 @@ ngx_http_autocert_challenge_handler(ngx_http_request_t *r)
     static const size_t             pfxlen =
                                         sizeof(NGX_HTTP_AUTOCERT_WK_PREFIX) - 1;
 
-    if (r->uri.len <= pfxlen
+    if (r->uri.len < pfxlen
         || ngx_strncmp(r->uri.data, NGX_HTTP_AUTOCERT_WK_PREFIX, pfxlen) != 0)
     {
-        return NGX_DECLINED;
+        return NGX_DECLINED;            /* not our path — let others handle it */
     }
 
+    /*
+     * From here the request is under /.well-known/acme-challenge/ — it is ours.
+     * Never NGX_DECLINED past this point, or a static/user handler could serve
+     * a bogus challenge response. Anything malformed is a 4xx.
+     */
     amcf = ngx_http_get_module_main_conf(r, ngx_http_autocert_module);
     if (amcf->challenge_zone == NULL) {
-        return NGX_DECLINED;
+        return NGX_HTTP_NOT_FOUND;
     }
 
-    /* the token is the path segment after the prefix (no further slashes) */
+    if (!(r->method & (NGX_HTTP_GET | NGX_HTTP_HEAD))) {
+        return NGX_HTTP_NOT_ALLOWED;
+    }
+
+    /* the token is the single path segment after the prefix */
     token.data = r->uri.data + pfxlen;
     token.len = r->uri.len - pfxlen;
-    if (ngx_strlchr(token.data, token.data + token.len, '/') != NULL) {
-        return NGX_DECLINED;
+    if (token.len == 0
+        || ngx_strlchr(token.data, token.data + token.len, '/') != NULL)
+    {
+        return NGX_HTTP_NOT_FOUND;
     }
 
     rc = ngx_autocert_challenge_get(amcf->challenge_zone, &token, r->pool,
@@ -466,17 +477,13 @@ ngx_http_autocert_challenge_handler(ngx_http_request_t *r)
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    if (r->method == NGX_HTTP_HEAD) {
-        keyauth.len = 0;                 /* headers only */
-    }
-
     r->headers_out.status = NGX_HTTP_OK;
     r->headers_out.content_length_n = keyauth.len;
-    ngx_str_set(&r->headers_out.content_type, "application/octet-stream");
+    ngx_str_set(&r->headers_out.content_type, "text/plain");
     r->headers_out.content_type_len = r->headers_out.content_type.len;
 
     rc = ngx_http_send_header(r);
-    if (rc == NGX_ERROR || rc > NGX_OK || r->header_only || keyauth.len == 0) {
+    if (rc == NGX_ERROR || rc > NGX_OK || r->header_only) {
         return rc;
     }
 
