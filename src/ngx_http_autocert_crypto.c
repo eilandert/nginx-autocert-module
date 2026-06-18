@@ -791,6 +791,149 @@ failed:
 }
 
 
+X509 *
+ngx_http_autocert_acme_tls_cert(EVP_PKEY *pkey, ngx_str_t *domain,
+    ngx_str_t *keyauth)
+{
+    X509               *x = NULL;
+    X509_NAME          *name;
+    ASN1_INTEGER       *serial = NULL;
+    GENERAL_NAMES      *gns = NULL;
+    GENERAL_NAME       *gn = NULL;
+    ASN1_IA5STRING     *ia5 = NULL;
+    X509_EXTENSION     *san = NULL;
+    X509_EXTENSION     *acmeid = NULL;
+    ASN1_OBJECT        *obj = NULL;
+    ASN1_OCTET_STRING  *inner = NULL;
+    ASN1_OCTET_STRING  *value = NULL;
+    unsigned char       digest[SHA256_DIGEST_LENGTH];
+    unsigned char      *der = NULL;
+    int                 der_len;
+    const EVP_MD       *md;
+
+    if (pkey == NULL || domain == NULL || domain->len == 0
+        || keyauth == NULL || keyauth->len == 0)
+    {
+        return NULL;
+    }
+
+    /* The acmeIdentifier value is SHA-256 over the key authorization. */
+    if (SHA256(keyauth->data, keyauth->len, digest) == NULL) {
+        return NULL;
+    }
+
+    x = X509_new();
+    if (x == NULL) {
+        return NULL;
+    }
+    if (X509_set_version(x, 2) != 1) {                /* X.509 v3 (extensions) */
+        goto failed;
+    }
+
+    serial = ASN1_INTEGER_new();
+    if (serial == NULL || ASN1_INTEGER_set(serial, 1) != 1
+        || X509_set_serialNumber(x, serial) != 1)
+    {
+        goto failed;
+    }
+
+    if (X509_gmtime_adj(X509_getm_notBefore(x), 0) == NULL
+        || X509_gmtime_adj(X509_getm_notAfter(x), 24L * 60 * 60) == NULL)
+    {
+        goto failed;
+    }
+    if (X509_set_pubkey(x, pkey) != 1) {
+        goto failed;
+    }
+
+    /* Empty subject; self-signed (issuer == subject). The identity lives in the
+     * subjectAltName, per RFC 8737. */
+    name = X509_get_subject_name(x);                  /* internal ptr */
+    if (name == NULL || X509_set_issuer_name(x, name) != 1) {
+        goto failed;
+    }
+
+    /* subjectAltName = DNS:<domain>, length-bounded (no NUL assumed). */
+    gns = GENERAL_NAMES_new();
+    gn = GENERAL_NAME_new();
+    ia5 = ASN1_IA5STRING_new();
+    if (gns == NULL || gn == NULL || ia5 == NULL) {
+        goto failed;
+    }
+    if (domain->len > INT_MAX
+        || ASN1_STRING_set(ia5, domain->data, (int) domain->len) != 1)
+    {
+        goto failed;
+    }
+    GENERAL_NAME_set0_value(gn, GEN_DNS, ia5);
+    ia5 = NULL;                                       /* owned by gn now */
+    if (sk_GENERAL_NAME_push(gns, gn) <= 0) {
+        goto failed;
+    }
+    gn = NULL;                                        /* owned by gns now */
+    /* Subject is empty, so the SAN MUST be critical (RFC 5280 §4.2.1.6). */
+    san = X509V3_EXT_i2d(NID_subject_alt_name, 1 /* critical */, gns);
+    if (san == NULL || X509_add_ext(x, san, -1) != 1) {  /* add_ext dups */
+        goto failed;
+    }
+
+    /* CRITICAL id-pe-acmeIdentifier: extnValue is the DER of an OCTET STRING
+     * wrapping the 32-byte digest. */
+    inner = ASN1_OCTET_STRING_new();
+    if (inner == NULL
+        || ASN1_OCTET_STRING_set(inner, digest, (int) sizeof(digest)) != 1)
+    {
+        goto failed;
+    }
+    der_len = i2d_ASN1_OCTET_STRING(inner, &der);
+    if (der_len <= 0 || der == NULL) {
+        goto failed;
+    }
+    value = ASN1_OCTET_STRING_new();
+    if (value == NULL || ASN1_OCTET_STRING_set(value, der, der_len) != 1) {
+        goto failed;
+    }
+    obj = OBJ_txt2obj("1.3.6.1.5.5.7.1.31", 1 /* numeric OID only */);
+    if (obj == NULL) {
+        goto failed;
+    }
+    acmeid = X509_EXTENSION_create_by_OBJ(NULL, obj, 1 /* critical */, value);
+    if (acmeid == NULL || X509_add_ext(x, acmeid, -1) != 1) {
+        goto failed;
+    }
+
+    md = (EVP_PKEY_bits(pkey) > 256) ? EVP_sha384() : EVP_sha256();
+    if (X509_sign(x, pkey, md) == 0) {
+        goto failed;
+    }
+
+    OPENSSL_free(der);
+    ASN1_OCTET_STRING_free(inner);
+    ASN1_OCTET_STRING_free(value);
+    ASN1_OBJECT_free(obj);
+    X509_EXTENSION_free(san);
+    X509_EXTENSION_free(acmeid);
+    GENERAL_NAMES_free(gns);
+    ASN1_INTEGER_free(serial);
+    return x;
+
+failed:
+
+    if (der != NULL)    { OPENSSL_free(der); }
+    if (inner != NULL)  { ASN1_OCTET_STRING_free(inner); }
+    if (value != NULL)  { ASN1_OCTET_STRING_free(value); }
+    if (obj != NULL)    { ASN1_OBJECT_free(obj); }
+    if (san != NULL)    { X509_EXTENSION_free(san); }
+    if (acmeid != NULL) { X509_EXTENSION_free(acmeid); }
+    if (ia5 != NULL)    { ASN1_STRING_free(ia5); }
+    if (gn != NULL)     { GENERAL_NAME_free(gn); }
+    if (gns != NULL)    { GENERAL_NAMES_free(gns); }
+    if (serial != NULL) { ASN1_INTEGER_free(serial); }
+    X509_free(x);
+    return NULL;
+}
+
+
 /*
  * Convert a UTC `struct tm` to a Unix time_t without relying on the non-POSIX
  * timegm(3) or the process timezone. Days-since-epoch via the civil-from-days
