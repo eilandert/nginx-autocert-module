@@ -6,6 +6,11 @@
 #include "ngx_http_autocert_crypto.h"
 
 #include <limits.h>
+#include <errno.h>
+#include <time.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdint.h>
 
 #include <openssl/ec.h>
 #include <openssl/bn.h>
@@ -783,4 +788,91 @@ failed:
     }
     X509_free(x);
     return NULL;
+}
+
+
+/*
+ * Convert a UTC `struct tm` to a Unix time_t without relying on the non-POSIX
+ * timegm(3) or the process timezone. Days-since-epoch via the civil-from-days
+ * algorithm; only the fields ASN1_TIME_to_tm populates are used. Returns
+ * (time_t) -1 on an out-of-range year.
+ */
+static time_t
+ngx_autocert_timegm(const struct tm *tm)
+{
+    int64_t  y = tm->tm_year + 1900;
+    int64_t  m = tm->tm_mon + 1;       /* 1..12 */
+    int64_t  d = tm->tm_mday;          /* 1..31 */
+    int64_t  era, yoe, doy, doe, days;
+
+    if (y < 1970 || y > 9999) {
+        return (time_t) -1;
+    }
+
+    /* Howard Hinnant's days_from_civil: days since 1970-01-01. */
+    y -= (m <= 2);
+    era = (y >= 0 ? y : y - 399) / 400;
+    yoe = y - era * 400;                                  /* 0..399 */
+    doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1; /* 0..365 */
+    doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;          /* 0..146096 */
+    days = era * 146097 + doe - 719468;
+
+    return (time_t) (days * 86400
+                     + tm->tm_hour * 3600 + tm->tm_min * 60 + tm->tm_sec);
+}
+
+
+/*
+ * Read the leaf cert's notAfter from the PEM fullchain at `path`. See the
+ * header for the contract. ENOENT/ENOTDIR => NGX_DECLINED (no cert yet);
+ * other failures => NGX_ERROR.
+ */
+ngx_int_t
+ngx_http_autocert_cert_not_after(const char *path, time_t *out)
+{
+    int         fd;
+    BIO        *bio;
+    X509       *leaf;
+    struct tm   tm;
+    time_t      t;
+    ngx_int_t   rc;
+
+    /* O_NOFOLLOW: never traverse a symlink at the final path component, and
+     * capture errno from open() (BIO_new_file's errno is unreliable). */
+    fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd == -1) {
+        if (errno == ENOENT || errno == ENOTDIR) {
+            return NGX_DECLINED;            /* no cert stored yet */
+        }
+        return NGX_ERROR;                   /* ELOOP (symlink), EACCES, ... */
+    }
+
+    bio = BIO_new_fd(fd, BIO_CLOSE);        /* BIO owns + closes fd */
+    if (bio == NULL) {
+        (void) close(fd);
+        return NGX_ERROR;
+    }
+
+    leaf = PEM_read_bio_X509(bio, NULL, NULL, NULL);
+    BIO_free(bio);
+    if (leaf == NULL) {
+        return NGX_ERROR;
+    }
+
+    ngx_memzero(&tm, sizeof(struct tm));
+
+    rc = NGX_ERROR;
+
+    /* ASN1_TIME_to_tm fills a UTC struct tm (OpenSSL 1.1.1+, BoringSSL — both
+     * already required by the JOSE primitives). */
+    if (ASN1_TIME_to_tm(X509_get0_notAfter(leaf), &tm) == 1) {
+        t = ngx_autocert_timegm(&tm);
+        if (t != (time_t) -1) {
+            *out = t;
+            rc = NGX_OK;
+        }
+    }
+
+    X509_free(leaf);
+    return rc;
 }
