@@ -1,0 +1,205 @@
+name: Build module + load/serve tests
+description: >
+  Fetch one flavor (nginx | angie), configure + build the autocert dynamic
+  modules against it, run the no-network load / negative / serve tests, and
+  upload the built tree as the build-<flavor> artifact. Factored out of the
+  workflow so the per-flavor build jobs share one definition and downstream
+  jobs can depend on a single flavor's build (not the whole matrix).
+
+inputs:
+  flavor:
+    description: nginx | angie
+    required: true
+  version:
+    description: Resolved upstream version.
+    required: true
+  url:
+    description: Source tarball URL.
+    required: true
+  dir:
+    description: Unpacked source dir name (e.g. nginx-1.31.2).
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Setup build deps
+      uses: ./.github/actions/setup
+      with:
+        ccache-key: build-${{ inputs.flavor }}-${{ inputs.version }}
+
+    - name: Fetch ${{ inputs.flavor }} ${{ inputs.version }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        curl -fsSL -o src.tar.gz "${{ inputs.url }}"
+        tar -xzf src.tar.gz
+
+    - name: Configure + build module
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "${{ inputs.dir }}"
+        ./configure --with-compat --with-http_ssl_module \
+          --with-cc="ccache cc" \
+          --add-dynamic-module="$GITHUB_WORKSPACE" > /tmp/conf.log 2>&1 \
+          || { tail -40 /tmp/conf.log; exit 1; }
+        # Full build (not `make modules`): the load test needs the server
+        # binary too. angie names it objs/angie, nginx names it objs/nginx.
+        make > /tmp/make.log 2>&1 || { tail -40 /tmp/make.log; exit 1; }
+        test -f objs/ngx_http_autocert_module.so
+        test -f objs/ngx_autocert_process_module.so   # CORE module (M4a helper)
+        BIN=objs/nginx; [ -x objs/angie ] && BIN=objs/angie
+        test -x "$BIN"
+        echo "SERVER_BIN=$PWD/$BIN" >> "$GITHUB_ENV"
+        echo "✓ built autocert .so (http + process) + $BIN"
+        # Hit-rate visibility (CACHE-4): confirm ccache is actually warming.
+        ccache -s || true
+
+    - name: Load smoke test (parse + name collection)
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "${{ inputs.dir }}"
+        BIN="$SERVER_BIN"
+        MOD="$PWD/objs/ngx_http_autocert_module.so"
+        PROC="$PWD/objs/ngx_autocert_process_module.so"
+        PREFIX=/tmp/ngx-test
+        mkdir -p "$PREFIX/logs" "$PREFIX/conf"
+        cat > "$PREFIX/conf/nginx.conf" <<EOF
+        load_module $PROC;
+        load_module $MOD;
+        events {}
+        http {
+            autocert on admin@example.com;   # global
+            # M2 global tuning knobs (all non-default values).
+            autocert_ca https://acme-staging-v02.api.letsencrypt.org/directory;
+            autocert_renew_before 10d;
+            autocert_key_type secp256r1;
+            autocert_store certbot;
+            autocert_path /var/lib/autocert;
+            autocert_challenge tls-alpn-01;
+            server {
+                listen 8080;
+                server_name a.example.com www.a.example.com;
+                autocert on;                  # per-vhost override, 2 names
+            }
+            server {
+                listen 8081;
+                server_name b.example.com;
+                autocert off;                 # opt out, name NOT collected
+            }
+            server {
+                listen 8082;
+                # regex + leading/suffix wildcard names are skipped (not issuable).
+                server_name ~^re\.example\.com$ *.wild.example.com www.suffix.*;
+                autocert on;
+            }
+        }
+        EOF
+        # 1) -t: config parses, module loads, postconfig walk runs clean.
+        "$BIN" -t -p "$PREFIX" -c "$PREFIX/conf/nginx.conf"
+        # 2) The postconfig name-count NOTICE is only emitted on a real start
+        #    (nginx gates notice-level output under -t), so briefly start,
+        #    grep the error log, then stop. High ports → no root needed.
+        "$BIN" -p "$PREFIX" -c "$PREFIX/conf/nginx.conf"
+        for i in $(seq 1 20); do [ -s "$PREFIX/logs/error.log" ] && break; sleep 0.2; done
+        "$BIN" -p "$PREFIX" -c "$PREFIX/conf/nginx.conf" -s stop || true
+        cat "$PREFIX/logs/error.log"
+        # Exactly the 2 concrete names of the enabled vhost must be collected:
+        # b.* is off; regex + wildcard are skipped; dedup across vhosts.
+        grep -q 'autocert: 2 name(s) enabled for issuance' "$PREFIX/logs/error.log"
+        echo "✓ ${{ inputs.flavor }} ${{ inputs.version }} parsed autocert_* + collected enabled names"
+
+    - name: Reject invalid config (negative tests)
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "${{ inputs.dir }}"
+        BIN="$SERVER_BIN"
+        MOD="$PWD/objs/ngx_http_autocert_module.so"
+        PREFIX=/tmp/ngx-bad
+        mkdir -p "$PREFIX/logs" "$PREFIX/conf"
+
+        # Each case: a description, the http{} body, and the substring the
+        # rejection message must contain. Every one must fail `nginx -t`.
+        run_neg() {
+          local desc="$1" body="$2" want="$3"
+          printf 'load_module %s;\nevents {}\nhttp {\n%s\n}\n' \
+            "$MOD" "$body" > "$PREFIX/conf/nginx.conf"
+          if "$BIN" -t -p "$PREFIX" -c "$PREFIX/conf/nginx.conf" 2>/tmp/err; then
+            echo "::error::[$desc] invalid config was accepted"; cat /tmp/err
+            exit 1
+          fi
+          if ! grep -q "$want" /tmp/err; then
+            echo "::error::[$desc] wrong error message (wanted: $want)"
+            cat /tmp/err; exit 1
+          fi
+          echo "✓ rejected: $desc"
+        }
+
+        run_neg "invalid email"     'server { listen 8080; autocert on x@; }'                          'invalid email'
+        run_neg "bad key_type"      'autocert_key_type rsa2048;'                                       'invalid key type'
+        run_neg "bad store"         'autocert_store vault;'                                            'invalid store'
+        run_neg "bad challenge"     'autocert_challenge dns-01;'                                       'invalid challenge'
+        run_neg "duplicate key"     'autocert_key_type secp384r1; autocert_key_type secp256r1;'        'is duplicate'
+        run_neg "knob in server{}"  'server { listen 8080; autocert_ca http://x/; }'                   'directive is not allowed'
+        echo "✓ all negative cases rejected"
+
+    - name: Helper process lifecycle (M4a)
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Channel-managed ACME helper: start spawns one, reload x2 keeps exactly
+        # one (old retired, new respawned), crash auto-respawns, stop tears down
+        # cleanly with no SIGKILL/hang. Runs against this flavor's build.
+        NGX_BUILD_DIR="$GITHUB_WORKSPACE/${{ inputs.dir }}" \
+          AC_TEST_PORT=18177 \
+          bash "$GITHUB_WORKSPACE/tests/helper-lifecycle.sh"
+
+    - name: HTTP-01 challenge serve (M5)
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Seed a token via autocert_test_challenge, fetch
+        # /.well-known/acme-challenge/<token>, assert exact keyauth + 404s.
+        SERVER_BIN="$SERVER_BIN" \
+          NGX_BUILD_DIR="$GITHUB_WORKSPACE/${{ inputs.dir }}" \
+          AC_TEST_PORT=18178 \
+          bash "$GITHUB_WORKSPACE/tests/http01-challenge.sh"
+
+    - name: Per-SNI certificate serving (M7)
+      shell: bash
+      run: |
+        set -euo pipefail
+        # `listen ssl; autocert on;` with no ssl_certificate must start,
+        # serve a bootstrap cert pre-issuance, serve the real store cert by
+        # SNI, and hot-reload on mtime change. No network/docker.
+        SERVER_BIN="$SERVER_BIN" \
+          NGX_BUILD_DIR="$GITHUB_WORKSPACE/${{ inputs.dir }}" \
+          AC_TEST_PORT=18179 \
+          bash "$GITHUB_WORKSPACE/tests/tls-serve.sh"
+
+    - name: tls-alpn-01 ALPN serve path (M10b)
+      shell: bash
+      run: |
+        set -euo pipefail
+        # A client negotiating ALPN "acme-tls/1" + SNI gets the seeded
+        # challenge cert (SAN + critical acmeIdentifier); a normal client gets
+        # the ordinary cert and negotiates http/1.1. No network/docker.
+        SERVER_BIN="$SERVER_BIN" \
+          NGX_BUILD_DIR="$GITHUB_WORKSPACE/${{ inputs.dir }}" \
+          AC_TEST_PORT=18180 \
+          bash "$GITHUB_WORKSPACE/tests/tls-alpn-challenge.sh"
+
+    # Publish the built tree (objs + src headers) so unit/integration jobs
+    # link/run against it instead of recompiling.
+    - name: Upload built tree
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      with:
+        name: build-${{ inputs.flavor }}
+        path: |
+          ${{ inputs.dir }}/objs
+          ${{ inputs.dir }}/src
+        retention-days: 1
+        if-no-files-found: error

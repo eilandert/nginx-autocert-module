@@ -1,0 +1,42 @@
+name: Setup build deps
+description: >
+  Install apt packages and, optionally, restore a ccache. Factored out so every
+  job shares one definition instead of copying the same boilerplate. ccache is
+  only relevant for jobs that actually compile nginx/angie (the build jobs);
+  leave ccache-key empty to skip it.
+
+inputs:
+  packages:
+    description: Space-separated apt packages to install.
+    default: build-essential libpcre2-dev zlib1g-dev libssl-dev ccache
+  ccache-key:
+    description: Suffix for the ccache cache key; empty disables ccache.
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    # No apt .deb caching: actions/cache with a static key is immutable after
+    # the first save and races package sets across jobs (CACHE-1 audit), while
+    # `apt-get update` hits the network every run regardless — near-zero
+    # benefit for the footgun. Plain update+install is simpler and reliable.
+    - name: Install apt deps
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends ${{ inputs.packages }}
+
+    - name: Restore ccache
+      if: inputs.ccache-key != ''
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: ~/.ccache
+        key: ccache-${{ inputs.ccache-key }}-${{ github.sha }}
+        restore-keys: |
+          ccache-${{ inputs.ccache-key }}-
+
+    - name: Size ccache
+      if: inputs.ccache-key != ''
+      shell: bash
+      run: ccache --max-size=500M
