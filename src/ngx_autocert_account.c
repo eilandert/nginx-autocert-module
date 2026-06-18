@@ -29,6 +29,12 @@ static ngx_int_t ngx_autocert_account_post_account(
     ngx_autocert_account_t *acct);
 static void ngx_autocert_account_register_done(
     ngx_autocert_acme_request_t *req, ngx_int_t rc);
+static void ngx_autocert_account_register_renonce_done(
+    ngx_autocert_acme_request_t *req, ngx_int_t rc);
+static ngx_uint_t ngx_autocert_account_is_bad_nonce(
+    ngx_autocert_acme_request_t *req);
+static ngx_int_t ngx_autocert_account_set_nonce(ngx_autocert_account_t *acct,
+    ngx_str_t *nonce);
 static void ngx_autocert_account_finish(ngx_autocert_account_t *acct,
     ngx_int_t rc);
 
@@ -56,6 +62,7 @@ ngx_autocert_account_register(ngx_autocert_account_t *acct)
      * handler or surface a stale kid. (The caller is expected to pcalloc it,
      * but don't depend on that.) */
     acct->done = 0;
+    acct->register_retried = 0;
     acct->key = NULL;
     ngx_str_null(&acct->kid);
     ngx_str_null(&acct->new_nonce_url);
@@ -465,8 +472,49 @@ ngx_autocert_account_register_done(ngx_autocert_acme_request_t *req,
         if (loc != NULL && loc->len > 0
             && ngx_autocert_account_dup(acct, &acct->kid, loc) == NGX_OK)
         {
+            ngx_str_t  *nonce;
+
+            /* Capture the fresh Replay-Nonce so the first kid-signed POST
+             * (newOrder) doesn't reuse the spent registration nonce and burn
+             * its only badNonce retry. A missing header isn't fatal — the
+             * kid-path refetches on badNonce. */
+            nonce = ngx_autocert_acme_header(req, "Replay-Nonce");
+            if (nonce != NULL && nonce->len > 0) {
+                (void) ngx_autocert_account_set_nonce(acct, nonce);
+            }
+
             ok = NGX_OK;
         }
+    }
+
+    /*
+     * newAccount is a one-shot POST (its own JWK-signed path, not the M6a
+     * kid-signed primitive), so it didn't share that path's badNonce retry.
+     * A fresh ACME server occasionally rejects the first nonce (badNonce) —
+     * re-fetch newNonce and re-POST newAccount once. (This is why CI previously
+     * needed PEBBLE_WFE_NONCEREJECT=0.)
+     */
+    if (ok != NGX_OK && !acct->register_retried
+        && ngx_autocert_account_is_bad_nonce(req))
+    {
+        ngx_str_t  get = ngx_string("GET");
+        ngx_str_t  empty = ngx_null_string;
+
+        acct->register_retried = 1;
+        ngx_destroy_pool(req->pool);
+
+        ngx_log_error(NGX_LOG_NOTICE, acct->log, 0,
+                      "autocert: newAccount badNonce, re-fetching nonce and "
+                      "retrying");
+
+        if (ngx_autocert_account_start(acct, &get, &acct->new_nonce_url,
+                                       &empty, &empty,
+                                       ngx_autocert_account_register_renonce_done)
+            != NGX_OK)
+        {
+            ngx_autocert_account_finish(acct, NGX_ERROR);
+        }
+        return;
     }
 
     if (ok != NGX_OK) {
@@ -476,6 +524,43 @@ ngx_autocert_account_register_done(ngx_autocert_acme_request_t *req,
 
     ngx_destroy_pool(req->pool);
     ngx_autocert_account_finish(acct, ok);
+}
+
+
+/*
+ * Completion of the newNonce GET issued for a newAccount badNonce retry: stash
+ * the fresh Replay-Nonce and re-POST newAccount. Mirrors nonce_done but routes
+ * back to the register POST instead of the first-time path.
+ */
+static void
+ngx_autocert_account_register_renonce_done(ngx_autocert_acme_request_t *req,
+    ngx_int_t rc)
+{
+    ngx_autocert_account_t  *acct = req->data;
+    ngx_str_t               *nonce;
+    ngx_int_t                ok = NGX_ERROR;
+
+    if (rc == NGX_OK && (req->status == 200 || req->status == 204)) {
+        nonce = ngx_autocert_acme_header(req, "Replay-Nonce");
+        if (nonce != NULL && nonce->len > 0
+            && ngx_autocert_account_dup(acct, &acct->nonce, nonce) == NGX_OK)
+        {
+            ok = NGX_OK;
+        }
+    }
+
+    ngx_destroy_pool(req->pool);
+
+    if (ok != NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, acct->log, 0,
+                      "autocert: no Replay-Nonce on newAccount retry");
+        ngx_autocert_account_finish(acct, NGX_ERROR);
+        return;
+    }
+
+    if (ngx_autocert_account_post_account(acct) != NGX_OK) {
+        ngx_autocert_account_finish(acct, NGX_ERROR);
+    }
 }
 
 
