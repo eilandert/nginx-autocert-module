@@ -2,13 +2,23 @@ name: Build & Test
 
 # Third-party actions pinned to commit SHAs for supply-chain safety.
 # Pin table (canonical for all workflow files — keep consistent):
-# actions/checkout@v4        -> 34e114876b0b11c390a56381ad16ebd13914f8d5
-# actions/cache@v4           -> 0057852bfaa89a56745cba8c7296529d2fc39830
-# actions/upload-artifact@v4 -> ea165f8d65b6e75b540449e92b4886f43607fa02
+# actions/checkout@v4          -> 34e114876b0b11c390a56381ad16ebd13914f8d5
+# actions/cache@v4             -> 0057852bfaa89a56745cba8c7296529d2fc39830
+# actions/upload-artifact@v4   -> ea165f8d65b6e75b540449e92b4886f43607fa02
+# actions/download-artifact@v4 -> d3f86a106a0bac45b974a628896c90dbdf5c8093
+#
+# Local composite actions:
+#   ./.github/actions/setup         apt deps + optional ccache restore.
+#   ./.github/actions/build-module  fetch+build one flavor, run the no-network
+#                                   load/serve tests, upload build-<flavor>.
 
-# nginx version is NOT pinned: the `resolve` job scrapes nginx.org for the
-# current mainline + stable at run time and feeds them to the build matrix,
-# alongside the pinned Angie fork. The module must build and LOAD on all three.
+# Neither nginx nor angie is pinned: the `resolve` job scrapes the current
+# mainline nginx and the latest angie release at run time. There are two
+# independent build jobs (build-nginx, build-angie) so each is built exactly
+# once and the downstream unit/e2e jobs depend on ONLY the flavor they consume
+# (they download that flavor's artifact instead of recompiling). The Pebble
+# issuance/renewal e2e runs on BOTH flavors: the nginx jobs gate on build-nginx
+# (not blocked by a slow angie build), the e2e-angie matrix gates on build-angie.
 
 on:
   push:
@@ -30,257 +40,99 @@ permissions:
 jobs:
 
   resolve:
-    name: Resolve nginx version
+    name: Resolve nginx + angie versions
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      matrix: ${{ steps.v.outputs.matrix }}
+      nginx_version: ${{ steps.v.outputs.nginx_version }}
+      nginx_dir: ${{ steps.v.outputs.nginx_dir }}
+      nginx_url: ${{ steps.v.outputs.nginx_url }}
+      angie_version: ${{ steps.v.outputs.angie_version }}
+      angie_dir: ${{ steps.v.outputs.angie_dir }}
+      angie_url: ${{ steps.v.outputs.angie_url }}
     steps:
-      - name: Resolve latest mainline + stable nginx
+      - name: Resolve latest mainline nginx + latest angie
         id: v
-        run: |
-          set -euo pipefail
-          vers=$(curl -fsSL https://nginx.org/en/download.html \
-            | grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.gz)' \
-            | sort -V)
-          ver=$(echo "$vers" | tail -1)
-          if [ -z "$ver" ]; then
-            echo "::error::could not resolve mainline nginx version"
-            exit 1
-          fi
-          stable=$(echo "$vers" | awk -F. '($2 % 2)==0' | sort -V | tail -1)
-          [ -z "$stable" ] && stable="$ver"
-          echo "Resolved nginx mainline: $ver  stable: $stable"
-          # Angie fork pinned; bump alongside nginx as releases ship.
-          matrix=$(printf 'matrix={"include":[{"flavor":"nginx","version":"%s","url":"https://nginx.org/download/nginx-%s.tar.gz","dir":"nginx-%s"},{"flavor":"nginx","version":"%s","url":"https://nginx.org/download/nginx-%s.tar.gz","dir":"nginx-%s"},{"flavor":"angie","version":"1.11.5","url":"https://download.angie.software/files/angie-1.11.5.tar.gz","dir":"angie-1.11.5"}]}' \
-            "$ver" "$ver" "$ver" "$stable" "$stable" "$stable")
-          { echo "$matrix"; } >> "$GITHUB_OUTPUT"
-
-  build:
-    name: Build & load (${{ matrix.flavor }} ${{ matrix.version }})
-    needs: resolve
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
-    steps:
-      - name: Checkout module
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Install build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential libpcre2-dev zlib1g-dev libssl-dev ccache
-          ccache --max-size=500M
-
-      - name: Restore ccache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: ~/.ccache
-          key: ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-${{ github.sha }}
-          restore-keys: |
-            ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-
-
-      - name: Fetch ${{ matrix.flavor }} ${{ matrix.version }}
-        run: |
-          set -euo pipefail
-          curl -fsSL -o src.tar.gz "${{ matrix.url }}"
-          tar -xzf src.tar.gz
-
-      - name: Configure + build module
-        run: |
-          set -euo pipefail
-          cd "${{ matrix.dir }}"
-          ./configure --with-compat --with-http_ssl_module \
-            --with-cc="ccache cc" \
-            --add-dynamic-module="$GITHUB_WORKSPACE" > /tmp/conf.log 2>&1 \
-            || { tail -40 /tmp/conf.log; exit 1; }
-          # Full build (not `make modules`): the load test needs the server
-          # binary too. angie names it objs/angie, nginx names it objs/nginx.
-          make > /tmp/make.log 2>&1 || { tail -40 /tmp/make.log; exit 1; }
-          test -f objs/ngx_http_autocert_module.so
-          test -f objs/ngx_autocert_process_module.so   # CORE module (M4a helper)
-          BIN=objs/nginx; [ -x objs/angie ] && BIN=objs/angie
-          test -x "$BIN"
-          echo "SERVER_BIN=$PWD/$BIN" >> "$GITHUB_ENV"
-          echo "✓ built autocert .so (http + process) + $BIN"
-
-      - name: Load smoke test (parse + name collection)
-        run: |
-          set -euo pipefail
-          cd "${{ matrix.dir }}"
-          BIN="$SERVER_BIN"
-          MOD="$PWD/objs/ngx_http_autocert_module.so"
-          PROC="$PWD/objs/ngx_autocert_process_module.so"
-          PREFIX=/tmp/ngx-test
-          mkdir -p "$PREFIX/logs" "$PREFIX/conf"
-          cat > "$PREFIX/conf/nginx.conf" <<EOF
-          load_module $PROC;
-          load_module $MOD;
-          events {}
-          http {
-              autocert on admin@example.com;   # global
-              # M2 global tuning knobs (all non-default values).
-              autocert_ca https://acme-staging-v02.api.letsencrypt.org/directory;
-              autocert_renew_before 10d;
-              autocert_key_type secp256r1;
-              autocert_store certbot;
-              autocert_path /var/lib/autocert;
-              autocert_challenge tls-alpn-01;
-              server {
-                  listen 8080;
-                  server_name a.example.com www.a.example.com;
-                  autocert on;                  # per-vhost override, 2 names
-              }
-              server {
-                  listen 8081;
-                  server_name b.example.com;
-                  autocert off;                 # opt out, name NOT collected
-              }
-              server {
-                  listen 8082;
-                  # regex + leading/suffix wildcard names are skipped (not issuable).
-                  server_name ~^re\.example\.com$ *.wild.example.com www.suffix.*;
-                  autocert on;
-              }
-          }
-          EOF
-          # 1) -t: config parses, module loads, postconfig walk runs clean.
-          "$BIN" -t -p "$PREFIX" -c "$PREFIX/conf/nginx.conf"
-          # 2) The postconfig name-count NOTICE is only emitted on a real start
-          #    (nginx gates notice-level output under -t), so briefly start,
-          #    grep the error log, then stop. High ports → no root needed.
-          "$BIN" -p "$PREFIX" -c "$PREFIX/conf/nginx.conf"
-          for i in $(seq 1 20); do [ -s "$PREFIX/logs/error.log" ] && break; sleep 0.2; done
-          "$BIN" -p "$PREFIX" -c "$PREFIX/conf/nginx.conf" -s stop || true
-          cat "$PREFIX/logs/error.log"
-          # Exactly the 2 concrete names of the enabled vhost must be collected:
-          # b.* is off; regex + wildcard are skipped; dedup across vhosts.
-          grep -q 'autocert: 2 name(s) enabled for issuance' "$PREFIX/logs/error.log"
-          echo "✓ ${{ matrix.flavor }} ${{ matrix.version }} parsed autocert_* + collected enabled names"
-
-      - name: Reject invalid config (negative tests)
-        run: |
-          set -euo pipefail
-          cd "${{ matrix.dir }}"
-          BIN="$SERVER_BIN"
-          MOD="$PWD/objs/ngx_http_autocert_module.so"
-          PREFIX=/tmp/ngx-bad
-          mkdir -p "$PREFIX/logs" "$PREFIX/conf"
-
-          # Each case: a description, the http{} body, and the substring the
-          # rejection message must contain. Every one must fail `nginx -t`.
-          run_neg() {
-            local desc="$1" body="$2" want="$3"
-            printf 'load_module %s;\nevents {}\nhttp {\n%s\n}\n' \
-              "$MOD" "$body" > "$PREFIX/conf/nginx.conf"
-            if "$BIN" -t -p "$PREFIX" -c "$PREFIX/conf/nginx.conf" 2>/tmp/err; then
-              echo "::error::[$desc] invalid config was accepted"; cat /tmp/err
-              exit 1
-            fi
-            if ! grep -q "$want" /tmp/err; then
-              echo "::error::[$desc] wrong error message (wanted: $want)"
-              cat /tmp/err; exit 1
-            fi
-            echo "✓ rejected: $desc"
-          }
-
-          run_neg "invalid email"     'server { listen 8080; autocert on x@; }'                          'invalid email'
-          run_neg "bad key_type"      'autocert_key_type rsa2048;'                                       'invalid key type'
-          run_neg "bad store"         'autocert_store vault;'                                            'invalid store'
-          run_neg "bad challenge"     'autocert_challenge dns-01;'                                       'invalid challenge'
-          run_neg "duplicate key"     'autocert_key_type secp384r1; autocert_key_type secp256r1;'        'is duplicate'
-          run_neg "knob in server{}"  'server { listen 8080; autocert_ca http://x/; }'                   'directive is not allowed'
-          echo "✓ all negative cases rejected"
-
-      - name: Helper process lifecycle (M4a)
-        run: |
-          set -euo pipefail
-          # Channel-managed ACME helper: start spawns one, reload x2 keeps exactly
-          # one (old retired, new respawned), crash auto-respawns, stop tears down
-          # cleanly with no SIGKILL/hang. Runs against this matrix flavor's build
-          # (nginx mainline+stable AND angie), reusing the dir from the build step.
-          NGX_BUILD_DIR="$GITHUB_WORKSPACE/${{ matrix.dir }}" \
-            AC_TEST_PORT=18177 \
-            bash "$GITHUB_WORKSPACE/tests/helper-lifecycle.sh"
-
-      - name: HTTP-01 challenge serve (M5)
-        run: |
-          set -euo pipefail
-          # Seed a token via autocert_test_challenge, fetch
-          # /.well-known/acme-challenge/<token>, assert exact keyauth + 404s.
-          # No network/docker — pure nginx/angie. Reuses the matrix build dir.
-          SERVER_BIN="$GITHUB_WORKSPACE/${{ matrix.dir }}/$( \
-            [ -x "${{ matrix.dir }}/objs/angie" ] && echo objs/angie || echo objs/nginx)" \
-            NGX_BUILD_DIR="$GITHUB_WORKSPACE/${{ matrix.dir }}" \
-            AC_TEST_PORT=18178 \
-            bash "$GITHUB_WORKSPACE/tests/http01-challenge.sh"
-
-      - name: Per-SNI certificate serving (M7)
-        run: |
-          set -euo pipefail
-          # `listen ssl; autocert on;` with no ssl_certificate must start,
-          # serve a bootstrap cert pre-issuance, serve the real store cert by
-          # SNI, and hot-reload on mtime change. No network/docker.
-          SERVER_BIN="$GITHUB_WORKSPACE/${{ matrix.dir }}/$( \
-            [ -x "${{ matrix.dir }}/objs/angie" ] && echo objs/angie || echo objs/nginx)" \
-            NGX_BUILD_DIR="$GITHUB_WORKSPACE/${{ matrix.dir }}" \
-            AC_TEST_PORT=18179 \
-            bash "$GITHUB_WORKSPACE/tests/tls-serve.sh"
-
-      - name: tls-alpn-01 ALPN serve path (M10b)
-        run: |
-          set -euo pipefail
-          # A client negotiating ALPN "acme-tls/1" + SNI gets the seeded
-          # challenge cert (SAN + critical acmeIdentifier); a normal client gets
-          # the ordinary cert and negotiates http/1.1. No network/docker.
-          SERVER_BIN="$GITHUB_WORKSPACE/${{ matrix.dir }}/$( \
-            [ -x "${{ matrix.dir }}/objs/angie" ] && echo objs/angie || echo objs/nginx)" \
-            NGX_BUILD_DIR="$GITHUB_WORKSPACE/${{ matrix.dir }}" \
-            AC_TEST_PORT=18180 \
-            bash "$GITHUB_WORKSPACE/tests/tls-alpn-challenge.sh"
-
-  crypto-unit:
-    name: Crypto unit tests (M3)
-    needs: resolve
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - name: Checkout module
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Install build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential libpcre2-dev zlib1g-dev libssl-dev ccache
-          ccache --max-size=500M
-
-      - name: Restore ccache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: ~/.ccache
-          key: ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-${{ github.sha }}
-          restore-keys: |
-            ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-
-
-      - name: Fetch + configure nginx (for ngx_palloc/string/times objects)
         run: |
           set -euo pipefail
           ver=$(curl -fsSL https://nginx.org/en/download.html \
             | grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.gz)' \
             | sort -V | tail -1)
-          curl -fsSL -o src.tar.gz "https://nginx.org/download/nginx-$ver.tar.gz"
-          tar -xzf src.tar.gz
-          echo "NGX=$PWD/nginx-$ver" >> "$GITHUB_ENV"
-          # configure + a full build so the core .o files we link exist.
-          ( cd "nginx-$ver" \
-            && ./configure --with-compat --with-http_ssl_module --with-cc="ccache cc" > /tmp/c.log 2>&1 \
-            && make > /tmp/m.log 2>&1 ) || { tail -40 /tmp/c.log /tmp/m.log; exit 1; }
+          if [ -z "$ver" ]; then
+            echo "::error::could not resolve mainline nginx version"; exit 1
+          fi
+          angie=$(curl -fsSL https://download.angie.software/files/ \
+            | grep -oP 'angie-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.gz)' \
+            | sort -V | tail -1)
+          if [ -z "$angie" ]; then
+            echo "::error::could not resolve latest angie version"; exit 1
+          fi
+          echo "Resolved nginx mainline: $ver  angie: $angie"
+          {
+            echo "nginx_version=$ver"
+            echo "nginx_dir=nginx-$ver"
+            echo "nginx_url=https://nginx.org/download/nginx-$ver.tar.gz"
+            echo "angie_version=$angie"
+            echo "angie_dir=angie-$angie"
+            echo "angie_url=https://download.angie.software/files/angie-$angie.tar.gz"
+          } >> "$GITHUB_OUTPUT"
+
+  build-nginx:
+    name: Build & load (nginx ${{ needs.resolve.outputs.nginx_version }})
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Build module + load/serve tests
+        uses: ./.github/actions/build-module
+        with:
+          flavor: nginx
+          version: ${{ needs.resolve.outputs.nginx_version }}
+          url: ${{ needs.resolve.outputs.nginx_url }}
+          dir: ${{ needs.resolve.outputs.nginx_dir }}
+
+  build-angie:
+    name: Build & load (angie ${{ needs.resolve.outputs.angie_version }})
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Build module + load/serve tests
+        uses: ./.github/actions/build-module
+        with:
+          flavor: angie
+          version: ${{ needs.resolve.outputs.angie_version }}
+          url: ${{ needs.resolve.outputs.angie_url }}
+          dir: ${{ needs.resolve.outputs.angie_dir }}
+
+  crypto-unit:
+    name: Crypto unit tests (M3)
+    needs: [resolve, build-nginx]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Setup build deps
+        uses: ./.github/actions/setup
+        with:
+          packages: build-essential libssl-dev
+
+      - name: Download nginx build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: build-nginx
+          path: ${{ needs.resolve.outputs.nginx_dir }}
 
       - name: Build + run crypto unit tests
         run: |
           set -euo pipefail
+          NGX="$GITHUB_WORKSPACE/${{ needs.resolve.outputs.nginx_dir }}"
           INC="-I$NGX/src/core -I$NGX/src/event -I$NGX/src/os/unix -I$NGX/objs"
           OBJS="$NGX/objs/src/core/ngx_palloc.o $NGX/objs/src/core/ngx_string.o \
                 $NGX/objs/src/os/unix/ngx_time.o $NGX/objs/src/core/ngx_times.o \
@@ -293,43 +145,28 @@ jobs:
 
   json-unit:
     name: JSON parser unit tests (M4c)
-    needs: resolve
+    needs: [resolve, build-nginx]
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - name: Checkout module
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - name: Install build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential libpcre2-dev zlib1g-dev libssl-dev ccache
-          ccache --max-size=500M
-
-      - name: Restore ccache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - name: Setup build deps
+        uses: ./.github/actions/setup
         with:
-          path: ~/.ccache
-          key: ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-${{ github.sha }}
-          restore-keys: |
-            ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-
+          packages: build-essential libssl-dev
 
-      - name: Fetch + configure nginx (for ngx_palloc/string/times objects)
-        run: |
-          set -euo pipefail
-          ver=$(curl -fsSL https://nginx.org/en/download.html \
-            | grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.gz)' \
-            | sort -V | tail -1)
-          curl -fsSL -o src.tar.gz "https://nginx.org/download/nginx-$ver.tar.gz"
-          tar -xzf src.tar.gz
-          echo "NGX=$PWD/nginx-$ver" >> "$GITHUB_ENV"
-          ( cd "nginx-$ver" \
-            && ./configure --with-compat --with-http_ssl_module --with-cc="ccache cc" > /tmp/c.log 2>&1 \
-            && make > /tmp/m.log 2>&1 ) || { tail -40 /tmp/c.log /tmp/m.log; exit 1; }
+      - name: Download nginx build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: build-nginx
+          path: ${{ needs.resolve.outputs.nginx_dir }}
 
       - name: Build + run JSON unit tests
         run: |
           set -euo pipefail
+          NGX="$GITHUB_WORKSPACE/${{ needs.resolve.outputs.nginx_dir }}"
           INC="-I$NGX/src/core -I$NGX/src/event -I$NGX/src/os/unix -I$NGX/objs"
           OBJS="$NGX/objs/src/core/ngx_palloc.o $NGX/objs/src/core/ngx_string.o \
                 $NGX/objs/src/os/unix/ngx_time.o $NGX/objs/src/core/ngx_times.o \
@@ -340,297 +177,192 @@ jobs:
             $OBJS
           ./test_json
 
+  # ------------------------------------------------------------------ nginx e2e
+  # The full Pebble issuance/renewal suite against the nginx build. Gates on
+  # build-nginx only (a slow angie build never blocks these).
+
   acme-directory:
     name: ACME account register over TLS (M4b/M4c/M4d)
-    needs: resolve
+    needs: [resolve, build-nginx]
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
       - name: Checkout module
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Install build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential libpcre2-dev zlib1g-dev libssl-dev ccache
-          ccache --max-size=500M
-
-      - name: Restore ccache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - name: Setup runtime deps
+        uses: ./.github/actions/setup
         with:
-          path: ~/.ccache
-          key: ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-${{ github.sha }}
-          restore-keys: |
-            ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-
-
-      - name: Fetch + build nginx with the module
-        run: |
-          set -euo pipefail
-          ver=$(curl -fsSL https://nginx.org/en/download.html \
-            | grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.gz)' \
-            | sort -V | tail -1)
-          curl -fsSL -o src.tar.gz "https://nginx.org/download/nginx-$ver.tar.gz"
-          tar -xzf src.tar.gz
-          cd "nginx-$ver"
-          ./configure --with-compat --with-http_ssl_module \
-            --with-cc="ccache cc" \
-            --add-dynamic-module="$GITHUB_WORKSPACE" > /tmp/conf.log 2>&1 \
-            || { tail -40 /tmp/conf.log; exit 1; }
-          make > /tmp/make.log 2>&1 || { tail -40 /tmp/make.log; exit 1; }
-          echo "SERVER_BIN=$PWD/objs/nginx" >> "$GITHUB_ENV"
-
+          packages: libpcre2-8-0
+      - name: Download nginx build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: build-nginx
+          path: ${{ needs.resolve.outputs.nginx_dir }}
       - name: Helper registers an ACME account over verified TLS
         run: |
-          # Pebble + dnsmasq run as docker containers (available on GH runners).
-          # The script wires them up, points the helper at Pebble with Pebble's
-          # CA in the trust store, and asserts a 200 directory fetch.
-          bash "$GITHUB_WORKSPACE/tests/acme-directory.sh"
+          NGX="$GITHUB_WORKSPACE/${{ needs.resolve.outputs.nginx_dir }}"
+          chmod +x "$NGX/objs/nginx"
+          SERVER_BIN="$NGX/objs/nginx" NGX_BUILD_DIR="$NGX" \
+            bash "$GITHUB_WORKSPACE/tests/acme-directory.sh"
 
   order-authz:
     name: ACME order + authz reaches valid (M6a)
-    needs: resolve
+    needs: [resolve, build-nginx]
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
       - name: Checkout module
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Install build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential libpcre2-dev zlib1g-dev libssl-dev ccache
-          ccache --max-size=500M
-
-      - name: Restore ccache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - name: Setup runtime deps
+        uses: ./.github/actions/setup
         with:
-          path: ~/.ccache
-          key: ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-${{ github.sha }}
-          restore-keys: |
-            ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-
-
-      - name: Fetch + build nginx with the module
-        run: |
-          set -euo pipefail
-          ver=$(curl -fsSL https://nginx.org/en/download.html \
-            | grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.gz)' \
-            | sort -V | tail -1)
-          curl -fsSL -o src.tar.gz "https://nginx.org/download/nginx-$ver.tar.gz"
-          tar -xzf src.tar.gz
-          cd "nginx-$ver"
-          ./configure --with-compat --with-http_ssl_module \
-            --with-cc="ccache cc" \
-            --add-dynamic-module="$GITHUB_WORKSPACE" > /tmp/conf.log 2>&1 \
-            || { tail -40 /tmp/conf.log; exit 1; }
-          make > /tmp/make.log 2>&1 || { tail -40 /tmp/make.log; exit 1; }
-          echo "SERVER_BIN=$PWD/objs/nginx" >> "$GITHUB_ENV"
-
+          packages: libpcre2-8-0
+      - name: Download nginx build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: build-nginx
+          path: ${{ needs.resolve.outputs.nginx_dir }}
       - name: Full order -> authz -> http-01 -> valid against Pebble
         run: |
-          # The helper registers an account, then drives newOrder -> fetch authz
-          # -> publish the http-01 keyauth to the challenge store -> POST the
-          # challenge -> poll until the authorization is "valid". Pebble's VA
-          # fetches the token from our :80 worker handler, so nginx binds :80
-          # (root) and dnsmasq points the order domain at the host.
-          sudo env SERVER_BIN="$SERVER_BIN" \
-            NGX_BUILD_DIR="$(dirname "$SERVER_BIN")/.." \
+          NGX="$GITHUB_WORKSPACE/${{ needs.resolve.outputs.nginx_dir }}"
+          chmod +x "$NGX/objs/nginx"
+          sudo env SERVER_BIN="$NGX/objs/nginx" NGX_BUILD_DIR="$NGX" \
             bash "$GITHUB_WORKSPACE/tests/order-authz.sh"
 
   tls-alpn-issue:
     name: tls-alpn-01 full issuance, no port 80 (M10c)
-    needs: resolve
+    needs: [resolve, build-nginx]
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
       - name: Checkout module
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Install build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential libpcre2-dev zlib1g-dev libssl-dev ccache
-          ccache --max-size=500M
-
-      - name: Restore ccache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - name: Setup runtime deps
+        uses: ./.github/actions/setup
         with:
-          path: ~/.ccache
-          key: ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-${{ github.sha }}
-          restore-keys: |
-            ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-
-
-      - name: Fetch + build nginx with the module
-        run: |
-          set -euo pipefail
-          ver=$(curl -fsSL https://nginx.org/en/download.html \
-            | grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.gz)' \
-            | sort -V | tail -1)
-          curl -fsSL -o src.tar.gz "https://nginx.org/download/nginx-$ver.tar.gz"
-          tar -xzf src.tar.gz
-          cd "nginx-$ver"
-          ./configure --with-compat --with-http_ssl_module \
-            --with-cc="ccache cc" \
-            --add-dynamic-module="$GITHUB_WORKSPACE" > /tmp/conf.log 2>&1 \
-            || { tail -40 /tmp/conf.log; exit 1; }
-          make > /tmp/make.log 2>&1 || { tail -40 /tmp/make.log; exit 1; }
-          echo "SERVER_BIN=$PWD/objs/nginx" >> "$GITHUB_ENV"
-
+          packages: libpcre2-8-0
+      - name: Download nginx build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: build-nginx
+          path: ${{ needs.resolve.outputs.nginx_dir }}
       - name: Full tls-alpn-01 issuance against Pebble (port 80 never used)
         run: |
-          # autocert_challenge tls-alpn-01: the helper builds the RFC 8737
-          # challenge cert and the worker serves it at the handshake on ALPN
-          # "acme-tls/1". Pebble's VA validates on a high tlsPort (5001) with no
-          # :80 listener anywhere, so this needs no root. dnsmasq points the
-          # order domain at the host; the test asserts authz valid, the worker
-          # served the challenge cert, and the issued cert is stored + matches.
-          SERVER_BIN="$SERVER_BIN" \
-            NGX_BUILD_DIR="$(dirname "$SERVER_BIN")/.." \
+          NGX="$GITHUB_WORKSPACE/${{ needs.resolve.outputs.nginx_dir }}"
+          chmod +x "$NGX/objs/nginx"
+          SERVER_BIN="$NGX/objs/nginx" NGX_BUILD_DIR="$NGX" \
             bash "$GITHUB_WORKSPACE/tests/tls-alpn-issue.sh"
 
   renewal:
     name: ACME renewal + multi-name issuance (M8)
-    needs: resolve
+    needs: [resolve, build-nginx]
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
       - name: Checkout module
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Install build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential libpcre2-dev zlib1g-dev libssl-dev ccache
-          ccache --max-size=500M
-
-      - name: Restore ccache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - name: Setup runtime deps
+        uses: ./.github/actions/setup
         with:
-          path: ~/.ccache
-          key: ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-${{ github.sha }}
-          restore-keys: |
-            ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-
-
-      - name: Fetch + build nginx with the module
-        run: |
-          set -euo pipefail
-          ver=$(curl -fsSL https://nginx.org/en/download.html \
-            | grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.gz)' \
-            | sort -V | tail -1)
-          curl -fsSL -o src.tar.gz "https://nginx.org/download/nginx-$ver.tar.gz"
-          tar -xzf src.tar.gz
-          cd "nginx-$ver"
-          ./configure --with-compat --with-http_ssl_module \
-            --with-cc="ccache cc" \
-            --add-dynamic-module="$GITHUB_WORKSPACE" > /tmp/conf.log 2>&1 \
-            || { tail -40 /tmp/conf.log; exit 1; }
-          make > /tmp/make.log 2>&1 || { tail -40 /tmp/make.log; exit 1; }
-          echo "SERVER_BIN=$PWD/objs/nginx" >> "$GITHUB_ENV"
-
+          packages: libpcre2-8-0
+      - name: Download nginx build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: build-nginx
+          path: ${{ needs.resolve.outputs.nginx_dir }}
       - name: Provision two domains, then force a renewal reissue
         run: |
-          # Two server_names => both must get a cert (multi-name scheduler).
-          # autocert_renew_before is set huge so every cert is inside its renew
-          # window; a reload spawns a fresh helper whose scan reissues both, and
-          # the test asserts the leaf serials changed (real reissue, atomic
-          # store swap that the M7 serve path hot-reloads).
-          sudo env SERVER_BIN="$SERVER_BIN" \
-            NGX_BUILD_DIR="$(dirname "$SERVER_BIN")/.." \
+          NGX="$GITHUB_WORKSPACE/${{ needs.resolve.outputs.nginx_dir }}"
+          chmod +x "$NGX/objs/nginx"
+          sudo env SERVER_BIN="$NGX/objs/nginx" NGX_BUILD_DIR="$NGX" \
             bash "$GITHUB_WORKSPACE/tests/renewal.sh"
 
   backoff:
     name: Per-name failure backoff (M9b)
-    needs: resolve
+    needs: [resolve, build-nginx]
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
       - name: Checkout module
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Install build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential libpcre2-dev zlib1g-dev libssl-dev ccache
-          ccache --max-size=500M
-
-      - name: Restore ccache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - name: Setup runtime deps
+        uses: ./.github/actions/setup
         with:
-          path: ~/.ccache
-          key: ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-${{ github.sha }}
-          restore-keys: |
-            ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-
-
-      - name: Fetch + build nginx with the module
-        run: |
-          set -euo pipefail
-          ver=$(curl -fsSL https://nginx.org/en/download.html \
-            | grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.gz)' \
-            | sort -V | tail -1)
-          curl -fsSL -o src.tar.gz "https://nginx.org/download/nginx-$ver.tar.gz"
-          tar -xzf src.tar.gz
-          cd "nginx-$ver"
-          ./configure --with-compat --with-http_ssl_module \
-            --with-cc="ccache cc" \
-            --add-dynamic-module="$GITHUB_WORKSPACE" > /tmp/conf.log 2>&1 \
-            || { tail -40 /tmp/conf.log; exit 1; }
-          make > /tmp/make.log 2>&1 || { tail -40 /tmp/make.log; exit 1; }
-          echo "SERVER_BIN=$PWD/objs/nginx" >> "$GITHUB_ENV"
-
+          packages: libpcre2-8-0
+      - name: Download nginx build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: build-nginx
+          path: ${{ needs.resolve.outputs.nginx_dir }}
       - name: A failing name must back off, a good name issues once
         run: |
-          # One helper, two names: a good one (issues once) and a bad one whose
-          # http-01 the Pebble VA can never reach (DNS -> unroutable). The bad
-          # name must be retried with the exponential backoff hold (>=~60s),
-          # not re-ordered every sweep.
-          sudo env SERVER_BIN="$SERVER_BIN" \
-            NGX_BUILD_DIR="$(dirname "$SERVER_BIN")/.." \
+          NGX="$GITHUB_WORKSPACE/${{ needs.resolve.outputs.nginx_dir }}"
+          chmod +x "$NGX/objs/nginx"
+          sudo env SERVER_BIN="$NGX/objs/nginx" NGX_BUILD_DIR="$NGX" \
             bash "$GITHUB_WORKSPACE/tests/backoff.sh"
 
   retry-after:
     name: 429 / Retry-After rate-limit awareness (M9c)
-    needs: resolve
+    needs: [resolve, build-nginx]
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
       - name: Checkout module
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-      - name: Install build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential libpcre2-dev zlib1g-dev libssl-dev ccache
-          ccache --max-size=500M
-
-      - name: Restore ccache
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - name: Setup runtime deps
+        uses: ./.github/actions/setup
         with:
-          path: ~/.ccache
-          key: ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-${{ github.sha }}
-          restore-keys: |
-            ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-
-
-      - name: Fetch + build nginx with the module
-        run: |
-          set -euo pipefail
-          ver=$(curl -fsSL https://nginx.org/en/download.html \
-            | grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.gz)' \
-            | sort -V | tail -1)
-          curl -fsSL -o src.tar.gz "https://nginx.org/download/nginx-$ver.tar.gz"
-          tar -xzf src.tar.gz
-          cd "nginx-$ver"
-          ./configure --with-compat --with-http_ssl_module \
-            --with-cc="ccache cc" \
-            --add-dynamic-module="$GITHUB_WORKSPACE" > /tmp/conf.log 2>&1 \
-            || { tail -40 /tmp/conf.log; exit 1; }
-          make > /tmp/make.log 2>&1 || { tail -40 /tmp/make.log; exit 1; }
-          echo "SERVER_BIN=$PWD/objs/nginx" >> "$GITHUB_ENV"
-
+          packages: libpcre2-8-0
+      - name: Download nginx build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: build-nginx
+          path: ${{ needs.resolve.outputs.nginx_dir }}
       - name: A 429 must honour Retry-After over the exponential backoff
         run: |
-          # A mock ACME CA returns 429 + "Retry-After: 90" on every newOrder.
-          # The helper must log that it is honouring the Retry-After and hold
-          # the name ~90s before the next attempt — longer than the 60s first
-          # exponential backoff step, proving the CA's hint wins.
-          sudo env SERVER_BIN="$SERVER_BIN" \
-            NGX_BUILD_DIR="$(dirname "$SERVER_BIN")/.." \
+          NGX="$GITHUB_WORKSPACE/${{ needs.resolve.outputs.nginx_dir }}"
+          chmod +x "$NGX/objs/nginx"
+          sudo env SERVER_BIN="$NGX/objs/nginx" NGX_BUILD_DIR="$NGX" \
             bash "$GITHUB_WORKSPACE/tests/retry-after.sh"
+
+  # ------------------------------------------------------------------ angie e2e
+  # The same Pebble issuance/renewal suite against the angie build (FLOW-2:
+  # angie previously only got build+load+serve, never full issuance). One job,
+  # matrixed over the test scripts; gates on build-angie only. Run uniformly
+  # under sudo (the http-01/renewal/backoff/retry scripts bind :80; harmless for
+  # the tls-alpn/account ones). The test scripts auto-detect objs/angie.
+
+  e2e-angie:
+    name: angie e2e (${{ matrix.test }})
+    needs: [resolve, build-angie]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - acme-directory
+          - order-authz
+          - tls-alpn-issue
+          - renewal
+          - backoff
+          - retry-after
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Setup runtime deps
+        uses: ./.github/actions/setup
+        with:
+          packages: libpcre2-8-0
+      - name: Download angie build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: build-angie
+          path: ${{ needs.resolve.outputs.angie_dir }}
+      - name: ${{ matrix.test }} against Pebble on angie
+        run: |
+          set -euo pipefail
+          NGX="$GITHUB_WORKSPACE/${{ needs.resolve.outputs.angie_dir }}"
+          chmod +x "$NGX/objs/angie"
+          sudo env SERVER_BIN="$NGX/objs/angie" NGX_BUILD_DIR="$NGX" \
+            bash "$GITHUB_WORKSPACE/tests/${{ matrix.test }}.sh"
