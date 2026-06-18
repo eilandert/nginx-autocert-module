@@ -1,0 +1,9 @@
+{
+  "newNonce": "https://acme.example/acme/new-nonce",
+  "newAccount": "https://acme.example/acme/new-acct",
+  "newOrder": "https://acme.example/acme/new-order",
+  "meta": {
+    "termsOfService": "https://acme.example/terms/v1",
+    "externalAccountRequired": false
+  }
+}

@@ -1,0 +1,115 @@
+name: Fuzzing
+
+# Coverage-guided fuzzing of the ACME JSON parser. Monthly discovery run plus
+# manual dispatch; kept off PR feedback because the normal JSON unit tests run
+# on every push/PR.
+#
+# Action pins:
+# actions/checkout@v5        -> 93cb6efe18208431cddfb8368fd83d5badbf9bfd
+# actions/upload-artifact@v5 -> 330a01c490aca151604b8cf639adc76d48f6c5d4
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+on:
+  schedule:
+    # Monthly, 1st @ 03:41 UTC.
+    - cron: "41 3 1 * *"
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Fuzz duration in seconds"
+        required: false
+        default: "900"
+
+concurrency:
+  group: fuzz-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: JSON parser fuzz
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install clang + build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential clang curl libpcre2-dev libssl-dev zlib1g-dev
+
+      - name: Resolve latest mainline nginx
+        run: |
+          set -euo pipefail
+          ver=$(curl -fsSL https://nginx.org/en/download.html \
+            | grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.gz)' \
+            | sort -V | tail -1)
+          if [ -z "$ver" ]; then
+            echo "::error::could not resolve mainline nginx version"
+            exit 1
+          fi
+          echo "NGINX_VERSION=$ver" >> "$GITHUB_ENV"
+
+      - name: Build nginx objects used by the parser harness
+        run: |
+          set -euo pipefail
+          mkdir -p .build
+          curl -fsSL -o ".build/nginx-${NGINX_VERSION}.tar.gz" \
+            "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
+          tar -xzf ".build/nginx-${NGINX_VERSION}.tar.gz" -C .build
+          cd ".build/nginx-${NGINX_VERSION}"
+          ./configure --with-http_ssl_module
+          make -j"$(nproc)"
+
+      - name: Build fuzz targets
+        run: |
+          NGX_BUILD_DIR="$GITHUB_WORKSPACE/.build/nginx-${NGINX_VERSION}" \
+            bash fuzz/build.sh "$GITHUB_WORKSPACE/fuzz"
+
+      - name: Select fuzz duration
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "FUZZ_SECS=${{ github.event.inputs.duration }}" >> "$GITHUB_ENV"
+          else
+            echo "FUZZ_SECS=900" >> "$GITHUB_ENV"
+          fi
+
+      - name: Run fuzzers
+        run: |
+          cd fuzz
+          ./fuzz_json \
+            -max_total_time="$FUZZ_SECS" \
+            -print_final_stats=1 \
+            -artifact_prefix="crash-json-" \
+            corpus/
+
+      - name: Minimize and persist corpus growth
+        if: success() && github.event_name == 'schedule'
+        run: |
+          cd fuzz
+          mkdir -p corpus-min
+          ./fuzz_json -merge=1 corpus-min/ corpus/
+          echo "Merged corpus: $(find corpus-min -type f | wc -l) units"
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: fuzz-crashes
+          path: ${{ github.workspace }}/fuzz/crash-*
+          retention-days: 30
+
+      - name: Upload minimized corpus
+        if: success() && github.event_name == 'schedule'
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: fuzz-corpus
+          path: ${{ github.workspace }}/fuzz/corpus-min
+          retention-days: 30

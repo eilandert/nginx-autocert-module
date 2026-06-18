@@ -1,0 +1,12 @@
+{
+  "status": "pending",
+  "identifiers": [
+    {"type": "dns", "value": "a.example.com"},
+    {"type": "dns", "value": "www.a.example.com"}
+  ],
+  "authorizations": [
+    "https://acme.example/acme/authz/A",
+    "https://acme.example/acme/authz/B"
+  ],
+  "finalize": "https://acme.example/acme/order/1/finalize"
+}

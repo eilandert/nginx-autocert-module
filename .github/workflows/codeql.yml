@@ -1,0 +1,79 @@
+name: CodeQL
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+on:
+  schedule:
+    # Monthly, 1st @ 04:47 UTC.
+    - cron: "47 4 1 * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze C
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential curl libpcre2-dev libssl-dev zlib1g-dev
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
+        with:
+          languages: c-cpp
+          queries: security-extended
+          config: |
+            paths:
+              - src
+            paths-ignore:
+              - .build/**
+
+      - name: Resolve latest mainline nginx
+        run: |
+          set -euo pipefail
+          ver=$(curl -fsSL https://nginx.org/en/download.html \
+            | grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.gz)' \
+            | sort -V | tail -1)
+          if [ -z "$ver" ]; then
+            echo "::error::could not resolve mainline nginx version"
+            exit 1
+          fi
+          echo "NGINX_VERSION=$ver" >> "$GITHUB_ENV"
+
+      - name: Build traced modules
+        run: |
+          set -euo pipefail
+          mkdir -p .build
+          curl -fsSL -o ".build/nginx-${NGINX_VERSION}.tar.gz" \
+            "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
+          tar -xzf ".build/nginx-${NGINX_VERSION}.tar.gz" -C .build
+          cd ".build/nginx-${NGINX_VERSION}"
+          ./configure \
+            --with-compat \
+            --with-http_ssl_module \
+            --add-dynamic-module="$GITHUB_WORKSPACE"
+          make -j"$(nproc)" modules
+          test -f objs/ngx_http_autocert_module.so
+          test -f objs/ngx_autocert_process_module.so
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4
+        with:
+          category: /language:c-cpp

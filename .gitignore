@@ -6,3 +6,6 @@
 tmp/
 objs/
 .codex-*.txt
+
+# local build/test scratch
+.build/
