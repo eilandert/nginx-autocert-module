@@ -9,43 +9,47 @@ certificate from an ACME CA (Let's Encrypt by default) for that vhost's
 - **Per-vhost or global** — a `server{}` setting overrides the `http{}` global.
 - **Privilege-separated** — keys live in a dedicated helper process, never in
   workers; the on-disk store is root-only (or certbot-compatible) by choice.
+- **No config reload on renewal** — certificates are loaded per-SNI at the TLS
+  handshake and hot-reload the instant a renewal rewrites the files.
+- **HTTP-01 and TLS-ALPN-01** challenges — the latter validates with **no port
+  80 listener** anywhere.
 - Builds and runs on both **nginx** and **angie**.
 
-> **Status: under construction — end-to-end issuance + serving work.** Done and
-> building/loading on nginx + angie: the `autocert` directives and global
-> `autocert_*` config model (M0/M2), ECDSA crypto/JWS (M3), the
-> privilege-separated helper **process** (M4a), the outbound
-> **HTTP/1.1-over-TLS client** (M4b), JSON parsing (M4c), ACME account
-> registration (M4d), the HTTP-01 challenge responder (M5), and the full
-> **RFC 8555 order flow** — newOrder → authz → http-01 → finalize (ECDSA CSR) →
-> download → store (M6). M7 adds **certificate serving**: a `listen 443 ssl;
-> autocert on;` server needs **no `ssl_certificate`** — the module gives it a
-> self-signed bootstrap cert so the listener comes up, then swaps in the real
-> certificate **per-SNI at the TLS handshake**, reloading automatically when a
-> renewal rewrites the files (no config reload). M8 adds **timed renewal across
-> all configured names**: a scheduler on the helper reads each stored
-> certificate's `notAfter` and reissues it once it enters the
-> `autocert_renew_before` window (default 7d), writing the fresh cert into the
-> store where the per-SNI serve path hot-reloads it — no config reload, no
-> downtime. M9 adds **robustness**: each name that fails to provision is held
-> off with an exponential per-name backoff (60s, doubling, capped at 1h) so a
-> broken name is never hammered, and when the CA replies **HTTP 429 (rate
-> limited)** the module honours its **`Retry-After`** header — holding the name
-> exactly that long (taking the later of the backoff and the CA's request)
-> instead of guessing. Verified end-to-end against Pebble (and a mock CA for
-> 429) in CI. M10 adds **TLS-ALPN-01** (RFC 8737, port-80-free validation): M10a
-> builds the challenge certificate (SAN + critical `id-pe-acmeIdentifier`), and
-> **M10b wires the serve path** — when a client negotiates ALPN `acme-tls/1`
-> with an SNI we have a pending challenge for, the handshake serves that
-> challenge certificate (from a shared store the helper writes) instead of the
-> real one; every other client still gets nginx's normal h2/http negotiation and
-> the per-SNI cert. **M10c wires it into the order flow**: with
-> `autocert_challenge tls-alpn-01;` the helper selects that challenge, builds the
-> challenge cert for the key authorization, publishes it to the serve store,
-> answers the CA, and removes it once validated — a full certificate is issued
-> with **no port 80 listener anywhere** (verified end-to-end against Pebble in
-> CI, validating on a high TLS port with `:80` closed). Still ahead: a packaged
-> Debian sub-package (M11).
+## How it works
+
+`autocert on;` on a `listen ... ssl;` vhost is all that's required — **no
+`ssl_certificate` line**. The module:
+
+1. **Brings the listener up immediately** with a self-signed bootstrap
+   certificate, so a config with no real cert still starts.
+2. **Provisions a certificate** from the ACME CA (Let's Encrypt by default) for
+   every concrete `server_name` on that vhost. A single privilege-separated
+   **helper process** — spawned by the master, the only process that ever holds
+   the account and certificate keys — runs the full RFC 8555 order flow:
+   newAccount → newOrder → authorization → challenge (HTTP-01 or TLS-ALPN-01) →
+   finalize (ECDSA CSR) → download → store.
+3. **Serves the real certificate per-SNI** at the TLS handshake once issued,
+   transparently replacing the bootstrap cert. The store is hot-reloaded by
+   `mtime`, so a renewal takes effect with **no config reload and no downtime**.
+4. **Renews automatically.** A scheduler on the helper reads each stored
+   certificate's `notAfter` and reissues once it enters the
+   `autocert_renew_before` window (default 7d).
+
+**Robustness.** A name that fails to provision is held off with an exponential
+per-name backoff (60s, doubling, capped at 1h) so it is never hammered. When the
+CA replies **HTTP 429**, the module honours the **`Retry-After`** header (taking
+the later of the backoff and the CA's request) instead of guessing. Account-
+registration and challenge POSTs retry once on a stale `badNonce`.
+
+**Challenge types.** HTTP-01 is served transparently on port 80 (no `location`
+block needed). With `autocert_challenge tls-alpn-01;` validation happens entirely
+inside the TLS handshake (RFC 8737): when a client negotiates ALPN `acme-tls/1`
+for a name with a pending challenge, the handshake serves the challenge
+certificate (critical `id-pe-acmeIdentifier`); every other client gets normal
+h2/http negotiation and the per-SNI cert. This needs **no port 80 listener**.
+
+The whole flow is verified end-to-end against [Pebble](https://github.com/letsencrypt/pebble)
+in CI on both nginx (mainline + stable) and angie, for HTTP-01 and TLS-ALPN-01.
 
 ## Directives
 
@@ -131,25 +135,37 @@ off`, the empty catch-all `""`, and wildcard (`*.x` / `.x`) or regex (`~…`)
 is deferred). The resolved name set is published to a shared-memory zone for the
 ACME helper to consume.
 
-## Architecture (target)
+## Architecture
 
 - A single **helper process** (master-spawned) runs the ACME state machine and
-  holds the account + certificate private keys.
+  holds the account + certificate private keys. Workers never touch keys.
+- The helper reaches the CA over a verified TLS connection (its own resolver +
+  HTTP/1.1 client); challenge tokens and cert state pass to workers through a
+  shared-memory zone.
 - HTTP-01 challenges are served **transparently** on port 80 (no location
-  block needed); TLS-ALPN-01 is offered for port-80-free setups.
+  block needed); TLS-ALPN-01 needs no port 80 at all.
 - Certificates are loaded **per-SNI at TLS handshake** from the store, so renewal
   needs no config reload.
 
 ## Build
 
-Dynamic module:
+The addon ships **two** dynamic modules — `ngx_autocert_process_module` (CORE,
+the helper) and `ngx_http_autocert_module` (HTTP, directives + serving):
 
 ```sh
 cd nginx-<version>
 ./configure --with-compat --with-http_ssl_module \
     --add-dynamic-module=/path/to/nginx-autocert-module
 make modules
-# -> objs/ngx_http_autocert_module.so, load with `load_module`.
+# -> objs/ngx_autocert_process_module.so
+#    objs/ngx_http_autocert_module.so
+```
+
+Load **both**, helper first:
+
+```nginx
+load_module modules/ngx_autocert_process_module.so;
+load_module modules/ngx_http_autocert_module.so;
 ```
 
 ## See also
