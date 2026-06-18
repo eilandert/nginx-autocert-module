@@ -38,11 +38,16 @@
 #include <ngx_event.h>
 #include <ngx_channel.h>
 
+#include "ngx_autocert_shared.h"
+#include "ngx_autocert_acme.h"
+
 
 #define NGX_AUTOCERT_PROC_NAME    "autocert helper"
 #define NGX_AUTOCERT_HEARTBEAT    60000   /* ms; placeholder until M4b */
 #define NGX_AUTOCERT_WATCH        1000    /* ms; master-liveness poll */
 #define NGX_AUTOCERT_STARTUP_BUDGET 30000 /* ms; give up if master never seen */
+#define NGX_AUTOCERT_KICK         500     /* ms; defer first ACME fetch */
+#define NGX_AUTOCERT_HTTP_TIMEOUT 30000   /* ms; per-request transport timeout */
 
 
 static ngx_int_t ngx_autocert_process_init_module(ngx_cycle_t *cycle);
@@ -52,6 +57,19 @@ static void ngx_autocert_heartbeat_handler(ngx_event_t *ev);
 static void ngx_autocert_watch_handler(ngx_event_t *ev);
 static ngx_uint_t ngx_autocert_master_gone(ngx_cycle_t *cycle);
 static void ngx_autocert_close_listening(ngx_cycle_t *cycle);
+static void ngx_autocert_kick_handler(ngx_event_t *ev);
+static void ngx_autocert_directory_done(ngx_autocert_acme_request_t *req,
+    ngx_int_t rc);
+
+
+/*
+ * The outbound ACME client and the in-flight directory request, owned by the
+ * helper for its lifetime. M4b fetches the CA directory exactly once at
+ * startup to prove the transport; the ACME state machine (M4c+) reuses the
+ * same client for every request.
+ */
+static ngx_autocert_acme_client_t  ngx_autocert_client;
+static ngx_uint_t                   ngx_autocert_client_ready;
 
 
 static ngx_core_module_t  ngx_autocert_process_module_ctx = {
@@ -289,6 +307,7 @@ ngx_autocert_process_cycle(ngx_cycle_t *cycle, void *data)
     sigset_t     set;
     ngx_event_t  heartbeat;
     ngx_event_t  watch;
+    ngx_event_t  kick;
 
     ngx_process = NGX_PROCESS_HELPER;
 
@@ -426,6 +445,17 @@ ngx_autocert_process_cycle(ngx_cycle_t *cycle, void *data)
     watch.data = cycle;
     watch.log = cycle->log;
     ngx_add_timer(&watch, NGX_AUTOCERT_WATCH);
+
+    /*
+     * Kick off the one-shot ACME directory fetch shortly after startup, off the
+     * event loop (so the resolver/connect run with the loop fully up). M4b
+     * proof-of-transport; M4c+ replaces this with the real ACME schedule.
+     */
+    ngx_memzero(&kick, sizeof(ngx_event_t));
+    kick.handler = ngx_autocert_kick_handler;
+    kick.data = cycle;
+    kick.log = cycle->log;
+    ngx_add_timer(&kick, NGX_AUTOCERT_KICK);
 
     for ( ;; ) {
 
@@ -592,6 +622,99 @@ ngx_autocert_watch_handler(ngx_event_t *ev)
     }
 
     ngx_add_timer(ev, NGX_AUTOCERT_WATCH);
+}
+
+
+/*
+ * One-shot startup kick: build the outbound client (TLS trust + resolver from
+ * the HTTP config) on first fire, then GET the CA directory to prove the
+ * transport end to end. Failures are logged, not fatal -- the helper keeps
+ * running so the ACME flow (M4c+) can retry.
+ */
+static void
+ngx_autocert_kick_handler(ngx_event_t *ev)
+{
+    ngx_cycle_t                  *cycle = ev->data;
+    ngx_pool_t                   *pool;
+    ngx_autocert_conf_t           acf;
+    ngx_autocert_acme_request_t  *req;
+
+    if (ngx_quit || ngx_terminate || ngx_exiting) {
+        return;
+    }
+
+    if (ngx_autocert_get_conf(cycle, &acf) != NGX_OK || !acf.configured) {
+        ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
+                      "autocert: no http{} autocert config; helper idle");
+        return;
+    }
+
+    if (!ngx_autocert_client_ready) {
+        if (ngx_autocert_acme_client_create(&ngx_autocert_client, cycle,
+                                            &acf.ca_certificate, acf.resolver,
+                                            NGX_AUTOCERT_HTTP_TIMEOUT)
+            != NGX_OK)
+        {
+            ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
+                          "autocert: failed to build ACME client");
+            return;
+        }
+        ngx_autocert_client.resolver_timeout = acf.resolver_timeout * 1000;
+        ngx_autocert_client_ready = 1;
+    }
+
+    pool = ngx_create_pool(NGX_MIN_POOL_SIZE, cycle->log);
+    if (pool == NULL) {
+        return;
+    }
+
+    req = ngx_pcalloc(pool, sizeof(ngx_autocert_acme_request_t));
+    if (req == NULL) {
+        ngx_destroy_pool(pool);
+        return;
+    }
+
+    req->client = &ngx_autocert_client;
+    req->pool = pool;
+    req->log = cycle->log;
+    req->url = acf.ca;
+    req->handler = ngx_autocert_directory_done;
+
+    ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
+                  "autocert: fetching ACME directory %V", &acf.ca);
+
+    if (ngx_autocert_acme_request(req) != NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
+                      "autocert: could not start ACME directory fetch");
+        ngx_destroy_pool(pool);
+    }
+}
+
+
+/*
+ * Completion of the startup directory fetch. Logs the outcome and frees the
+ * request pool. A 200 with a non-empty body means the transport works end to
+ * end (the CI asserts on this line).
+ */
+static void
+ngx_autocert_directory_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
+{
+    ngx_pool_t  *pool = req->pool;
+
+    if (rc == NGX_OK && req->status == 200) {
+        ngx_log_error(NGX_LOG_NOTICE, req->log, 0,
+                      "autocert: ACME directory OK, status %ui, %uz bytes",
+                      req->status, req->body_out.len);
+    } else if (rc == NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, req->log, 0,
+                      "autocert: ACME directory unexpected status %ui",
+                      req->status);
+    } else {
+        ngx_log_error(NGX_LOG_ERR, req->log, 0,
+                      "autocert: ACME directory fetch failed");
+    }
+
+    ngx_destroy_pool(pool);
 }
 
 

@@ -13,12 +13,16 @@ certificate from an ACME CA (Let's Encrypt by default) for that vhost's
 
 > **Status: under construction.** M0 (`autocert` directive), M2 (the global
 > `autocert_*` config model + enabled-name collection), M3 (ECDSA crypto/JWS
-> primitives) and M4a (the privilege-separated helper **process**) are in place
-> and build/load on nginx + angie. The directives parse and validate, the set
-> of `server_name`s to provision is resolved at config time, and the master now
-> runs a dedicated helper process that survives reloads and crashes — but no
-> ACME issuance happens yet (the outbound ACME client lands in M4b+). Not yet
-> usable for real certificates.
+> primitives), M4a (the privilege-separated helper **process**) and M4b (the
+> outbound **HTTP/1.1-over-TLS client**) are in place and build/load on nginx +
+> angie. The directives parse and validate, the set of `server_name`s to
+> provision is resolved at config time, the master runs a dedicated helper
+> process that survives reloads and crashes, and that helper can now reach the
+> ACME server: it resolves the CA hostname (`ngx_resolver`), connects, completes
+> a verified TLS handshake, and performs an HTTP request — proven by fetching the
+> CA **directory** at startup. The full ACME issuance flow (account, orders,
+> challenges, certificate download) lands in M4c+. Not yet usable for real
+> certificates.
 
 ## Directives
 
@@ -58,7 +62,24 @@ autocert_store secure|certbot;      # secure = 0700 root-only (default)
                                     #   certbot = live/ + archive/ symlink layout
 autocert_path <dir>;                # store location (default: autocert)
 autocert_challenge http-01|tls-alpn-01;  # default: http-01
+
+# Outbound ACME transport (used by the helper to reach the CA):
+autocert_resolver 1.1.1.1 8.8.8.8;       # DNS server(s) to resolve the CA host.
+                                         #   If unset, the http{}-level `resolver`
+                                         #   directive is used as a fallback;
+                                         #   one of the two is required to reach
+                                         #   a CA by name.
+autocert_resolver_timeout 30s;           # DNS query timeout (default 30s)
+autocert_ca_certificate <file>;          # PEM trust bundle to verify the CA
+                                         #   (default: system trust store —
+                                         #   correct for Let's Encrypt; set this
+                                         #   only for a private/test CA, e.g.
+                                         #   Pebble)
 ```
+
+> The ACME server's certificate is **always verified** (hostname + chain). With
+> no `autocert_ca_certificate` the system CA store is used; a private CA (such as
+> Pebble for testing) must be supplied explicitly.
 
 ### Which names get provisioned
 
