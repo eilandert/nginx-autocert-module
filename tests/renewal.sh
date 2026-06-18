@@ -168,4 +168,61 @@ for d in "$DOMAIN_A" "$DOMAIN_B"; do
 done
 echo "✓ renewed key/chain pairs are consistent and certify their domains"
 
-echo "✓✓ M8 renewal + multi-name issuance verified end-to-end"
+# --- Negative cases (M9): staleness detection -------------------------------
+# Switch to a SMALL renew_before so a healthy stored cert is NOT due — that lets
+# us prove the scheduler reissues ONLY when the stored fullchain is unusable
+# (corrupt / missing / a symlink), and leaves a healthy cert untouched.
+echo "== restart with small renew_before (healthy certs not due) =="
+"$SERVER_BIN" -p "$PREFIX" -c "$PREFIX/conf/nginx.conf" -s stop
+sleep 1
+sed -i 's/autocert_renew_before 9999d;/autocert_renew_before 60s;/' \
+    "$PREFIX/conf/nginx.conf"
+"$SERVER_BIN" -t -p "$PREFIX" -c "$PREFIX/conf/nginx.conf"
+"$SERVER_BIN" -p "$PREFIX" -c "$PREFIX/conf/nginx.conf"
+
+# Healthy certs must survive the initial scan unchanged (control).
+SERIAL_A3=$(openssl x509 -in "$CHAIN_A" -noout -serial)
+SERIAL_B3=$(openssl x509 -in "$CHAIN_B" -noout -serial)
+sleep 6
+[ "$(openssl x509 -in "$CHAIN_A" -noout -serial)" = "$SERIAL_A3" ] \
+    || { echo "::error::healthy ${DOMAIN_A} reissued though not due"; exit 1; }
+[ "$(openssl x509 -in "$CHAIN_B" -noout -serial)" = "$SERIAL_B3" ] \
+    || { echo "::error::healthy ${DOMAIN_B} reissued though not due"; exit 1; }
+echo "✓ healthy certs not reissued under small renew_before (control)"
+
+# Corrupt A's fullchain, remove B's entirely, then reload (fresh helper scans
+# at once). A: parse fails -> NGX_ERROR -> due. B: open ENOENT -> NGX_DECLINED
+# -> due. Both must be reissued into a fresh, valid cert.
+echo "== corrupt A + remove B, reload =="
+echo "-----BEGIN CERTIFICATE-----\nnot a real cert\n-----END CERTIFICATE-----" \
+    > "$CHAIN_A"
+rm -rf "$PREFIX/store/${DOMAIN_B}"
+"$SERVER_BIN" -p "$PREFIX" -c "$PREFIX/conf/nginx.conf" -s reload
+
+SERIAL_A4=$(renewed "$CHAIN_A" "$SERIAL_A3") \
+    || { echo "::error::corrupt ${DOMAIN_A} not reissued"; grep autocert "$PREFIX/logs/error.log" | tail -20; exit 1; }
+SERIAL_B4=$(wait_for_cert "$CHAIN_B") \
+    || { echo "::error::missing ${DOMAIN_B} not re-provisioned"; grep autocert "$PREFIX/logs/error.log" | tail -20; exit 1; }
+openssl x509 -in "$CHAIN_A" -noout -ext subjectAltName 2>/dev/null \
+    | grep -q "DNS:${DOMAIN_A}" || { echo "::error::reissued ${DOMAIN_A} invalid"; exit 1; }
+echo "✓ corrupt + missing fullchain both trigger reissue: A=$SERIAL_A4 B=$SERIAL_B4"
+
+# Replace A's fullchain with a symlink: the O_NOFOLLOW open must refuse to
+# follow it (NGX_ERROR -> due) and reissue a real regular file in its place.
+echo "== symlink A's fullchain, reload =="
+SERIAL_A5=$(openssl x509 -in "$CHAIN_A" -noout -serial)
+rm -f "$CHAIN_A"
+ln -s /etc/hostname "$CHAIN_A"
+"$SERVER_BIN" -p "$PREFIX" -c "$PREFIX/conf/nginx.conf" -s reload
+for i in $(seq 1 120); do
+    if [ ! -L "$CHAIN_A" ] && cur=$(openssl x509 -in "$CHAIN_A" -noout -serial 2>/dev/null) \
+       && [ -n "$cur" ] && [ "$cur" != "$SERIAL_A5" ]; then
+        break
+    fi
+    sleep 0.5
+    [ "$i" = 120 ] && { echo "::error::symlinked ${DOMAIN_A} not reissued as a regular file"; grep autocert "$PREFIX/logs/error.log" | tail -20; exit 1; }
+done
+[ -L "$CHAIN_A" ] && { echo "::error::${DOMAIN_A} fullchain still a symlink"; exit 1; }
+echo "✓ symlinked fullchain refused (O_NOFOLLOW) and reissued as a regular file"
+
+echo "✓✓ M8 renewal + multi-name + M9 staleness negatives verified end-to-end"
