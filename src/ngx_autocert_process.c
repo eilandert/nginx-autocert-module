@@ -1224,6 +1224,8 @@ ngx_autocert_start_order_for(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
     order->directory_url = acf->ca;
     order->domain = *name;
     order->challenge_zone = acf->challenge_zone;
+    order->challenge = acf->challenge;          /* M10c: http-01 / tls-alpn-01 */
+    order->alpn_zone = acf->alpn_zone;          /* M10b store, used when alpn */
     order->key_type = acf->key_type;
     order->store_path = acf->path;
     order->handler = ngx_autocert_order_complete;

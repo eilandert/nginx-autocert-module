@@ -57,6 +57,12 @@ struct ngx_autocert_order_s {
     ngx_uint_t                       key_type;       /* cert key curve (M6b) */
     ngx_str_t                        store_path;     /* cert store dir (M6b) */
 
+    /* M10c challenge selection: NGX_AUTOCERT_CHALLENGE_* (0 = http-01 default).
+     * tls-alpn-01 publishes a challenge cert into alpn_zone instead of a token
+     * into challenge_zone. */
+    ngx_uint_t                       challenge;
+    ngx_shm_zone_t                  *alpn_zone;      /* M10b tls-alpn cert store */
+
     ngx_autocert_order_handler_pt    handler;
     void                            *data;
 
@@ -80,6 +86,7 @@ struct ngx_autocert_order_s {
     ngx_uint_t                       poll_tries;       /* authz poll counter */
     ngx_uint_t                       order_poll_tries; /* order poll counter */
     ngx_uint_t                       challenge_set;    /* token in store? */
+    ngx_uint_t                       alpn_set;         /* M10c: cert in alpn store? */
     ngx_uint_t                       done;
     ngx_event_t                      poll_timer;       /* authz polling */
     ngx_event_t                      order_timer;      /* order polling (M6b) */

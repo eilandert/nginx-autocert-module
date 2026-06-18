@@ -31,6 +31,15 @@
 #include <ngx_core.h>
 
 
+/*
+ * Challenge-type selector shared with the CORE order/helper TUs (which don't
+ * include the HTTP module's conf header). Values MUST match
+ * ngx_http_autocert_challenge_e in ngx_http_autocert_conf.h.
+ */
+#define NGX_AUTOCERT_CHALLENGE_HTTP_01       0
+#define NGX_AUTOCERT_CHALLENGE_TLS_ALPN_01   1
+
+
 /* Upper bounds (defensive). A DNS name is <= 255; a P-256/P-384 self-signed
  * challenge cert PEM and its PKCS#8 key PEM are well under a few KB. */
 #define NGX_AUTOCERT_ALPN_DOMAIN_MAX   255

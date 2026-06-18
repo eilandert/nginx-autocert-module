@@ -39,8 +39,13 @@ certificate from an ACME CA (Let's Encrypt by default) for that vhost's
 > with an SNI we have a pending challenge for, the handshake serves that
 > challenge certificate (from a shared store the helper writes) instead of the
 > real one; every other client still gets nginx's normal h2/http negotiation and
-> the per-SNI cert. Still ahead: M10c (order wiring + full Pebble tls-alpn-01
-> issuance) and a packaged Debian sub-package (M11).
+> the per-SNI cert. **M10c wires it into the order flow**: with
+> `autocert_challenge tls-alpn-01;` the helper selects that challenge, builds the
+> challenge cert for the key authorization, publishes it to the serve store,
+> answers the CA, and removes it once validated — a full certificate is issued
+> with **no port 80 listener anywhere** (verified end-to-end against Pebble in
+> CI, validating on a high TLS port with `:80` closed). Still ahead: a packaged
+> Debian sub-package (M11).
 
 ## Directives
 

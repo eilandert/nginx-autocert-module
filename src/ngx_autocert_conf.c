@@ -72,6 +72,7 @@ ngx_autocert_get_conf(ngx_cycle_t *cycle, ngx_autocert_conf_t *out)
     out->key_type = amcf->key_type;
     out->path = amcf->path;
     out->renew_before = amcf->renew_before;
+    out->challenge = amcf->challenge;
     out->challenge_zone = amcf->challenge_zone;
     out->names = amcf->names;
     out->test_token = amcf->test_token;
