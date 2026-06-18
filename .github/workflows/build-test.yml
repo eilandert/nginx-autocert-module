@@ -415,3 +415,42 @@ jobs:
           sudo env SERVER_BIN="$SERVER_BIN" \
             NGX_BUILD_DIR="$(dirname "$SERVER_BIN")/.." \
             bash "$GITHUB_WORKSPACE/tests/renewal.sh"
+
+  backoff:
+    name: Per-name failure backoff (M9b)
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libpcre2-dev zlib1g-dev libssl-dev
+
+      - name: Fetch + build nginx with the module
+        run: |
+          set -euo pipefail
+          ver=$(curl -fsSL https://nginx.org/en/download.html \
+            | grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.gz)' \
+            | sort -V | tail -1)
+          curl -fsSL -o src.tar.gz "https://nginx.org/download/nginx-$ver.tar.gz"
+          tar -xzf src.tar.gz
+          cd "nginx-$ver"
+          ./configure --with-compat --with-http_ssl_module \
+            --add-dynamic-module="$GITHUB_WORKSPACE" > /tmp/conf.log 2>&1 \
+            || { tail -40 /tmp/conf.log; exit 1; }
+          make > /tmp/make.log 2>&1 || { tail -40 /tmp/make.log; exit 1; }
+          echo "SERVER_BIN=$PWD/objs/nginx" >> "$GITHUB_ENV"
+
+      - name: A failing name must back off, a good name issues once
+        run: |
+          # One helper, two names: a good one (issues once) and a bad one whose
+          # http-01 the Pebble VA can never reach (DNS -> unroutable). The bad
+          # name must be retried with the exponential backoff hold (>=~60s),
+          # not re-ordered every sweep.
+          sudo env SERVER_BIN="$SERVER_BIN" \
+            NGX_BUILD_DIR="$(dirname "$SERVER_BIN")/.." \
+            bash "$GITHUB_WORKSPACE/tests/backoff.sh"

@@ -800,8 +800,26 @@ ngx_autocert_account_done(ngx_autocert_account_t *acct, ngx_int_t rc)
 /* First scan shortly after startup (account is registered by then). */
 #define NGX_AUTOCERT_SCHED_INITIAL   (1000)                  /* 1s, ms */
 
-static ngx_event_t   ngx_autocert_sched_timer;
-static ngx_uint_t    ngx_autocert_sched_index;   /* next name to examine */
+/*
+ * Per-name failure backoff: after a failed order for a name, hold off
+ * retrying it for BASE << min(fails-1, MAXSHIFT) seconds, capped at CAP, so a
+ * persistently failing name (bad DNS, ACME rate limit) doesn't get hammered
+ * every sweep. A success clears it.
+ */
+#define NGX_AUTOCERT_BACKOFF_BASE    60          /* 60s first retry hold */
+#define NGX_AUTOCERT_BACKOFF_MAXSHIFT 6          /* 60s..3840s growth */
+#define NGX_AUTOCERT_BACKOFF_CAP     (60 * 60)   /* 1h ceiling, seconds */
+
+typedef struct {
+    time_t      next_eligible;   /* don't retry before this (0 = ready) */
+    ngx_uint_t  fails;           /* consecutive failures */
+} ngx_autocert_backoff_t;
+
+static ngx_event_t              ngx_autocert_sched_timer;
+static ngx_uint_t               ngx_autocert_sched_index;  /* next name to scan */
+static ngx_uint_t               ngx_autocert_sched_cur;    /* name index in flight */
+static ngx_autocert_backoff_t  *ngx_autocert_backoff;      /* per-name, [n] */
+static ngx_uint_t               ngx_autocert_backoff_n;    /* array length */
 
 static void ngx_autocert_sched_handler(ngx_event_t *ev);
 static void ngx_autocert_sched_pump(ngx_cycle_t *cycle);
@@ -809,6 +827,7 @@ static ngx_int_t ngx_autocert_name_due(ngx_cycle_t *cycle,
     ngx_autocert_conf_t *acf, ngx_str_t *name);
 static ngx_int_t ngx_autocert_start_order_for(ngx_cycle_t *cycle,
     ngx_autocert_conf_t *acf, ngx_str_t *name);
+static void ngx_autocert_backoff_record(ngx_uint_t index, ngx_uint_t success);
 
 
 /*
@@ -887,17 +906,44 @@ ngx_autocert_sched_pump(ngx_cycle_t *cycle)
 
     names = acf.names->elts;
 
+    /* Lazily size the per-name backoff array to the (stable, postconfig) name
+     * set. Allocated from the cycle pool; if the count ever changes across a
+     * reload the helper is a fresh process, so a simple realloc-on-mismatch is
+     * enough. */
+    if (ngx_autocert_backoff == NULL
+        || ngx_autocert_backoff_n != acf.names->nelts)
+    {
+        ngx_autocert_backoff = ngx_pcalloc(cycle->pool,
+            acf.names->nelts * sizeof(ngx_autocert_backoff_t));
+        if (ngx_autocert_backoff == NULL) {
+            ngx_autocert_backoff_n = 0;
+            goto rearm;
+        }
+        ngx_autocert_backoff_n = acf.names->nelts;
+    }
+
     while (ngx_autocert_sched_index < acf.names->nelts) {
-        name = &names[ngx_autocert_sched_index++];
+        ngx_uint_t  i = ngx_autocert_sched_index++;
+
+        name = &names[i];
+
+        /* Honour the per-name failure backoff before any disk/clock check. */
+        if (ngx_autocert_backoff[i].next_eligible > ngx_time()) {
+            continue;
+        }
 
         if (!ngx_autocert_name_due(cycle, &acf, name)) {
             continue;
         }
 
+        ngx_autocert_sched_cur = i;     /* record which name is in flight */
+
         if (ngx_autocert_start_order_for(cycle, &acf, name) == NGX_OK) {
             return;                     /* order_complete will pump again */
         }
-        /* Launch failed; try the next name on this same sweep. */
+        /* Launch failed (transient: pool/OOM) — treat as a failure for backoff
+         * so we don't spin on it, then try the next name this sweep. */
+        ngx_autocert_backoff_record(i, 0);
     }
 
 rearm:
@@ -910,6 +956,9 @@ rearm:
      */
     {
         ngx_msec_t  interval = NGX_AUTOCERT_SCHED_INTERVAL;
+        time_t      now = ngx_time();
+        time_t      soonest = 0;
+        ngx_uint_t  i;
 
         if (acf.configured && acf.renew_before > 0) {
             ngx_msec_t  half = (ngx_msec_t) acf.renew_before * 1000 / 2;
@@ -917,11 +966,67 @@ rearm:
                 interval = half;
             }
         }
+
+        /* If any name is backing off, wake when its hold expires (so a 60s
+         * backoff isn't stuck behind a 12h sweep). */
+        for (i = 0; i < ngx_autocert_backoff_n; i++) {
+            time_t  e = ngx_autocert_backoff[i].next_eligible;
+            if (e > now && (soonest == 0 || e < soonest)) {
+                soonest = e;
+            }
+        }
+        if (soonest != 0) {
+            ngx_msec_t  until = (ngx_msec_t) (soonest - now) * 1000;
+            if (until < interval) {
+                interval = until;
+            }
+        }
+
         if (interval < NGX_AUTOCERT_SCHED_FLOOR) {
             interval = NGX_AUTOCERT_SCHED_FLOOR;
         }
         ngx_add_timer(&ngx_autocert_sched_timer, interval);
     }
+}
+
+
+/*
+ * Record the outcome of an order attempt for name `index` into its backoff
+ * slot. Success clears the backoff; failure grows it exponentially
+ * (BASE << min(fails-1, MAXSHIFT)), capped at CAP, so a persistently failing
+ * name is retried with increasing delay instead of every sweep.
+ */
+static void
+ngx_autocert_backoff_record(ngx_uint_t index, ngx_uint_t success)
+{
+    ngx_autocert_backoff_t  *b;
+    ngx_uint_t               shift;
+    time_t                   delay;
+
+    if (ngx_autocert_backoff == NULL || index >= ngx_autocert_backoff_n) {
+        return;
+    }
+
+    b = &ngx_autocert_backoff[index];
+
+    if (success) {
+        b->fails = 0;
+        b->next_eligible = 0;
+        return;
+    }
+
+    b->fails++;
+    shift = b->fails - 1;
+    if (shift > NGX_AUTOCERT_BACKOFF_MAXSHIFT) {
+        shift = NGX_AUTOCERT_BACKOFF_MAXSHIFT;
+    }
+
+    delay = (time_t) NGX_AUTOCERT_BACKOFF_BASE << shift;
+    if (delay > NGX_AUTOCERT_BACKOFF_CAP) {
+        delay = NGX_AUTOCERT_BACKOFF_CAP;
+    }
+
+    b->next_eligible = ngx_time() + delay;
 }
 
 
@@ -1077,6 +1182,10 @@ ngx_autocert_order_complete(ngx_autocert_order_t *order, ngx_int_t rc)
                       "autocert: ACME order failed for \"%V\"", &order->domain);
     }
 
+    /* Record the outcome for the in-flight name's backoff: success clears it,
+     * failure grows the per-name retry delay (don't hammer a failing name). */
+    ngx_autocert_backoff_record(ngx_autocert_sched_cur, rc == NGX_OK);
+
     ngx_autocert_order_free(order);     /* drops token, frees order pool... */
     ngx_autocert_order = NULL;
     if (ngx_autocert_order_pool) {
@@ -1085,8 +1194,8 @@ ngx_autocert_order_complete(ngx_autocert_order_t *order, ngx_int_t rc)
     }
 
     /* Continue the current sweep with the next name (or rearm if done). A
-     * failed name is simply skipped this sweep; the next periodic tick retries
-     * it. */
+     * failed name is held off by its backoff slot; the next periodic tick
+     * retries it once next_eligible passes. */
     ngx_autocert_sched_pump(cycle);
 }
 
