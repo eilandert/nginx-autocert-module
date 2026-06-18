@@ -142,6 +142,7 @@ One ACME policy per instance. All optional.
 | Directive | Default | Purpose |
 |---|---|---|
 | `autocert_ca <url>;` | Let's Encrypt production | ACME directory URL |
+| `autocert_staging on\|off;` | `off` | use Let's Encrypt **staging** CA instead — see note |
 | `autocert_renew_before <time>;` | `7d` | renew this long before expiry |
 | `autocert_key_type secp384r1\|secp256r1;` | `secp384r1` | ECDSA curve (no RSA) |
 | `autocert_store secure;` | `secure` | on-disk layout (only `secure` is implemented) |
@@ -155,6 +156,15 @@ One ACME policy per instance. All optional.
 > not `p384` / `p256`. The ACME server's certificate is **always** verified
 > (chain + hostname); set `autocert_ca_certificate` only for a private/test CA
 > such as Pebble.
+
+> **`autocert_staging on`** is a shorthand for
+> `autocert_ca https://acme-staging-v02.api.letsencrypt.org/directory`.
+> It is mutually exclusive with `autocert_ca` — nginx will refuse to start if
+> both appear in the same `http {}` block. Staging certificates are issued via
+> the real ACME protocol and follow the same flow as production, but they are
+> signed by the *Fake LE* intermediate and are **not trusted by browsers**.
+> They consume no production rate-limit quota, making them suitable for
+> CI/CD pipelines that exercise the full issuance path before go-live.
 
 ### Which names get provisioned
 
