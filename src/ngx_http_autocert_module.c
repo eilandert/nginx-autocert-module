@@ -28,6 +28,9 @@
 #define NGX_HTTP_AUTOCERT_DEFAULT_CA \
     "https://acme-v02.api.letsencrypt.org/directory"
 
+#define NGX_HTTP_AUTOCERT_STAGING_CA \
+    "https://acme-staging-v02.api.letsencrypt.org/directory"
+
 #define NGX_HTTP_AUTOCERT_WK_PREFIX  "/.well-known/acme-challenge/"
 
 /* Challenge token store zone: small; one node per in-flight authorization. */
@@ -99,6 +102,16 @@ static ngx_command_t  ngx_http_autocert_commands[] = {
       ngx_conf_set_str_slot,
       NGX_HTTP_MAIN_CONF_OFFSET,
       offsetof(ngx_http_autocert_main_conf_t, ca),
+      NULL },
+
+    /* Shorthand for the LE staging directory URL; mutually exclusive with
+     * autocert_ca. Use in CI/CD to exercise the full issuance flow without
+     * consuming production rate limits. */
+    { ngx_string("autocert_staging"),
+      NGX_HTTP_MAIN_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_MAIN_CONF_OFFSET,
+      offsetof(ngx_http_autocert_main_conf_t, staging),
       NULL },
 
     { ngx_string("autocert_renew_before"),
@@ -225,6 +238,7 @@ ngx_http_autocert_create_main_conf(ngx_conf_t *cf)
     }
 
     /* ca, path zeroed by pcalloc; set in init_main_conf. */
+    amcf->staging = NGX_CONF_UNSET;
     amcf->renew_before = NGX_CONF_UNSET;
     amcf->key_type = NGX_CONF_UNSET_UINT;
     amcf->store = NGX_CONF_UNSET_UINT;
@@ -242,7 +256,18 @@ ngx_http_autocert_init_main_conf(ngx_conf_t *cf, void *conf)
 {
     ngx_http_autocert_main_conf_t  *amcf = conf;
 
-    if (amcf->ca.data == NULL) {
+    ngx_conf_init_value(amcf->staging, 0);
+
+    if (amcf->staging) {
+        if (amcf->ca.data != NULL) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "\"autocert_staging\" and \"autocert_ca\" are mutually "
+                "exclusive");
+            return NGX_CONF_ERROR;
+        }
+        ngx_str_set(&amcf->ca, NGX_HTTP_AUTOCERT_STAGING_CA);
+
+    } else if (amcf->ca.data == NULL) {
         ngx_str_set(&amcf->ca, NGX_HTTP_AUTOCERT_DEFAULT_CA);
     }
 
