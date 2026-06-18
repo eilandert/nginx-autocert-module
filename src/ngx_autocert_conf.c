@@ -71,6 +71,9 @@ ngx_autocert_get_conf(ngx_cycle_t *cycle, ngx_autocert_conf_t *out)
     out->ca_certificate = amcf->ca_certificate;
     out->key_type = amcf->key_type;
     out->path = amcf->path;
+    out->challenge_zone = amcf->challenge_zone;
+    out->test_token = amcf->test_token;
+    out->test_keyauth = amcf->test_keyauth;
 
     /*
      * Fall back to the http{}-level `resolver` directive when autocert_resolver

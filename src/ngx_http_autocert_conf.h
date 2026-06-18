@@ -63,6 +63,16 @@ typedef struct {
 
     ngx_shm_zone_t  *shm_zone;      /* published enabled-name set (for M4) */
     ngx_array_t     *names;         /* ngx_str_t, collected at postconfig */
+
+    /* M5 HTTP-01 challenge token store (token -> keyauth), written by the
+     * helper, read by the :80 worker handler. */
+    ngx_shm_zone_t  *challenge_zone;
+
+    /* M5 test-only seed: autocert_test_challenge <token> <keyauth>; the helper
+     * inserts it at startup so the serve path can be exercised without a full
+     * order flow. token.len == 0 when unset. */
+    ngx_str_t        test_token;
+    ngx_str_t        test_keyauth;
 } ngx_http_autocert_main_conf_t;
 
 
