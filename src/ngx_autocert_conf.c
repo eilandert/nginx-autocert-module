@@ -76,6 +76,9 @@ ngx_autocert_get_conf(ngx_cycle_t *cycle, ngx_autocert_conf_t *out)
     out->names = amcf->names;
     out->test_token = amcf->test_token;
     out->test_keyauth = amcf->test_keyauth;
+    out->alpn_zone = amcf->alpn_zone;
+    out->test_alpn_domain = amcf->test_alpn_domain;
+    out->test_alpn_keyauth = amcf->test_alpn_keyauth;
 
     /*
      * Fall back to the http{}-level `resolver` directive when autocert_resolver

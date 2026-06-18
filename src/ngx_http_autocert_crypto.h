@@ -45,6 +45,14 @@ void ngx_http_autocert_key_free(EVP_PKEY *pkey);
  * Both return NGX_OK / NGX_ERROR; _from_pem stores the key in *out (caller
  * frees with ngx_http_autocert_key_free).
  */
+/*
+ * PEM-encode an X509 certificate into *out (pool-allocated). Used to persist a
+ * locally built self-signed cert (e.g. the tls-alpn-01 challenge cert, M10b)
+ * into the shared store. Returns NGX_OK / NGX_ERROR.
+ */
+ngx_int_t ngx_http_autocert_cert_to_pem(ngx_pool_t *pool, X509 *cert,
+    ngx_str_t *out);
+
 ngx_int_t ngx_http_autocert_key_to_pem(ngx_pool_t *pool, EVP_PKEY *pkey,
     ngx_str_t *out);
 ngx_int_t ngx_http_autocert_key_from_pem(ngx_str_t *pem, EVP_PKEY **out);

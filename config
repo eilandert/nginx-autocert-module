@@ -23,6 +23,7 @@ if test -n "$ngx_module_link"; then
                      $ngx_addon_dir/src/ngx_autocert_account.c \
                      $ngx_addon_dir/src/ngx_autocert_order.c \
                      $ngx_addon_dir/src/ngx_autocert_challenge.c \
+                     $ngx_addon_dir/src/ngx_autocert_alpn.c \
                      $ngx_addon_dir/src/ngx_http_autocert_crypto.c \
                      $ngx_addon_dir/src/ngx_autocert_conf.c"
     ngx_module_libs="-lssl -lcrypto"
@@ -31,6 +32,7 @@ if test -n "$ngx_module_link"; then
                      $ngx_addon_dir/src/ngx_autocert_account.h \
                      $ngx_addon_dir/src/ngx_autocert_order.h \
                      $ngx_addon_dir/src/ngx_autocert_challenge.h \
+                     $ngx_addon_dir/src/ngx_autocert_alpn.h \
                      $ngx_addon_dir/src/ngx_http_autocert_crypto.h \
                      $ngx_addon_dir/src/ngx_autocert_shared.h \
                      $ngx_addon_dir/src/ngx_http_autocert_conf.h"
@@ -40,10 +42,12 @@ if test -n "$ngx_module_link"; then
     ngx_module_name=ngx_http_autocert_module
     ngx_module_srcs="$ngx_addon_dir/src/ngx_http_autocert_module.c \
                      $ngx_addon_dir/src/ngx_autocert_challenge.c \
+                     $ngx_addon_dir/src/ngx_autocert_alpn.c \
                      $ngx_addon_dir/src/ngx_autocert_serve.c \
                      $ngx_addon_dir/src/ngx_http_autocert_crypto.c"
     ngx_module_libs="-lssl -lcrypto"
     ngx_module_deps="$ngx_addon_dir/src/ngx_autocert_challenge.h \
+                     $ngx_addon_dir/src/ngx_autocert_alpn.h \
                      $ngx_addon_dir/src/ngx_autocert_serve.h \
                      $ngx_addon_dir/src/ngx_http_autocert_crypto.h \
                      $ngx_addon_dir/src/ngx_http_autocert_conf.h"
@@ -58,6 +62,7 @@ else
                     $ngx_addon_dir/src/ngx_autocert_account.c \
                     $ngx_addon_dir/src/ngx_autocert_order.c \
                     $ngx_addon_dir/src/ngx_autocert_challenge.c \
+                    $ngx_addon_dir/src/ngx_autocert_alpn.c \
                     $ngx_addon_dir/src/ngx_autocert_conf.c \
                     $ngx_addon_dir/src/ngx_http_autocert_module.c \
                     $ngx_addon_dir/src/ngx_autocert_serve.c \

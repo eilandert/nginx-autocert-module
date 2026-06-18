@@ -4,13 +4,38 @@
  */
 
 #include "ngx_autocert_serve.h"
+#include "ngx_autocert_alpn.h"
 #include "ngx_http_autocert_crypto.h"
 
 #include <ngx_http_ssl_module.h>
+#if (NGX_HTTP_V2)
+#include <ngx_http_v2_module.h>
+#endif
+#if (NGX_HTTP_V3)
+#include <ngx_http_v3.h>
+#endif
 
 #include <openssl/ssl.h>
 #include <openssl/pem.h>
 #include <openssl/err.h>
+
+
+/*
+ * The RFC 8737 application protocol the ACME validation client negotiates. We
+ * select it (in the ALPN callback) and detect it (in the cert callback) to
+ * decide whether to serve the challenge certificate instead of the real one.
+ */
+#define NGX_AUTOCERT_ACME_TLS_ALPN      "acme-tls/1"
+#define NGX_AUTOCERT_ACME_TLS_ALPN_LEN  (sizeof(NGX_AUTOCERT_ACME_TLS_ALPN) - 1)
+
+/*
+ * VENDORED from src/http/modules/ngx_http_ssl_module.c (a private #define
+ * there). Our ALPN callback replaces nginx's on autocert-enabled SSL_CTXs
+ * (OpenSSL exposes no getter to chain to the original), so the normal-path
+ * negotiation below must mirror nginx's advertised protocol set.
+ * KEEP IN SYNC with nginx/angie.
+ */
+#define NGX_AUTOCERT_HTTP_ALPN_PROTOS   "\x08http/1.1\x08http/1.0\x08http/0.9"
 
 
 /*
@@ -35,7 +60,17 @@ typedef struct {
     ngx_str_t           path;        /* absolute store dir */
     ngx_uint_t          store;       /* ngx_http_autocert_store_e */
     ngx_array_t        *names;       /* ngx_str_t: the issuable name set */
+    ngx_shm_zone_t     *alpn_zone;   /* M10b tls-alpn-01 cert store; NULL=off */
 } ngx_autocert_serve_ctx_t;
+
+
+/*
+ * SSL-connection ex_data slot: set to (void *) 1 by our ALPN callback when it
+ * selects "acme-tls/1", read by the cert callback to switch to the challenge
+ * cert. An explicit flag (rather than SSL_get0_alpn_selected) makes the cert
+ * callback independent of OpenSSL's callback ordering. Allocated once.
+ */
+static int  ngx_autocert_alpn_conn_index = -1;
 
 
 /*
@@ -55,6 +90,14 @@ static ngx_int_t ngx_http_autocert_cache_reload(ngx_autocert_cert_t *c,
 static ngx_int_t ngx_http_autocert_install_dummy(SSL_CTX *ctx, ngx_log_t *log);
 static ngx_int_t ngx_http_autocert_read_file(ngx_pool_t *pool,
     u_char *path, ngx_str_t *out, time_t *mtime);
+static int ngx_http_autocert_alpn_select(ngx_ssl_conn_t *ssl_conn,
+    const unsigned char **out, unsigned char *outlen, const unsigned char *in,
+    unsigned int inlen, void *arg);
+static int ngx_http_autocert_alpn_default(ngx_ssl_conn_t *ssl_conn,
+    const unsigned char **out, unsigned char *outlen, const unsigned char *in,
+    unsigned int inlen);
+static int ngx_http_autocert_serve_alpn_cert(ngx_connection_t *c,
+    SSL *ssl_conn, ngx_autocert_serve_ctx_t *sctx, ngx_str_t *host);
 
 
 ngx_int_t
@@ -78,6 +121,22 @@ ngx_http_autocert_serve_init(ngx_conf_t *cf,
     sctx->path = amcf->path;
     sctx->store = amcf->store;
     sctx->names = amcf->names;       /* bounds the per-worker cache */
+    sctx->alpn_zone = amcf->alpn_zone;  /* M10b: NULL unless tls-alpn-01 wired */
+
+    /*
+     * Allocate the per-connection ex_data slot the ALPN callback uses to flag
+     * an acme-tls/1 handshake for the cert callback. Once per process; -1 means
+     * "not yet allocated". Only needed when the tls-alpn-01 path is active.
+     */
+    if (sctx->alpn_zone != NULL && ngx_autocert_alpn_conn_index == -1) {
+        ngx_autocert_alpn_conn_index =
+            SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
+        if (ngx_autocert_alpn_conn_index == -1) {
+            ngx_log_error(NGX_LOG_EMERG, cf->log, 0,
+                          "autocert: SSL_get_ex_new_index() failed");
+            return NGX_ERROR;
+        }
+    }
 
     cscfp = cmcf->servers.elts;
 
@@ -153,6 +212,18 @@ ngx_http_autocert_serve_init(ngx_conf_t *cf,
 
         /* Install the per-SNI cert callback (overrides whatever is on the ctx). */
         SSL_CTX_set_cert_cb(sscf->ssl.ctx, ngx_http_autocert_cert_cb, sctx);
+
+        /*
+         * M10b: when tls-alpn-01 is active, replace nginx's ALPN selection
+         * callback with ours so the CA's "acme-tls/1" validation handshake is
+         * accepted; ours reproduces nginx's h2/http negotiation for every other
+         * client (see ngx_http_autocert_alpn_select). Only when alpn_zone is
+         * set, so an http-01-only deployment keeps nginx's callback untouched.
+         */
+        if (sctx->alpn_zone != NULL) {
+            SSL_CTX_set_alpn_select_cb(sscf->ssl.ctx,
+                                       ngx_http_autocert_alpn_select, sctx);
+        }
     }
 
     return NGX_OK;
@@ -225,6 +296,32 @@ ngx_http_autocert_cert_cb(SSL *ssl_conn, void *arg)
     c = ngx_ssl_get_connection(ssl_conn);
     if (c == NULL) {
         return 1;
+    }
+
+    /*
+     * M10b tls-alpn-01: our ALPN callback flagged this handshake as the CA's
+     * "acme-tls/1" validation connection. Serve the challenge certificate for
+     * the SNI instead of the real/bootstrap one. acme-tls/1 mandates SNI; a
+     * missing or unknown name leaves nothing valid to present, so fail the
+     * handshake rather than leak the bootstrap cert under acme-tls/1.
+     */
+    if (sctx->alpn_zone != NULL
+        && ngx_autocert_alpn_conn_index != -1
+        && SSL_get_ex_data(ssl_conn, ngx_autocert_alpn_conn_index) != NULL)
+    {
+        servername = SSL_get_servername(ssl_conn, TLSEXT_NAMETYPE_host_name);
+        if (servername == NULL) {
+            return 0;
+        }
+
+        host.data = (u_char *) servername;
+        host.len = ngx_strlen(servername);
+
+        if (host.len == 0 || host.len > NGX_AUTOCERT_ALPN_DOMAIN_MAX) {
+            return 0;
+        }
+
+        return ngx_http_autocert_serve_alpn_cert(c, ssl_conn, sctx, &host);
     }
 
     servername = SSL_get_servername(ssl_conn, TLSEXT_NAMETYPE_host_name);
@@ -575,6 +672,224 @@ ngx_http_autocert_read_file(ngx_pool_t *pool, u_char *path, ngx_str_t *out,
     }
 
     return NGX_OK;
+}
+
+
+/*
+ * ALPN selection callback (M10b). Installed on autocert-enabled SSL_CTXs in
+ * place of nginx's. If the client offers "acme-tls/1" — which only an ACME CA's
+ * tls-alpn-01 validation client does (RFC 8737) — select it and flag the
+ * connection so the cert callback serves the challenge cert. Otherwise delegate
+ * to a vendored copy of nginx's normal h2/http negotiation.
+ */
+static int
+ngx_http_autocert_alpn_select(ngx_ssl_conn_t *ssl_conn,
+    const unsigned char **out, unsigned char *outlen, const unsigned char *in,
+    unsigned int inlen, void *arg)
+{
+    ngx_connection_t          *c;
+    unsigned int               i;
+
+    (void) arg;
+
+    /* Walk the length-prefixed protocol list looking for "acme-tls/1". */
+    for (i = 0; i < inlen; i += 1 + in[i]) {
+        if (in[i] == NGX_AUTOCERT_ACME_TLS_ALPN_LEN
+            && i + 1 + NGX_AUTOCERT_ACME_TLS_ALPN_LEN <= inlen
+            && ngx_memcmp(&in[i + 1], NGX_AUTOCERT_ACME_TLS_ALPN,
+                          NGX_AUTOCERT_ACME_TLS_ALPN_LEN) == 0)
+        {
+            *out = (const unsigned char *) NGX_AUTOCERT_ACME_TLS_ALPN;
+            *outlen = NGX_AUTOCERT_ACME_TLS_ALPN_LEN;
+
+            c = ngx_ssl_get_connection(ssl_conn);
+            if (c != NULL) {
+                ngx_log_error(NGX_LOG_INFO, c->log, 0,
+                              "autocert: tls-alpn-01 validation handshake");
+            }
+
+            if (ngx_autocert_alpn_conn_index != -1) {
+                (void) SSL_set_ex_data(ssl_conn,
+                                       ngx_autocert_alpn_conn_index,
+                                       (void *) 1);
+            }
+
+            return SSL_TLSEXT_ERR_OK;
+        }
+    }
+
+    return ngx_http_autocert_alpn_default(ssl_conn, out, outlen, in, inlen);
+}
+
+
+/*
+ * Normal-path ALPN negotiation, VENDORED from nginx's ngx_http_ssl_alpn_select
+ * (src/http/modules/ngx_http_ssl_module.c). We own the only ALPN callback slot
+ * on an autocert ctx, so non-acme clients must still get nginx's exact h2 / h3
+ * / http advertise-and-select behaviour. KEEP IN SYNC with nginx/angie.
+ */
+static int
+ngx_http_autocert_alpn_default(ngx_ssl_conn_t *ssl_conn,
+    const unsigned char **out, unsigned char *outlen, const unsigned char *in,
+    unsigned int inlen)
+{
+    unsigned int             srvlen;
+    unsigned char           *srv;
+#if (NGX_HTTP_V2 || NGX_HTTP_V3)
+    ngx_http_connection_t   *hc;
+#endif
+#if (NGX_HTTP_V2)
+    ngx_http_v2_srv_conf_t  *h2scf;
+#endif
+#if (NGX_HTTP_V3)
+    ngx_http_v3_srv_conf_t  *h3scf;
+#endif
+#if (NGX_HTTP_V2 || NGX_HTTP_V3)
+    ngx_connection_t        *c;
+
+    c = ngx_ssl_get_connection(ssl_conn);
+    hc = c->data;
+#endif
+
+#if (NGX_HTTP_V3)
+    if (hc->addr_conf->quic) {
+
+        h3scf = ngx_http_get_module_srv_conf(hc->conf_ctx, ngx_http_v3_module);
+
+        if (h3scf->enable && h3scf->enable_hq) {
+            srv = (unsigned char *) NGX_HTTP_V3_ALPN_PROTO
+                                    NGX_HTTP_V3_HQ_ALPN_PROTO;
+            srvlen = sizeof(NGX_HTTP_V3_ALPN_PROTO NGX_HTTP_V3_HQ_ALPN_PROTO)
+                     - 1;
+
+        } else if (h3scf->enable_hq) {
+            srv = (unsigned char *) NGX_HTTP_V3_HQ_ALPN_PROTO;
+            srvlen = sizeof(NGX_HTTP_V3_HQ_ALPN_PROTO) - 1;
+
+        } else if (h3scf->enable) {
+            srv = (unsigned char *) NGX_HTTP_V3_ALPN_PROTO;
+            srvlen = sizeof(NGX_HTTP_V3_ALPN_PROTO) - 1;
+
+        } else {
+            return SSL_TLSEXT_ERR_ALERT_FATAL;
+        }
+
+    } else
+#endif
+    {
+#if (NGX_HTTP_V2)
+        h2scf = ngx_http_get_module_srv_conf(hc->conf_ctx, ngx_http_v2_module);
+
+        if (h2scf->enable || hc->addr_conf->http2) {
+            srv = (unsigned char *) NGX_HTTP_V2_ALPN_PROTO
+                                    NGX_AUTOCERT_HTTP_ALPN_PROTOS;
+            srvlen = sizeof(NGX_HTTP_V2_ALPN_PROTO
+                            NGX_AUTOCERT_HTTP_ALPN_PROTOS) - 1;
+
+        } else
+#endif
+        {
+            srv = (unsigned char *) NGX_AUTOCERT_HTTP_ALPN_PROTOS;
+            srvlen = sizeof(NGX_AUTOCERT_HTTP_ALPN_PROTOS) - 1;
+        }
+    }
+
+    if (SSL_select_next_proto((unsigned char **) out, outlen, srv, srvlen,
+                              in, inlen)
+        != OPENSSL_NPN_NEGOTIATED)
+    {
+        return SSL_TLSEXT_ERR_ALERT_FATAL;
+    }
+
+    return SSL_TLSEXT_ERR_OK;
+}
+
+
+/*
+ * Serve the tls-alpn-01 challenge certificate for `host` on this connection.
+ * Look the {cert,key} PEM up in the shared store (filled by the helper), parse
+ * them, and bind them to the SSL. Returns 1 to proceed (challenge cert served),
+ * 0 to fail the handshake — under acme-tls/1 there is no honest fallback, so any
+ * miss or parse/install error fails closed.
+ */
+static int
+ngx_http_autocert_serve_alpn_cert(ngx_connection_t *c, SSL *ssl_conn,
+    ngx_autocert_serve_ctx_t *sctx, ngx_str_t *host)
+{
+    ngx_str_t   cert_pem, key_pem;
+    ngx_int_t   rc;
+    BIO        *bio = NULL;
+    X509       *cert = NULL;
+    EVP_PKEY   *key = NULL;
+    int         ret = 0;
+
+    rc = ngx_autocert_alpn_get(sctx->alpn_zone, host, c->pool,
+                               &cert_pem, &key_pem);
+    if (rc != NGX_OK) {
+        ngx_log_error(NGX_LOG_INFO, c->log, 0,
+                      "autocert: no tls-alpn-01 challenge cert for \"%V\"",
+                      host);
+        return 0;
+    }
+
+    bio = BIO_new_mem_buf(cert_pem.data, (int) cert_pem.len);
+    if (bio == NULL) {
+        goto done;
+    }
+
+    cert = PEM_read_bio_X509(bio, NULL, NULL, NULL);
+    if (cert == NULL) {
+        ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                      "autocert: malformed tls-alpn-01 cert for \"%V\"", host);
+        goto done;
+    }
+
+    BIO_free(bio);
+    bio = BIO_new_mem_buf(key_pem.data, (int) key_pem.len);
+    if (bio == NULL) {
+        goto done;
+    }
+
+    key = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL);
+    if (key == NULL) {
+        ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                      "autocert: bad tls-alpn-01 key for \"%V\"", host);
+        goto done;
+    }
+
+    /*
+     * Bind the challenge cert/key (self-signed: no chain). A partial bind would
+     * present a mismatched pair, so any failure fails the handshake. Clear any
+     * inherited chain so a stale intermediate never ships with the leaf.
+     */
+    if (SSL_use_certificate(ssl_conn, cert) != 1
+        || SSL_use_PrivateKey(ssl_conn, key) != 1
+        || SSL_set1_chain(ssl_conn, NULL) != 1)
+    {
+        ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                      "autocert: installing tls-alpn-01 cert for \"%V\" failed",
+                      host);
+        goto done;
+    }
+
+    ngx_log_error(NGX_LOG_INFO, c->log, 0,
+                  "autocert: served tls-alpn-01 challenge cert for \"%V\"",
+                  host);
+    ret = 1;
+
+done:
+
+    if (bio != NULL) {
+        BIO_free(bio);
+    }
+    if (cert != NULL) {
+        X509_free(cert);          /* SSL_use_certificate up-refs on success */
+    }
+    if (key != NULL) {
+        EVP_PKEY_free(key);
+    }
+
+    return ret;
 }
 
 

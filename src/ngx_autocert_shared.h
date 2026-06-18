@@ -35,6 +35,13 @@ typedef struct {
     /* M5 test seed (token.len == 0 when unset). */
     ngx_str_t        test_token;
     ngx_str_t        test_keyauth;
+
+    /* M10b: the tls-alpn-01 challenge cert store the helper writes (NULL if not
+     * set up). */
+    ngx_shm_zone_t  *alpn_zone;
+    /* M10b test seed (domain.len == 0 when unset). */
+    ngx_str_t        test_alpn_domain;
+    ngx_str_t        test_alpn_keyauth;
 } ngx_autocert_conf_t;
 
 

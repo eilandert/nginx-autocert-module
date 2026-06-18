@@ -219,6 +219,18 @@ jobs:
             AC_TEST_PORT=18179 \
             bash "$GITHUB_WORKSPACE/tests/tls-serve.sh"
 
+      - name: tls-alpn-01 ALPN serve path (M10b)
+        run: |
+          set -euo pipefail
+          # A client negotiating ALPN "acme-tls/1" + SNI gets the seeded
+          # challenge cert (SAN + critical acmeIdentifier); a normal client gets
+          # the ordinary cert and negotiates http/1.1. No network/docker.
+          SERVER_BIN="$GITHUB_WORKSPACE/${{ matrix.dir }}/$( \
+            [ -x "${{ matrix.dir }}/objs/angie" ] && echo objs/angie || echo objs/nginx)" \
+            NGX_BUILD_DIR="$GITHUB_WORKSPACE/${{ matrix.dir }}" \
+            AC_TEST_PORT=18180 \
+            bash "$GITHUB_WORKSPACE/tests/tls-alpn-challenge.sh"
+
   crypto-unit:
     name: Crypto unit tests (M3)
     needs: resolve
