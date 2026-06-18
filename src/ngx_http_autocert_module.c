@@ -17,6 +17,8 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 
+#include "ngx_http_autocert_conf.h"
+
 
 #define NGX_HTTP_AUTOCERT_DEFAULT_CA \
     "https://acme-v02.api.letsencrypt.org/directory"
@@ -25,45 +27,8 @@
 #define NGX_HTTP_AUTOCERT_ZONE_SIZE  (256 * 1024)
 
 
-typedef enum {
-    NGX_HTTP_AUTOCERT_KEY_P256 = 0,
-    NGX_HTTP_AUTOCERT_KEY_P384
-} ngx_http_autocert_key_type_e;
-
-typedef enum {
-    NGX_HTTP_AUTOCERT_STORE_SECURE = 0,
-    NGX_HTTP_AUTOCERT_STORE_CERTBOT
-} ngx_http_autocert_store_e;
-
-typedef enum {
-    NGX_HTTP_AUTOCERT_CHALLENGE_HTTP_01 = 0,
-    NGX_HTTP_AUTOCERT_CHALLENGE_TLS_ALPN_01
-} ngx_http_autocert_challenge_e;
-
-
-/* Per-server config: the on/off switch + optional contact (M0). */
-typedef struct {
-    ngx_flag_t   enable;    /* autocert on|off; NGX_CONF_UNSET until set */
-    ngx_str_t    email;     /* optional ACME account contact, "" if absent */
-} ngx_http_autocert_srv_conf_t;
-
-
-/*
- * Main (http{}-global) config: the autocert_* tuning knobs plus the shared
- * zone handle and the collected name set. Populated once, in the http{}
- * occurrence of create_main_conf, read by every server.
- */
-typedef struct {
-    ngx_str_t    ca;                /* ACME directory URL */
-    time_t       renew_before;      /* seconds before notAfter to renew */
-    ngx_uint_t   key_type;          /* ngx_http_autocert_key_type_e */
-    ngx_uint_t   store;             /* ngx_http_autocert_store_e */
-    ngx_str_t    path;              /* cert store directory */
-    ngx_uint_t   challenge;         /* ngx_http_autocert_challenge_e */
-
-    ngx_shm_zone_t  *shm_zone;      /* published enabled-name set (for M4) */
-    ngx_array_t     *names;         /* ngx_str_t, collected at postconfig */
-} ngx_http_autocert_main_conf_t;
+/* Config struct + enum defs are shared via ngx_http_autocert_conf.h so the
+ * CORE helper's accessor TU agrees on the layout. */
 
 
 /* Shared-zone payload: a flat list of NUL-free name strings in slab memory. */
@@ -88,6 +53,8 @@ static char *ngx_http_autocert_key_type(ngx_conf_t *cf, ngx_command_t *cmd,
 static char *ngx_http_autocert_store(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_autocert_challenge(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+static char *ngx_http_autocert_resolver(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 
 
@@ -150,6 +117,29 @@ static ngx_command_t  ngx_http_autocert_commands[] = {
       0,
       NULL },
 
+    /* M4b: outbound ACME client transport knobs (http{}-global). */
+
+    { ngx_string("autocert_resolver"),
+      NGX_HTTP_MAIN_CONF|NGX_CONF_1MORE,
+      ngx_http_autocert_resolver,
+      NGX_HTTP_MAIN_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("autocert_resolver_timeout"),
+      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_sec_slot,
+      NGX_HTTP_MAIN_CONF_OFFSET,
+      offsetof(ngx_http_autocert_main_conf_t, resolver_timeout),
+      NULL },
+
+    { ngx_string("autocert_ca_certificate"),
+      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_MAIN_CONF_OFFSET,
+      offsetof(ngx_http_autocert_main_conf_t, ca_certificate),
+      NULL },
+
       ngx_null_command
 };
 
@@ -201,6 +191,9 @@ ngx_http_autocert_create_main_conf(ngx_conf_t *cf)
     amcf->store = NGX_CONF_UNSET_UINT;
     amcf->challenge = NGX_CONF_UNSET_UINT;
 
+    /* resolver pointer + ca_certificate zeroed by pcalloc */
+    amcf->resolver_timeout = NGX_CONF_UNSET;
+
     return amcf;
 }
 
@@ -225,6 +218,8 @@ ngx_http_autocert_init_main_conf(ngx_conf_t *cf, void *conf)
     if (amcf->path.data == NULL) {
         ngx_str_set(&amcf->path, "autocert");
     }
+
+    ngx_conf_init_value(amcf->resolver_timeout, 30);
 
     return NGX_CONF_OK;
 }
@@ -434,6 +429,33 @@ ngx_http_autocert_init_zone(ngx_shm_zone_t *shm_zone, void *data)
     shpool->data = sh;
 
     return NGX_OK;
+}
+
+
+/*
+ * autocert_resolver <addr> [addr...];
+ *
+ * Build the ngx_resolver the helper uses for outbound ACME DNS. Created at
+ * config time so it lives in the cycle pool and is reachable from the helper
+ * process (same cycle); the helper has no ngx_conf_t to build one itself.
+ */
+static char *
+ngx_http_autocert_resolver(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_autocert_main_conf_t  *amcf = conf;
+
+    ngx_str_t  *value = cf->args->elts;
+
+    if (amcf->resolver != NULL) {
+        return "is duplicate";
+    }
+
+    amcf->resolver = ngx_resolver_create(cf, &value[1], cf->args->nelts - 1);
+    if (amcf->resolver == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    return NGX_CONF_OK;
 }
 
 

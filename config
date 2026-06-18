@@ -13,9 +13,13 @@ ngx_addon_name=ngx_http_autocert_module
 if test -n "$ngx_module_link"; then
     ngx_module_type=CORE
     ngx_module_name=ngx_autocert_process_module
-    ngx_module_srcs="$ngx_addon_dir/src/ngx_autocert_process.c"
-    ngx_module_libs=
-    ngx_module_deps=
+    ngx_module_srcs="$ngx_addon_dir/src/ngx_autocert_process.c \
+                     $ngx_addon_dir/src/ngx_autocert_acme.c \
+                     $ngx_addon_dir/src/ngx_autocert_conf.c"
+    ngx_module_libs="-lssl -lcrypto"
+    ngx_module_deps="$ngx_addon_dir/src/ngx_autocert_acme.h \
+                     $ngx_addon_dir/src/ngx_autocert_shared.h \
+                     $ngx_addon_dir/src/ngx_http_autocert_conf.h"
     . auto/module
 
     ngx_module_type=HTTP
@@ -23,13 +27,16 @@ if test -n "$ngx_module_link"; then
     ngx_module_srcs="$ngx_addon_dir/src/ngx_http_autocert_module.c \
                      $ngx_addon_dir/src/ngx_http_autocert_crypto.c"
     ngx_module_libs="-lssl -lcrypto"
-    ngx_module_deps="$ngx_addon_dir/src/ngx_http_autocert_crypto.h"
+    ngx_module_deps="$ngx_addon_dir/src/ngx_http_autocert_crypto.h \
+                     $ngx_addon_dir/src/ngx_http_autocert_conf.h"
     . auto/module
 else
     CORE_MODULES="$CORE_MODULES ngx_autocert_process_module"
     HTTP_MODULES="$HTTP_MODULES ngx_http_autocert_module"
     NGX_ADDON_SRCS="$NGX_ADDON_SRCS \
                     $ngx_addon_dir/src/ngx_autocert_process.c \
+                    $ngx_addon_dir/src/ngx_autocert_acme.c \
+                    $ngx_addon_dir/src/ngx_autocert_conf.c \
                     $ngx_addon_dir/src/ngx_http_autocert_module.c \
                     $ngx_addon_dir/src/ngx_http_autocert_crypto.c"
     CORE_LIBS="$CORE_LIBS -lssl -lcrypto"

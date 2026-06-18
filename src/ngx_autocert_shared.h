@@ -1,0 +1,36 @@
+/*
+ * ngx_autocert_shared — the narrow interface the CORE helper process uses to
+ * read the HTTP module's configuration without depending on the HTTP module's
+ * private conf struct. The helper is an NGX_CORE_MODULE; it cannot use
+ * ngx_http_conf_get_module_main_conf, and the autocert main-conf struct is
+ * file-private to ngx_http_autocert_module.c. So the HTTP module exports one
+ * accessor that copies the few fields the helper needs into this flat struct.
+ */
+
+#ifndef _NGX_AUTOCERT_SHARED_H_INCLUDED_
+#define _NGX_AUTOCERT_SHARED_H_INCLUDED_
+
+
+#include <ngx_config.h>
+#include <ngx_core.h>
+
+
+typedef struct {
+    ngx_uint_t       configured;     /* 0 => autocert not present in http{} */
+    ngx_str_t        ca;             /* ACME directory URL */
+    ngx_resolver_t  *resolver;       /* may be NULL if autocert_resolver unset */
+    time_t           resolver_timeout;
+    ngx_str_t        ca_certificate; /* PEM trust bundle path, "" => system */
+} ngx_autocert_conf_t;
+
+
+/*
+ * Fill *out from the running cycle's HTTP autocert main conf. Returns NGX_OK
+ * with out->configured set appropriately (0 if the http{} block has no
+ * autocert main conf, e.g. no http{} at all), NGX_ERROR only on a NULL out.
+ * Safe to call from the helper (CORE) process against its own cycle.
+ */
+ngx_int_t ngx_autocert_get_conf(ngx_cycle_t *cycle, ngx_autocert_conf_t *out);
+
+
+#endif /* _NGX_AUTOCERT_SHARED_H_INCLUDED_ */
