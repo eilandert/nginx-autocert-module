@@ -555,8 +555,14 @@ ngx_autocert_acme_build_request(ngx_autocert_acme_request_t *r)
      * Accept, and for a body Content-Type + Content-Length. We always send
      * Connection: close so the response ends at EOF if no Content-Length.
      */
+    /* Host header: include the port when it is not the https default (443),
+     * per RFC 7230. ACME servers (e.g. Pebble) derive the directory endpoint
+     * URLs from this header, so dropping a non-default port makes every
+     * subsequent URL point at :443 and fail to connect. */
     len = r->method.len + 1 + r->uri.len + sizeof(" HTTP/1.1" CRLF) - 1
-        + sizeof("Host: ") - 1 + r->host.len + sizeof(CRLF) - 1
+        + sizeof("Host: ") - 1 + r->host.len
+        + (r->port != 443 ? sizeof(":65535") - 1 : 0)
+        + sizeof(CRLF) - 1
         + sizeof("User-Agent: ngx-autocert" CRLF) - 1
         + sizeof("Accept: application/json" CRLF) - 1
         + sizeof("Connection: close" CRLF) - 1
@@ -580,6 +586,9 @@ ngx_autocert_acme_build_request(ngx_autocert_acme_request_t *r)
     p = ngx_cpymem(p, " HTTP/1.1" CRLF, sizeof(" HTTP/1.1" CRLF) - 1);
     p = ngx_cpymem(p, "Host: ", sizeof("Host: ") - 1);
     p = ngx_cpymem(p, r->host.data, r->host.len);
+    if (r->port != 443) {
+        p = ngx_sprintf(p, ":%d", (int) r->port);
+    }
     p = ngx_cpymem(p, CRLF, sizeof(CRLF) - 1);
     p = ngx_cpymem(p, "User-Agent: ngx-autocert" CRLF,
                    sizeof("User-Agent: ngx-autocert" CRLF) - 1);
