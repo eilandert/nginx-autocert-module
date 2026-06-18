@@ -24,6 +24,7 @@ typedef struct {
     ngx_uint_t       key_type;       /* ngx_http_autocert_key_type_e (acct key) */
     ngx_str_t        path;           /* cert store dir (holds the account key) */
     time_t           renew_before;   /* M8: seconds before notAfter to renew */
+    ngx_uint_t       challenge;      /* M10c: ngx_http_autocert_challenge_e */
 
     /* M5: the challenge token store the helper writes (NULL if not set up). */
     ngx_shm_zone_t  *challenge_zone;

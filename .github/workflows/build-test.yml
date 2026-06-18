@@ -436,6 +436,57 @@ jobs:
             NGX_BUILD_DIR="$(dirname "$SERVER_BIN")/.." \
             bash "$GITHUB_WORKSPACE/tests/order-authz.sh"
 
+  tls-alpn-issue:
+    name: tls-alpn-01 full issuance, no port 80 (M10c)
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libpcre2-dev zlib1g-dev libssl-dev ccache
+          ccache --max-size=500M
+
+      - name: Restore ccache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.job }}-${{ matrix.flavor }}-${{ matrix.version }}-
+
+      - name: Fetch + build nginx with the module
+        run: |
+          set -euo pipefail
+          ver=$(curl -fsSL https://nginx.org/en/download.html \
+            | grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.gz)' \
+            | sort -V | tail -1)
+          curl -fsSL -o src.tar.gz "https://nginx.org/download/nginx-$ver.tar.gz"
+          tar -xzf src.tar.gz
+          cd "nginx-$ver"
+          ./configure --with-compat --with-http_ssl_module \
+            --with-cc="ccache cc" \
+            --add-dynamic-module="$GITHUB_WORKSPACE" > /tmp/conf.log 2>&1 \
+            || { tail -40 /tmp/conf.log; exit 1; }
+          make > /tmp/make.log 2>&1 || { tail -40 /tmp/make.log; exit 1; }
+          echo "SERVER_BIN=$PWD/objs/nginx" >> "$GITHUB_ENV"
+
+      - name: Full tls-alpn-01 issuance against Pebble (port 80 never used)
+        run: |
+          # autocert_challenge tls-alpn-01: the helper builds the RFC 8737
+          # challenge cert and the worker serves it at the handshake on ALPN
+          # "acme-tls/1". Pebble's VA validates on a high tlsPort (5001) with no
+          # :80 listener anywhere, so this needs no root. dnsmasq points the
+          # order domain at the host; the test asserts authz valid, the worker
+          # served the challenge cert, and the issued cert is stored + matches.
+          SERVER_BIN="$SERVER_BIN" \
+            NGX_BUILD_DIR="$(dirname "$SERVER_BIN")/.." \
+            bash "$GITHUB_WORKSPACE/tests/tls-alpn-issue.sh"
+
   renewal:
     name: ACME renewal + multi-name issuance (M8)
     needs: resolve

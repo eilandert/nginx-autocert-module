@@ -10,6 +10,7 @@
 #include "ngx_autocert_acme.h"
 #include "ngx_autocert_json.h"
 #include "ngx_autocert_challenge.h"
+#include "ngx_autocert_alpn.h"
 #include "ngx_http_autocert_crypto.h"
 #include "ngx_http_autocert_conf.h"     /* key-type enum mapping */
 
@@ -56,6 +57,8 @@ static u_char *ngx_autocert_order_tmp_path(ngx_autocert_order_t *order,
     u_char *path);
 static ngx_int_t ngx_autocert_order_write_tmp(ngx_autocert_order_t *order,
     u_char *tmp, ngx_str_t *data, ngx_uint_t mode);
+static ngx_int_t ngx_autocert_order_publish_alpn(ngx_autocert_order_t *order);
+static void ngx_autocert_order_unpublish(ngx_autocert_order_t *order);
 static void ngx_autocert_order_finish(ngx_autocert_order_t *order,
     ngx_int_t rc);
 static void ngx_autocert_order_note_retry_after(ngx_autocert_order_t *order,
@@ -154,6 +157,7 @@ ngx_autocert_order_start(ngx_autocert_order_t *order)
 {
     order->done = 0;
     order->challenge_set = 0;
+    order->alpn_set = 0;
     order->poll_tries = 0;
     order->retry_after = 0;
     ngx_str_null(&order->order_url);
@@ -419,6 +423,15 @@ ngx_autocert_order_authz_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
             return;
         }
 
+        /* The challenge type to answer, per the autocert_challenge directive. */
+        ngx_str_t  want;
+
+        if (order->challenge == NGX_AUTOCERT_CHALLENGE_TLS_ALPN_01) {
+            ngx_str_set(&want, "tls-alpn-01");
+        } else {
+            ngx_str_set(&want, "http-01");
+        }
+
         challenges = (root != NULL)
                      ? ngx_autocert_json_object_get(root, "challenges") : NULL;
 
@@ -431,9 +444,8 @@ ngx_autocert_order_authz_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
                     continue;
                 }
                 if (ngx_autocert_json_object_str(ch, "type", &type) != NGX_OK
-                    || type.len != sizeof("http-01") - 1
-                    || ngx_strncmp(type.data, "http-01",
-                                   sizeof("http-01") - 1) != 0)
+                    || type.len != want.len
+                    || ngx_strncmp(type.data, want.data, want.len) != 0)
                 {
                     continue;
                 }
@@ -454,8 +466,8 @@ ngx_autocert_order_authz_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
 
     if (ok != NGX_OK) {
         ngx_log_error(NGX_LOG_ERR, order->log, 0,
-                      "autocert: no http-01 challenge in authorization "
-                      "(status %ui)", req->status);
+                      "autocert: no usable challenge of the configured type in "
+                      "authorization (status %ui)", req->status);
         ngx_destroy_pool(req->pool);
         ngx_autocert_order_finish(order, NGX_ERROR);
         return;
@@ -487,21 +499,101 @@ ngx_autocert_order_authz_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
 
     ngx_destroy_pool(req->pool);
 
-    /* Publish token->keyauth so the :80 worker handler can answer the VA. */
-    if (ngx_autocert_challenge_set(order->challenge_zone, &order->token,
-                                   &order->keyauth)
-        != NGX_OK)
-    {
-        ngx_log_error(NGX_LOG_ERR, order->log, 0,
-                      "autocert: could not publish challenge token");
-        ngx_autocert_order_finish(order, NGX_ERROR);
-        return;
+    /*
+     * Publish the challenge answer where the worker can serve it:
+     *  - tls-alpn-01: a self-signed challenge cert (SAN + acmeIdentifier) in the
+     *    ALPN store, served at the handshake on ALPN "acme-tls/1" (M10b);
+     *  - http-01: token->keyauth in the token store, served by the :80 handler.
+     */
+    if (order->challenge == NGX_AUTOCERT_CHALLENGE_TLS_ALPN_01) {
+        if (ngx_autocert_order_publish_alpn(order) != NGX_OK) {
+            ngx_autocert_order_finish(order, NGX_ERROR);
+            return;
+        }
+    } else {
+        if (ngx_autocert_challenge_set(order->challenge_zone, &order->token,
+                                       &order->keyauth)
+            != NGX_OK)
+        {
+            ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                          "autocert: could not publish challenge token");
+            ngx_autocert_order_finish(order, NGX_ERROR);
+            return;
+        }
+        order->challenge_set = 1;
     }
-    order->challenge_set = 1;
 
     if (ngx_autocert_order_respond(order) != NGX_OK) {
         ngx_autocert_order_finish(order, NGX_ERROR);
     }
+}
+
+
+/*
+ * M10c: build the tls-alpn-01 challenge certificate for this order's domain and
+ * key authorization (RFC 8737) and publish it into the shared ALPN store, where
+ * the worker handshake serves it on ALPN "acme-tls/1" (M10b). The challenge cert
+ * uses a throwaway key independent of the issuance cert key; both PEMs are
+ * copied into the slab store and the local OpenSSL objects freed here.
+ */
+static ngx_int_t
+ngx_autocert_order_publish_alpn(ngx_autocert_order_t *order)
+{
+    EVP_PKEY    *key;
+    X509        *cert;
+    ngx_pool_t  *tmp;
+    ngx_str_t    cert_pem, key_pem;
+    ngx_int_t    rc = NGX_ERROR;
+
+    if (order->alpn_zone == NULL) {
+        ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                      "autocert: tls-alpn-01 selected but no ALPN store");
+        return NGX_ERROR;
+    }
+
+    tmp = ngx_create_pool(4096, order->log);
+    if (tmp == NULL) {
+        return NGX_ERROR;
+    }
+
+    key = ngx_http_autocert_key_generate(order->key_type);
+    if (key == NULL) {
+        ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                      "autocert: tls-alpn-01 challenge key generation failed");
+        goto done;
+    }
+
+    cert = ngx_http_autocert_acme_tls_cert(key, &order->domain, &order->keyauth);
+    if (cert == NULL) {
+        ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                      "autocert: tls-alpn-01 challenge cert build failed");
+        goto done_key;
+    }
+
+    if (ngx_http_autocert_cert_to_pem(tmp, cert, &cert_pem) != NGX_OK
+        || ngx_http_autocert_key_to_pem(tmp, key, &key_pem) != NGX_OK
+        || ngx_autocert_alpn_set(order->alpn_zone, &order->domain,
+                                 &cert_pem, &key_pem) != NGX_OK)
+    {
+        ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                      "autocert: could not publish tls-alpn-01 challenge cert");
+        X509_free(cert);
+        goto done_key;
+    }
+
+    order->alpn_set = 1;
+    rc = NGX_OK;
+
+    X509_free(cert);
+
+done_key:
+
+    ngx_http_autocert_key_free(key);
+
+done:
+
+    ngx_destroy_pool(tmp);
+    return rc;
 }
 
 
@@ -620,14 +712,8 @@ ngx_autocert_order_poll_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
                       "autocert: authorization for \"%V\" is valid",
                       &order->domain);
 
-        /* M6a step 6: token no longer needed once validation completed. */
-        if (order->challenge_set && order->challenge_zone != NULL
-            && order->token.len != 0)
-        {
-            (void) ngx_autocert_challenge_remove(order->challenge_zone,
-                                                 &order->token);
-            order->challenge_set = 0;
-        }
+        /* Step 6: challenge answer no longer needed once validation completed. */
+        ngx_autocert_order_unpublish(order);
 
         /* M6b: finalize the order with a CSR. */
         if (ngx_autocert_order_finalize(order) != NGX_OK) {
@@ -1134,6 +1220,30 @@ ngx_autocert_order_write_tmp(ngx_autocert_order_t *order, u_char *tmp,
 }
 
 
+/*
+ * Drop whatever challenge answer this order published, from whichever store.
+ * Idempotent: clears the flags so repeat calls (finish then free) are no-ops.
+ */
+static void
+ngx_autocert_order_unpublish(ngx_autocert_order_t *order)
+{
+    if (order->challenge_set && order->challenge_zone != NULL
+        && order->token.len != 0)
+    {
+        (void) ngx_autocert_challenge_remove(order->challenge_zone,
+                                             &order->token);
+        order->challenge_set = 0;
+    }
+
+    if (order->alpn_set && order->alpn_zone != NULL
+        && order->domain.len != 0)
+    {
+        (void) ngx_autocert_alpn_remove(order->alpn_zone, &order->domain);
+        order->alpn_set = 0;
+    }
+}
+
+
 static void
 ngx_autocert_order_finish(ngx_autocert_order_t *order, ngx_int_t rc)
 {
@@ -1149,16 +1259,10 @@ ngx_autocert_order_finish(ngx_autocert_order_t *order, ngx_int_t rc)
         ngx_del_timer(&order->order_timer);
     }
 
-    /* Step 6: drop the token from the store now the authz is settled. The cert
-     * key authorization is no longer needed once validation completed (or
-     * failed); keeping it serves no purpose and leaks slab. */
-    if (order->challenge_set && order->challenge_zone != NULL
-        && order->token.len != 0)
-    {
-        (void) ngx_autocert_challenge_remove(order->challenge_zone,
-                                             &order->token);
-        order->challenge_set = 0;
-    }
+    /* Drop the published challenge answer now the authz is settled. It is no
+     * longer needed once validation completed (or failed); keeping it serves no
+     * purpose and leaks slab. */
+    ngx_autocert_order_unpublish(order);
 
     if (order->handler) {
         order->handler(order, rc);
@@ -1169,13 +1273,7 @@ ngx_autocert_order_finish(ngx_autocert_order_t *order, ngx_int_t rc)
 void
 ngx_autocert_order_free(ngx_autocert_order_t *order)
 {
-    if (order->challenge_set && order->challenge_zone != NULL
-        && order->token.len != 0)
-    {
-        (void) ngx_autocert_challenge_remove(order->challenge_zone,
-                                             &order->token);
-        order->challenge_set = 0;
-    }
+    ngx_autocert_order_unpublish(order);
     if (order->poll_timer.timer_set) {
         ngx_del_timer(&order->poll_timer);
     }
