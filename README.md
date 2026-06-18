@@ -1,5 +1,8 @@
 # nginx-autocert-module
 
+[![Build & Test](https://github.com/eilandert/nginx-autocert-module/actions/workflows/build-test.yml/badge.svg)](https://github.com/eilandert/nginx-autocert-module/actions/workflows/build-test.yml)
+[![Valgrind](https://github.com/eilandert/nginx-autocert-module/actions/workflows/valgrind.yml/badge.svg)](https://github.com/eilandert/nginx-autocert-module/actions/workflows/valgrind.yml)
+
 NGINX dynamic module for **automatic ACME certificate provisioning**. Declare
 `autocert on;` on a vhost (or globally) and the module obtains and renews a
 certificate from an ACME CA (Let's Encrypt by default) for that vhost's

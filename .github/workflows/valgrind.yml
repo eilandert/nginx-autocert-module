@@ -1,0 +1,130 @@
+name: Valgrind
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  NGINX_VERSION: ""
+
+on:
+  schedule:
+    # Monthly, 1st @ 03:30 UTC.
+    - cron: "30 3 1 * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: valgrind-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  memcheck:
+    name: Memcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Resolve latest mainline nginx
+        run: |
+          set -euo pipefail
+          ver=$(curl -fsSL https://nginx.org/en/download.html \
+            | grep -oP 'nginx-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.gz)' \
+            | sort -V | tail -1)
+          if [ -z "$ver" ]; then
+            echo "::error::could not resolve mainline nginx version"
+            exit 1
+          fi
+          echo "Resolved nginx mainline: $ver"
+          echo "NGINX_VERSION=$ver" >> "$GITHUB_ENV"
+
+      - name: Setup build deps
+        uses: ./.github/actions/setup
+        with:
+          packages: build-essential ccache curl libpcre2-dev libssl-dev valgrind zlib1g-dev
+          ccache-key: valgrind-nginx
+
+      - name: Fetch nginx
+        run: |
+          set -euo pipefail
+          curl -fsSL -o src.tar.gz "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
+          tar -xzf src.tar.gz
+
+      - name: Configure + build debug nginx with autocert
+        run: |
+          set -euo pipefail
+          cd "nginx-${NGINX_VERSION}"
+          ./configure \
+            --with-compat \
+            --with-debug \
+            --with-http_ssl_module \
+            --with-cc="ccache cc" \
+            --with-cc-opt="-DNGX_DEBUG_PALLOC=1 -g3 -O0 -fno-omit-frame-pointer -funwind-tables" \
+            --add-dynamic-module="$GITHUB_WORKSPACE" > /tmp/conf.log 2>&1 \
+            || { tail -40 /tmp/conf.log; exit 1; }
+          make -j"$(nproc)" > /tmp/make.log 2>&1 || { tail -40 /tmp/make.log; exit 1; }
+          test -x objs/nginx
+          test -f objs/ngx_http_autocert_module.so
+          test -f objs/ngx_autocert_process_module.so
+          ccache -s || true
+
+      - name: Build unit tests
+        run: |
+          set -euo pipefail
+          NGX="$GITHUB_WORKSPACE/nginx-${NGINX_VERSION}"
+          INC="-I$NGX/src/core -I$NGX/src/event -I$NGX/src/os/unix -I$NGX/objs"
+          OBJS="$NGX/objs/src/core/ngx_palloc.o $NGX/objs/src/core/ngx_string.o \
+                $NGX/objs/src/os/unix/ngx_time.o $NGX/objs/src/core/ngx_times.o \
+                $NGX/objs/src/os/unix/ngx_alloc.o"
+          gcc -Wall -Wextra -Werror -g3 -O0 $INC -o test_crypto \
+            "$GITHUB_WORKSPACE/test/test_crypto.c" \
+            "$GITHUB_WORKSPACE/src/ngx_http_autocert_crypto.c" \
+            $OBJS -lssl -lcrypto
+          gcc -Wall -Wextra -Werror -g3 -O0 $INC -o test_json \
+            "$GITHUB_WORKSPACE/test/test_json.c" \
+            "$GITHUB_WORKSPACE/src/ngx_autocert_json.c" \
+            $OBJS
+
+      - name: Run unit tests under Memcheck
+        run: |
+          runner="valgrind --tool=memcheck --track-origins=yes --leak-check=full"
+          runner="$runner --show-leak-kinds=definite,indirect"
+          runner="$runner --errors-for-leak-kinds=definite,indirect --error-exitcode=99"
+          $runner ./test_crypto
+          $runner ./test_json
+
+      - name: Load modules under Memcheck
+        run: |
+          set -euo pipefail
+          NGX="$GITHUB_WORKSPACE/nginx-${NGINX_VERSION}"
+          PREFIX="$(mktemp -d)"
+          mkdir -p "$PREFIX/logs" "$PREFIX/conf"
+          cat > "$PREFIX/conf/nginx.conf" <<EOF
+          load_module $NGX/objs/ngx_autocert_process_module.so;
+          load_module $NGX/objs/ngx_http_autocert_module.so;
+          error_log $PREFIX/logs/error.log notice;
+          events {}
+          http {
+              autocert on admin@example.com;
+              autocert_ca https://acme-staging-v02.api.letsencrypt.org/directory;
+              autocert_renew_before 10d;
+              autocert_key_type secp256r1;
+              autocert_store secure;
+              autocert_path $PREFIX/store;
+              autocert_challenge tls-alpn-01;
+              server {
+                  listen 8443 ssl;
+                  server_name vg.example.com;
+                  autocert on;
+              }
+          }
+          EOF
+          valgrind \
+            --tool=memcheck \
+            --track-origins=yes \
+            --leak-check=full \
+            --show-leak-kinds=definite,indirect \
+            --errors-for-leak-kinds=none \
+            --error-exitcode=99 \
+            "$NGX/objs/nginx" -t -p "$PREFIX" -c "$PREFIX/conf/nginx.conf"
