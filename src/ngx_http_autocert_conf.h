@@ -73,6 +73,17 @@ typedef struct {
      * order flow. token.len == 0 when unset. */
     ngx_str_t        test_token;
     ngx_str_t        test_keyauth;
+
+    /* M10b tls-alpn-01 challenge cert store (domain -> {cert,key} PEM), written
+     * by the helper, read by the worker handshake (cert_cb). */
+    ngx_shm_zone_t  *alpn_zone;
+
+    /* M10b test-only seed: autocert_test_alpn <domain> <keyauth>; the helper
+     * builds the challenge cert at startup and inserts it into alpn_zone so the
+     * ALPN serve path can be exercised without a full order flow. domain.len ==
+     * 0 when unset. */
+    ngx_str_t        test_alpn_domain;
+    ngx_str_t        test_alpn_keyauth;
 } ngx_http_autocert_main_conf_t;
 
 

@@ -33,8 +33,14 @@ certificate from an ACME CA (Let's Encrypt by default) for that vhost's
 > limited)** the module honours its **`Retry-After`** header — holding the name
 > exactly that long (taking the later of the backoff and the CA's request)
 > instead of guessing. Verified end-to-end against Pebble (and a mock CA for
-> 429) in CI. Still ahead: TLS-ALPN-01 (M10) and a packaged Debian sub-package
-> (M11).
+> 429) in CI. M10 adds **TLS-ALPN-01** (RFC 8737, port-80-free validation): M10a
+> builds the challenge certificate (SAN + critical `id-pe-acmeIdentifier`), and
+> **M10b wires the serve path** — when a client negotiates ALPN `acme-tls/1`
+> with an SNI we have a pending challenge for, the handshake serves that
+> challenge certificate (from a shared store the helper writes) instead of the
+> real one; every other client still gets nginx's normal h2/http negotiation and
+> the per-SNI cert. Still ahead: M10c (order wiring + full Pebble tls-alpn-01
+> issuance) and a packaged Debian sub-package (M11).
 
 ## Directives
 

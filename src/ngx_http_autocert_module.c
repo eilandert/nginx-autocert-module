@@ -21,6 +21,7 @@
 
 #include "ngx_http_autocert_conf.h"
 #include "ngx_autocert_challenge.h"
+#include "ngx_autocert_alpn.h"
 #include "ngx_autocert_serve.h"
 
 
@@ -31,6 +32,10 @@
 
 /* Challenge token store zone: small; one node per in-flight authorization. */
 #define NGX_HTTP_AUTOCERT_CHALLENGE_ZONE_SIZE  (128 * 1024)
+
+/* tls-alpn-01 challenge-cert store zone (M10b): a cert+key PEM per in-flight
+ * authorization — larger entries than the token store, still few of them. */
+#define NGX_HTTP_AUTOCERT_ALPN_ZONE_SIZE  (256 * 1024)
 
 /* Default zone size: enough for a few thousand names; admin-tunable later. */
 #define NGX_HTTP_AUTOCERT_ZONE_SIZE  (256 * 1024)
@@ -57,6 +62,8 @@ static ngx_int_t ngx_http_autocert_init_zone(ngx_shm_zone_t *shm_zone,
     void *data);
 static ngx_int_t ngx_http_autocert_challenge_handler(ngx_http_request_t *r);
 static char *ngx_http_autocert_test_challenge(ngx_conf_t *cf,
+    ngx_command_t *cmd, void *conf);
+static char *ngx_http_autocert_test_alpn(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 
 static char *ngx_http_autocert(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
@@ -158,6 +165,16 @@ static ngx_command_t  ngx_http_autocert_commands[] = {
     { ngx_string("autocert_test_challenge"),
       NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE2,
       ngx_http_autocert_test_challenge,
+      NGX_HTTP_MAIN_CONF_OFFSET,
+      0,
+      NULL },
+
+    /* TEST-ONLY: seed one domain's tls-alpn-01 challenge cert into the ALPN
+     * store at startup (M10b) so the ALPN serve path can be tested before the
+     * order wiring (M10c) exists. Not for production use. */
+    { ngx_string("autocert_test_alpn"),
+      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE2,
+      ngx_http_autocert_test_alpn,
       NGX_HTTP_MAIN_CONF_OFFSET,
       0,
       NULL },
@@ -380,6 +397,29 @@ ngx_http_autocert_postconfig(ngx_conf_t *cf)
     ngx_log_error(NGX_LOG_NOTICE, cf->log, 0,
                   "autocert: %ui name(s) enabled for issuance",
                   amcf->names->nelts);
+
+    /*
+     * M10b: when tls-alpn-01 is the configured challenge (or a test seed is
+     * present), set up the challenge-cert store the helper writes and the
+     * cert_cb reads. Created BEFORE serve_init so the latter sees amcf->alpn_zone
+     * and installs the ALPN selection callback. Reuses its tree across reload
+     * (noreuse off) so an in-flight challenge survives a reconfigure.
+     */
+    if ((amcf->challenge == NGX_HTTP_AUTOCERT_CHALLENGE_TLS_ALPN_01
+         && amcf->names->nelts != 0)
+        || amcf->test_alpn_domain.len != 0)
+    {
+        ngx_str_set(&name, "autocert_tls_alpn");
+
+        amcf->alpn_zone = ngx_shared_memory_add(cf, &name,
+                              NGX_HTTP_AUTOCERT_ALPN_ZONE_SIZE,
+                              &ngx_http_autocert_module);
+        if (amcf->alpn_zone == NULL) {
+            return NGX_ERROR;
+        }
+        amcf->alpn_zone->init = ngx_autocert_alpn_init_zone;
+        amcf->alpn_zone->data = amcf;
+    }
 
     /*
      * M7: install per-SNI cert serving on every enabled ssl server (builds a
@@ -840,6 +880,50 @@ ngx_http_autocert_test_challenge(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     amcf->test_token = value[1];
     amcf->test_keyauth = value[2];
+
+    return NGX_CONF_OK;
+}
+
+
+/*
+ * autocert_test_alpn <domain> <keyauth>;  (TEST-ONLY)
+ *
+ * Records a single domain/keyauth pair in the main conf; the helper builds the
+ * RFC 8737 challenge certificate for it at startup and inserts it into the ALPN
+ * store. Lets CI negotiate ALPN "acme-tls/1" + SNI=<domain> and assert the
+ * acmeIdentifier cert is served, without running a real ACME order. Bounded to
+ * the same limits the store enforces.
+ */
+static char *
+ngx_http_autocert_test_alpn(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_autocert_main_conf_t  *amcf = conf;
+    ngx_str_t                      *value = cf->args->elts;
+
+    if (amcf->test_alpn_domain.len != 0) {
+        return "is duplicate";
+    }
+
+    if (value[1].len == 0 || value[1].len > NGX_AUTOCERT_ALPN_DOMAIN_MAX
+        || value[2].len == 0 || value[2].len > NGX_AUTOCERT_KEYAUTH_MAX)
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "invalid domain/keyauth length in "
+                           "\"autocert_test_alpn\"");
+        return NGX_CONF_ERROR;
+    }
+
+    if (value[1].data[0] == '.'
+        || ngx_strlchr(value[1].data, value[1].data + value[1].len, '/')
+           != NULL)
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "invalid domain in \"autocert_test_alpn\"");
+        return NGX_CONF_ERROR;
+    }
+
+    amcf->test_alpn_domain = value[1];
+    amcf->test_alpn_keyauth = value[2];
 
     return NGX_CONF_OK;
 }

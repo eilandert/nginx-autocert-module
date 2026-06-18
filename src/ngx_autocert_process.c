@@ -42,6 +42,7 @@
 #include "ngx_autocert_acme.h"
 #include "ngx_autocert_account.h"
 #include "ngx_autocert_challenge.h"
+#include "ngx_autocert_alpn.h"
 #include "ngx_autocert_order.h"
 #include "ngx_http_autocert_crypto.h"
 
@@ -81,6 +82,7 @@ static ngx_pool_t                  *ngx_autocert_account_pool;
 static ngx_autocert_order_t        *ngx_autocert_order;
 static ngx_pool_t                  *ngx_autocert_order_pool;
 static ngx_uint_t                   ngx_autocert_test_seeded;
+static ngx_uint_t                   ngx_autocert_test_alpn_seeded;
 
 
 static ngx_core_module_t  ngx_autocert_process_module_ctx = {
@@ -676,6 +678,53 @@ ngx_autocert_kick_handler(ngx_event_t *ev)
         } else {
             ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
                           "autocert: failed to seed test challenge token");
+        }
+    }
+
+    /* TEST-ONLY (M10b): build the tls-alpn-01 challenge cert for the configured
+     * domain once and seed it into the ALPN store, so the worker's ALPN serve
+     * path can be exercised before the order wiring (M10c) exists. */
+    if (!ngx_autocert_test_alpn_seeded
+        && acf.alpn_zone != NULL && acf.test_alpn_domain.len != 0)
+    {
+        EVP_PKEY    *akey;
+        X509        *acert;
+        ngx_pool_t  *atmp;
+        ngx_str_t    acert_pem, akey_pem;
+
+        ngx_autocert_test_alpn_seeded = 1;
+
+        atmp = ngx_create_pool(4096, cycle->log);
+        akey = ngx_http_autocert_key_generate(acf.key_type);
+        acert = NULL;
+
+        if (atmp != NULL && akey != NULL) {
+            acert = ngx_http_autocert_acme_tls_cert(akey,
+                        &acf.test_alpn_domain, &acf.test_alpn_keyauth);
+        }
+
+        if (acert != NULL
+            && ngx_http_autocert_cert_to_pem(atmp, acert, &acert_pem) == NGX_OK
+            && ngx_http_autocert_key_to_pem(atmp, akey, &akey_pem) == NGX_OK
+            && ngx_autocert_alpn_set(acf.alpn_zone, &acf.test_alpn_domain,
+                                     &acert_pem, &akey_pem) == NGX_OK)
+        {
+            ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
+                          "autocert: seeded test tls-alpn-01 cert for \"%V\"",
+                          &acf.test_alpn_domain);
+        } else {
+            ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
+                          "autocert: failed to seed test tls-alpn-01 cert");
+        }
+
+        if (acert != NULL) {
+            X509_free(acert);
+        }
+        if (akey != NULL) {
+            ngx_http_autocert_key_free(akey);
+        }
+        if (atmp != NULL) {
+            ngx_destroy_pool(atmp);
         }
     }
 

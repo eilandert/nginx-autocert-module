@@ -187,6 +187,45 @@ ngx_http_autocert_key_to_pem(ngx_pool_t *pool, EVP_PKEY *pkey, ngx_str_t *out)
 
 
 ngx_int_t
+ngx_http_autocert_cert_to_pem(ngx_pool_t *pool, X509 *cert, ngx_str_t *out)
+{
+    BIO      *bio;
+    char     *data;
+    long      len;
+    u_char   *buf;
+
+    bio = BIO_new(BIO_s_mem());
+    if (bio == NULL) {
+        return NGX_ERROR;
+    }
+
+    if (PEM_write_bio_X509(bio, cert) != 1) {
+        BIO_free(bio);
+        return NGX_ERROR;
+    }
+
+    len = BIO_get_mem_data(bio, &data);
+    if (len <= 0) {
+        BIO_free(bio);
+        return NGX_ERROR;
+    }
+
+    buf = ngx_pnalloc(pool, len);
+    if (buf == NULL) {
+        BIO_free(bio);
+        return NGX_ERROR;
+    }
+
+    ngx_memcpy(buf, data, len);
+    out->data = buf;
+    out->len = len;
+
+    BIO_free(bio);
+    return NGX_OK;
+}
+
+
+ngx_int_t
 ngx_http_autocert_key_from_pem(ngx_str_t *pem, EVP_PKEY **out)
 {
     BIO       *bio;
