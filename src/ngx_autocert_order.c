@@ -1,8 +1,9 @@
 /*
- * ngx_autocert_order — ACME order + authorization flow (M6a). See the header
- * for the contract. A chained state machine over the live account's kid-signed
- * POST primitive (ngx_autocert_account_post) plus one unauthenticated GET for
- * the directory's newOrder URL. Any failure funnels to _finish(NGX_ERROR).
+ * ngx_autocert_order — ACME order + authorization + issuance flow (M6a/M6b).
+ * See the header for the contract. A chained state machine over the live
+ * account's kid-signed POST primitive (ngx_autocert_account_post) plus one
+ * unauthenticated GET for the directory's newOrder URL. Any failure funnels to
+ * _finish(NGX_ERROR).
  */
 
 #include "ngx_autocert_order.h"
@@ -10,12 +11,20 @@
 #include "ngx_autocert_json.h"
 #include "ngx_autocert_challenge.h"
 #include "ngx_http_autocert_crypto.h"
+#include "ngx_http_autocert_conf.h"     /* key-type enum mapping */
+
+#include <fcntl.h>
+#include <sys/stat.h>
 
 
 /* Authorization poll: up to ~30 tries, 1s apart (Pebble validates fast; real
  * CAs take a few seconds). */
 #define NGX_AUTOCERT_ORDER_POLL_MAX     30
 #define NGX_AUTOCERT_ORDER_POLL_DELAY   1000    /* ms */
+
+/* Order (finalize) poll: same budget. */
+#define NGX_AUTOCERT_ORDER_FIN_POLL_MAX 30
+#define NGX_AUTOCERT_ORDER_FIN_DELAY    1000    /* ms */
 
 
 static void ngx_autocert_order_directory_done(
@@ -32,6 +41,21 @@ static void ngx_autocert_order_respond_done(
 static void ngx_autocert_order_poll_timer(ngx_event_t *ev);
 static void ngx_autocert_order_poll_done(
     ngx_autocert_acme_request_t *req, ngx_int_t rc);
+static ngx_int_t ngx_autocert_order_finalize(ngx_autocert_order_t *order);
+static void ngx_autocert_order_finalize_done(
+    ngx_autocert_acme_request_t *req, ngx_int_t rc);
+static void ngx_autocert_order_poll_order_timer(ngx_event_t *ev);
+static void ngx_autocert_order_poll_order_done(
+    ngx_autocert_acme_request_t *req, ngx_int_t rc);
+static ngx_int_t ngx_autocert_order_download(ngx_autocert_order_t *order);
+static void ngx_autocert_order_download_done(
+    ngx_autocert_acme_request_t *req, ngx_int_t rc);
+static ngx_int_t ngx_autocert_order_store(ngx_autocert_order_t *order);
+static ngx_int_t ngx_autocert_order_domain_safe(ngx_str_t *domain);
+static u_char *ngx_autocert_order_tmp_path(ngx_autocert_order_t *order,
+    u_char *path);
+static ngx_int_t ngx_autocert_order_write_tmp(ngx_autocert_order_t *order,
+    u_char *tmp, ngx_str_t *data, ngx_uint_t mode);
 static void ngx_autocert_order_finish(ngx_autocert_order_t *order,
     ngx_int_t rc);
 static ngx_int_t ngx_autocert_order_dup(ngx_autocert_order_t *order,
@@ -494,7 +518,20 @@ ngx_autocert_order_poll_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
         ngx_log_error(NGX_LOG_NOTICE, order->log, 0,
                       "autocert: authorization for \"%V\" is valid",
                       &order->domain);
-        ngx_autocert_order_finish(order, NGX_OK);
+
+        /* M6a step 6: token no longer needed once validation completed. */
+        if (order->challenge_set && order->challenge_zone != NULL
+            && order->token.len != 0)
+        {
+            (void) ngx_autocert_challenge_remove(order->challenge_zone,
+                                                 &order->token);
+            order->challenge_set = 0;
+        }
+
+        /* M6b: finalize the order with a CSR. */
+        if (ngx_autocert_order_finalize(order) != NGX_OK) {
+            ngx_autocert_order_finish(order, NGX_ERROR);
+        }
         return;
     }
 
@@ -510,6 +547,489 @@ ngx_autocert_order_poll_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
 }
 
 
+/*
+ * M6b step 7: generate a fresh certificate key, build a CSR with SAN=domain,
+ * and POST it to the finalize URL. base64url(DER(CSR)) goes in {"csr":…}.
+ */
+static ngx_int_t
+ngx_autocert_order_finalize(ngx_autocert_order_t *order)
+{
+    ngx_str_t   csr_der, csr_b64, payload;
+    u_char     *p;
+    ngx_uint_t  curve;
+
+    if (order->finalize_url.len == 0) {
+        ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                      "autocert: order has no finalize URL");
+        return NGX_ERROR;
+    }
+
+    /* key_type enum (P256=0/P384=1) maps 1:1 onto the crypto curve enum. */
+    curve = (order->key_type == NGX_HTTP_AUTOCERT_KEY_P384)
+            ? NGX_HTTP_AUTOCERT_CRYPTO_P384
+            : NGX_HTTP_AUTOCERT_CRYPTO_P256;
+
+    order->cert_key = ngx_http_autocert_key_generate(curve);
+    if (order->cert_key == NULL) {
+        ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                      "autocert: certificate key generation failed");
+        return NGX_ERROR;
+    }
+
+    /* PEM now (in the order pool) — needed at store time, and the key handle is
+     * freed in _free; capturing the PEM up front decouples the two. */
+    if (ngx_http_autocert_key_to_pem(order->pool, order->cert_key,
+                                     &order->cert_key_pem)
+        != NGX_OK)
+    {
+        ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                      "autocert: certificate key PEM failed");
+        return NGX_ERROR;
+    }
+
+    if (ngx_http_autocert_csr_der(order->pool, order->cert_key, &order->domain,
+                                  &csr_der)
+        != NGX_OK)
+    {
+        ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                      "autocert: CSR build failed for \"%V\"", &order->domain);
+        return NGX_ERROR;
+    }
+
+    if (ngx_http_autocert_base64url_encode(order->pool, &csr_der, &csr_b64)
+        != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+
+    /* payload = {"csr":"<b64url>"} */
+    payload.len = sizeof("{\"csr\":\"\"}") - 1 + csr_b64.len;
+    payload.data = ngx_pnalloc(order->pool, payload.len);
+    if (payload.data == NULL) {
+        return NGX_ERROR;
+    }
+    p = ngx_cpymem(payload.data, "{\"csr\":\"", sizeof("{\"csr\":\"") - 1);
+    p = ngx_cpymem(p, csr_b64.data, csr_b64.len);
+    *p++ = '"';
+    *p++ = '}';
+    payload.len = p - payload.data;
+
+    return ngx_autocert_account_post(order->account, &order->finalize_url,
+                                     &payload,
+                                     ngx_autocert_order_finalize_done, order);
+}
+
+
+static void
+ngx_autocert_order_finalize_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
+{
+    ngx_autocert_order_t  *order;
+
+    if (req == NULL) {
+        return;
+    }
+
+    order = req->data;
+
+    /* Finalize returns the order object (200). The order may already be
+     * "valid" with a certificate URL, or still "processing" -> poll. */
+    if (rc != NGX_OK || req->status != 200) {
+        ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                      "autocert: finalize failed, status %ui", req->status);
+        ngx_destroy_pool(req->pool);
+        ngx_autocert_order_finish(order, NGX_ERROR);
+        return;
+    }
+
+    ngx_destroy_pool(req->pool);
+
+    /* Begin polling the order resource for "valid" + certificate URL. */
+    ngx_memzero(&order->order_timer, sizeof(ngx_event_t));
+    order->order_timer.handler = ngx_autocert_order_poll_order_timer;
+    order->order_timer.data = order;
+    order->order_timer.log = order->log;
+    ngx_add_timer(&order->order_timer, NGX_AUTOCERT_ORDER_FIN_DELAY);
+}
+
+
+/* M6b step 8: POST-as-GET the order URL, look for status=valid + certificate. */
+static void
+ngx_autocert_order_poll_order_timer(ngx_event_t *ev)
+{
+    ngx_autocert_order_t  *order = ev->data;
+    ngx_str_t              empty = ngx_null_string;
+
+    if (++order->order_poll_tries > NGX_AUTOCERT_ORDER_FIN_POLL_MAX) {
+        ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                      "autocert: order poll timed out");
+        ngx_autocert_order_finish(order, NGX_ERROR);
+        return;
+    }
+
+    if (ngx_autocert_account_post(order->account, &order->order_url, &empty,
+                                  ngx_autocert_order_poll_order_done, order)
+        != NGX_OK)
+    {
+        ngx_autocert_order_finish(order, NGX_ERROR);
+    }
+}
+
+
+static void
+ngx_autocert_order_poll_order_done(ngx_autocert_acme_request_t *req,
+    ngx_int_t rc)
+{
+    ngx_autocert_order_t       *order;
+    ngx_autocert_json_value_t  *root;
+    ngx_str_t                   status, cert_url;
+    ngx_uint_t                  valid, pending;
+
+    if (req == NULL) {
+        return;
+    }
+
+    order = req->data;
+    valid = 0;
+    pending = 0;
+    ngx_str_null(&cert_url);
+
+    if (rc == NGX_OK && req->status == 200) {
+        root = ngx_autocert_json_parse(req->pool, req->body_out.data,
+                                       req->body_out.len);
+        if (root != NULL
+            && ngx_autocert_json_object_str(root, "status", &status) == NGX_OK)
+        {
+            if (status.len == sizeof("valid") - 1
+                && ngx_strncmp(status.data, "valid", status.len) == 0)
+            {
+                if (ngx_autocert_json_object_str(root, "certificate", &cert_url)
+                    == NGX_OK
+                    && cert_url.len != 0
+                    && ngx_autocert_order_dup(order, &order->cert_url,
+                                              &cert_url) == NGX_OK)
+                {
+                    valid = 1;
+                }
+
+            } else if ((status.len == sizeof("pending") - 1
+                        && ngx_strncmp(status.data, "pending", status.len)
+                           == 0)
+                       || (status.len == sizeof("processing") - 1
+                           && ngx_strncmp(status.data, "processing",
+                                          status.len) == 0)
+                       || (status.len == sizeof("ready") - 1
+                           && ngx_strncmp(status.data, "ready",
+                                          status.len) == 0))
+            {
+                pending = 1;
+            }
+            /* "invalid" or anything else -> fail */
+        }
+    }
+
+    ngx_destroy_pool(req->pool);
+
+    if (valid) {
+        if (ngx_autocert_order_download(order) != NGX_OK) {
+            ngx_autocert_order_finish(order, NGX_ERROR);
+        }
+        return;
+    }
+
+    if (!pending) {
+        ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                      "autocert: order did not become valid");
+        ngx_autocert_order_finish(order, NGX_ERROR);
+        return;
+    }
+
+    ngx_add_timer(&order->order_timer, NGX_AUTOCERT_ORDER_FIN_DELAY);
+}
+
+
+/* M6b step 9: POST-as-GET the certificate URL -> PEM chain in the body. */
+static ngx_int_t
+ngx_autocert_order_download(ngx_autocert_order_t *order)
+{
+    ngx_str_t  empty = ngx_null_string;
+
+    return ngx_autocert_account_post(order->account, &order->cert_url, &empty,
+                                     ngx_autocert_order_download_done, order);
+}
+
+
+static void
+ngx_autocert_order_download_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
+{
+    ngx_autocert_order_t  *order;
+
+    if (req == NULL) {
+        return;
+    }
+
+    order = req->data;
+
+    if (rc != NGX_OK || req->status != 200 || req->body_out.len == 0) {
+        ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                      "autocert: certificate download failed, status %ui",
+                      req->status);
+        ngx_destroy_pool(req->pool);
+        ngx_autocert_order_finish(order, NGX_ERROR);
+        return;
+    }
+
+    /* Copy the PEM chain into the order pool (req pool is about to die). */
+    if (ngx_autocert_order_dup(order, &order->cert_chain, &req->body_out)
+        != NGX_OK)
+    {
+        ngx_destroy_pool(req->pool);
+        ngx_autocert_order_finish(order, NGX_ERROR);
+        return;
+    }
+
+    ngx_destroy_pool(req->pool);
+
+    /* M6b step 10: persist to disk. */
+    if (ngx_autocert_order_store(order) != NGX_OK) {
+        ngx_autocert_order_finish(order, NGX_ERROR);
+        return;
+    }
+
+    ngx_log_error(NGX_LOG_NOTICE, order->log, 0,
+                  "autocert: certificate issued and stored for \"%V\"",
+                  &order->domain);
+    ngx_autocert_order_finish(order, NGX_OK);
+}
+
+
+/*
+ * Reject any domain that could escape store_path when used as a path segment.
+ * Upstream name collection already drops empty/leading-dot/wildcard names, but
+ * not a configured name containing '/' or a "." / ".." segment, so guard here
+ * before it becomes a filesystem path. Only NUL is otherwise unsafe.
+ */
+static ngx_int_t
+ngx_autocert_order_domain_safe(ngx_str_t *domain)
+{
+    size_t  i;
+
+    if (domain->len == 0) {
+        return NGX_ERROR;
+    }
+    if ((domain->len == 1 && domain->data[0] == '.')
+        || (domain->len == 2 && domain->data[0] == '.'
+            && domain->data[1] == '.'))
+    {
+        return NGX_ERROR;
+    }
+    for (i = 0; i < domain->len; i++) {
+        if (domain->data[i] == '/' || domain->data[i] == '\0') {
+            return NGX_ERROR;
+        }
+    }
+    return NGX_OK;
+}
+
+
+/* Allocate "<path>.tmp" (NUL-terminated) in the order pool. */
+static u_char *
+ngx_autocert_order_tmp_path(ngx_autocert_order_t *order, u_char *path)
+{
+    u_char  *tmp, *p;
+    size_t   plen;
+
+    plen = ngx_strlen(path);
+    tmp = ngx_pnalloc(order->pool, plen + sizeof(".tmp"));
+    if (tmp == NULL) {
+        return NULL;
+    }
+    p = ngx_cpymem(tmp, path, plen);
+    ngx_memcpy(p, ".tmp", sizeof(".tmp"));
+    return tmp;
+}
+
+
+/*
+ * M6b step 10: store the cert key + fullchain under store_path/<domain>/.
+ * Secure layout (M7 will add the certbot layout): the per-domain directory is
+ * 0700, privkey.pem 0600, fullchain.pem 0644. Both files are written to .tmp
+ * siblings (fsync'd), then rename()d back-to-back so a reader never sees a
+ * half-written file and the key/chain pair flips as close to atomically as a
+ * two-file store allows. On a failure after the key has already been renamed,
+ * the new chain temp is left behind (logged) — renewal will redo both.
+ */
+static ngx_int_t
+ngx_autocert_order_store(ngx_autocert_order_t *order)
+{
+    u_char       *dir, *key_path, *chain_path, *key_tmp, *chain_tmp, *p;
+    size_t        base;
+    struct stat   st;
+
+    if (order->store_path.len == 0) {
+        ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                      "autocert: no store path configured");
+        return NGX_ERROR;
+    }
+
+    if (ngx_autocert_order_domain_safe(&order->domain) != NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                      "autocert: refusing unsafe domain \"%V\" as a path",
+                      &order->domain);
+        return NGX_ERROR;
+    }
+
+    /* store_path "/" domain "\0" */
+    base = order->store_path.len + 1 + order->domain.len + 1;
+
+    dir = ngx_pnalloc(order->pool, base);
+    if (dir == NULL) {
+        return NGX_ERROR;
+    }
+    p = ngx_cpymem(dir, order->store_path.data, order->store_path.len);
+    *p++ = '/';
+    p = ngx_cpymem(p, order->domain.data, order->domain.len);
+    *p = '\0';
+
+    if (mkdir((char *) dir, 0700) == -1 && errno != EEXIST) {
+        ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
+                      "autocert: mkdir(\"%s\") failed", dir);
+        return NGX_ERROR;
+    }
+
+    /* The per-domain dir must be a real directory we own, not a symlink an
+     * attacker pre-created to redirect the cert/key writes (O_NOFOLLOW only
+     * guards the leaf temp file, not the parent dir component). */
+    if (lstat((char *) dir, &st) == -1) {
+        ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
+                      "autocert: lstat(\"%s\") failed", dir);
+        return NGX_ERROR;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                      "autocert: store path \"%s\" is not a directory", dir);
+        return NGX_ERROR;
+    }
+
+    /* dir "/privkey.pem\0" and "/fullchain.pem\0" */
+    key_path = ngx_pnalloc(order->pool, base - 1 + sizeof("/privkey.pem"));
+    chain_path = ngx_pnalloc(order->pool, base - 1 + sizeof("/fullchain.pem"));
+    if (key_path == NULL || chain_path == NULL) {
+        return NGX_ERROR;
+    }
+    p = ngx_cpymem(key_path, dir, base - 1);   /* without the NUL */
+    ngx_memcpy(p, "/privkey.pem", sizeof("/privkey.pem"));
+    p = ngx_cpymem(chain_path, dir, base - 1);
+    ngx_memcpy(p, "/fullchain.pem", sizeof("/fullchain.pem"));
+
+    key_tmp = ngx_autocert_order_tmp_path(order, key_path);
+    chain_tmp = ngx_autocert_order_tmp_path(order, chain_path);
+    if (key_tmp == NULL || chain_tmp == NULL) {
+        return NGX_ERROR;
+    }
+
+    /* Write + fsync both temps BEFORE either rename, so a write failure leaves
+     * the live cert/key untouched. */
+    if (ngx_autocert_order_write_tmp(order, key_tmp, &order->cert_key_pem, 0600)
+        != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+    if (ngx_autocert_order_write_tmp(order, chain_tmp, &order->cert_chain, 0644)
+        != NGX_OK)
+    {
+        (void) unlink((char *) key_tmp);
+        return NGX_ERROR;
+    }
+
+    /* Commit. Key first then chain (back-to-back; no I/O between). */
+    if (rename((char *) key_tmp, (char *) key_path) == -1) {
+        ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
+                      "autocert: rename(\"%s\") failed", key_tmp);
+        (void) unlink((char *) key_tmp);
+        (void) unlink((char *) chain_tmp);
+        return NGX_ERROR;
+    }
+    if (rename((char *) chain_tmp, (char *) chain_path) == -1) {
+        ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
+                      "autocert: rename(\"%s\") failed (key already committed, "
+                      "renewal will reconcile)", chain_tmp);
+        (void) unlink((char *) chain_tmp);
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+
+/* Write data to an already-built <tmp> path (mode), force perms, fsync, close.
+ * Leaves the temp in place for the caller to rename; unlinks it on failure. */
+static ngx_int_t
+ngx_autocert_order_write_tmp(ngx_autocert_order_t *order, u_char *tmp,
+    ngx_str_t *data, ngx_uint_t mode)
+{
+    int      fd;
+    size_t   off;
+    ssize_t  n;
+
+    fd = open((char *) tmp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW,
+              (mode_t) mode);
+    if (fd == -1) {
+        ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
+                      "autocert: open(\"%s\") failed", tmp);
+        return NGX_ERROR;
+    }
+
+    /* O_CREAT honours umask; force the intended perms regardless. */
+    if (fchmod(fd, (mode_t) mode) == -1) {
+        ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
+                      "autocert: fchmod(\"%s\") failed", tmp);
+        (void) close(fd);
+        (void) unlink((char *) tmp);
+        return NGX_ERROR;
+    }
+
+    for (off = 0; off < data->len; off += n) {
+        n = write(fd, data->data + off, data->len - off);
+        if (n == -1) {
+            if (errno == EINTR) {
+                n = 0;
+                continue;
+            }
+            ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
+                          "autocert: write(\"%s\") failed", tmp);
+            (void) close(fd);
+            (void) unlink((char *) tmp);
+            return NGX_ERROR;
+        }
+        if (n == 0) {
+            /* zero progress on a non-empty remainder — fail rather than spin. */
+            ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                          "autocert: write(\"%s\") made no progress", tmp);
+            (void) close(fd);
+            (void) unlink((char *) tmp);
+            return NGX_ERROR;
+        }
+    }
+
+    if (fsync(fd) == -1) {
+        ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
+                      "autocert: fsync(\"%s\") failed", tmp);
+        (void) close(fd);
+        (void) unlink((char *) tmp);
+        return NGX_ERROR;
+    }
+
+    if (close(fd) == -1) {
+        ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
+                      "autocert: close(\"%s\") failed", tmp);
+        (void) unlink((char *) tmp);
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+
 static void
 ngx_autocert_order_finish(ngx_autocert_order_t *order, ngx_int_t rc)
 {
@@ -520,6 +1040,9 @@ ngx_autocert_order_finish(ngx_autocert_order_t *order, ngx_int_t rc)
 
     if (order->poll_timer.timer_set) {
         ngx_del_timer(&order->poll_timer);
+    }
+    if (order->order_timer.timer_set) {
+        ngx_del_timer(&order->order_timer);
     }
 
     /* Step 6: drop the token from the store now the authz is settled. The cert
@@ -551,6 +1074,13 @@ ngx_autocert_order_free(ngx_autocert_order_t *order)
     }
     if (order->poll_timer.timer_set) {
         ngx_del_timer(&order->poll_timer);
+    }
+    if (order->order_timer.timer_set) {
+        ngx_del_timer(&order->order_timer);
+    }
+    if (order->cert_key != NULL) {
+        ngx_http_autocert_key_free(order->cert_key);
+        order->cert_key = NULL;
     }
     if (order->pool) {
         ngx_destroy_pool(order->pool);

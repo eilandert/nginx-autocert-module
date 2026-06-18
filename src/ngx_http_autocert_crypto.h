@@ -105,4 +105,15 @@ ngx_int_t ngx_http_autocert_jws_sign(ngx_pool_t *pool, EVP_PKEY *pkey,
 const char *ngx_http_autocert_jws_alg(EVP_PKEY *pkey);
 
 
+/*
+ * Build a PKCS#10 certificate-signing request for `domain`, signed with the
+ * certificate key `pkey`, and emit its DER bytes into *out (pool-allocated).
+ * The subject is empty; the name lives in a critical subjectAltName (RFC 8555
+ * §7.4 / RFC 5280 §4.2.1.6). Caller base64url-encodes *out for the ACME
+ * finalize request. Returns NGX_OK / NGX_ERROR.
+ */
+ngx_int_t ngx_http_autocert_csr_der(ngx_pool_t *pool, EVP_PKEY *pkey,
+    ngx_str_t *domain, ngx_str_t *out);
+
+
 #endif /* _NGX_HTTP_AUTOCERT_CRYPTO_H_INCLUDED_ */

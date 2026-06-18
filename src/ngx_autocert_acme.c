@@ -30,6 +30,7 @@ static void ngx_autocert_acme_write_handler(ngx_event_t *ev);
 static void ngx_autocert_acme_read_handler(ngx_event_t *ev);
 static ngx_int_t ngx_autocert_acme_parse_response(
     ngx_autocert_acme_request_t *r);
+static ngx_int_t ngx_autocert_acme_dechunk(ngx_autocert_acme_request_t *r);
 static void ngx_autocert_acme_finalize(ngx_autocert_acme_request_t *r,
     ngx_int_t rc);
 
@@ -761,6 +762,16 @@ ngx_autocert_acme_read_handler(ngx_event_t *ev)
                 ngx_autocert_acme_finalize(r, NGX_ERROR);
                 return;
             }
+            /* A chunked body is only complete when the terminating zero chunk
+             * was seen (parse returns NGX_DONE then). EOF before that is a
+             * truncated download, not success. */
+            if (r->chunked) {
+                ngx_log_error(NGX_LOG_ERR, r->log, 0,
+                              "autocert: \"%V\" closed before the final chunk",
+                              &r->host);
+                ngx_autocert_acme_finalize(r, NGX_ERROR);
+                return;
+            }
             /* If a Content-Length was advertised, EOF before it is satisfied is
              * a truncated response, not success. */
             if (r->content_length >= 0
@@ -829,8 +840,9 @@ ngx_autocert_memmem(u_char *hay, size_t n, const char *needle, size_t m)
  * a malformed response (the caller finalizes; this never finalizes itself, so
  * the read loop never touches freed memory after an error). Minimal: status
  * line (HTTP/1.0|1.1 + 3-digit code), headers (Content-Length interpreted,
- * chunked rejected), then body by length. Bodies with no Content-Length are
- * framed by Connection: close and end at EOF (handled in the read handler).
+ * Transfer-Encoding: chunked decoded), then body by length or de-chunked.
+ * Bodies with neither are framed by Connection: close and end at EOF (handled
+ * in the read handler).
  */
 ngx_str_t *
 ngx_autocert_acme_header(ngx_autocert_acme_request_t *r, const char *name)
@@ -976,18 +988,36 @@ ngx_autocert_acme_parse_response(ngx_autocert_acme_request_t *r)
                                           (u_char *) "Transfer-Encoding:",
                                           sizeof("Transfer-Encoding:") - 1) == 0)
             {
-                /* chunked decoding is not implemented; reject rather than
-                 * mis-frame the body. ACME servers send Content-Length. */
-                ngx_log_error(NGX_LOG_ERR, r->log, 0,
-                              "autocert: unsupported Transfer-Encoding from "
-                              "\"%V\"", &r->host);
-                return NGX_ERROR;
+                u_char  *v = line + sizeof("Transfer-Encoding:") - 1;
+
+                while (v < eol && (*v == ' ' || *v == '\t')) v++;
+
+                /* Only "chunked" is supported (some ACME servers — Pebble — use
+                 * it for the certificate download). Any other coding is
+                 * rejected rather than mis-framed. */
+                if ((size_t) (eol - v) == sizeof("chunked") - 1
+                    && ngx_strncasecmp(v, (u_char *) "chunked",
+                                       sizeof("chunked") - 1) == 0)
+                {
+                    r->chunked = 1;
+
+                } else {
+                    ngx_log_error(NGX_LOG_ERR, r->log, 0,
+                                  "autocert: unsupported Transfer-Encoding from "
+                                  "\"%V\"", &r->host);
+                    return NGX_ERROR;
+                }
             }
 
             line = eol + sizeof(CRLF) - 1;
         }
 
         r->headers_done = 1;
+    }
+
+    /* chunked transfer-coding (RFC 7230 §4.1): decode the accumulated body. */
+    if (r->chunked) {
+        return ngx_autocert_acme_dechunk(r);
     }
 
     /* body by Content-Length */
@@ -1004,6 +1034,122 @@ ngx_autocert_acme_parse_response(ngx_autocert_acme_request_t *r)
 
     /* no Content-Length: wait for EOF (handled in read handler) */
     return NGX_AGAIN;
+}
+
+
+/*
+ * Decode a chunked body (RFC 7230 §4.1). Operates on the whole accumulated
+ * body region [body_offset, last) each call — cheap for the small ACME cert
+ * responses. Returns NGX_DONE once the terminating zero-size chunk is seen
+ * (body_out points at a freshly decoded, pool-allocated buffer), NGX_AGAIN if
+ * more bytes are needed, or NGX_ERROR on a malformed framing. Chunk extensions
+ * and trailers are tolerated/ignored; we do not enforce a maximum but the read
+ * buffer growth is already bounded by the client.
+ */
+static ngx_int_t
+ngx_autocert_acme_dechunk(ngx_autocert_acme_request_t *r)
+{
+    ngx_buf_t  *b = r->recv;
+    u_char     *p, *end, *eol, *out, *o;
+    size_t      total, size;
+
+    p = b->start + r->body_offset;
+    end = b->last;
+    total = 0;
+
+    /* First pass: validate framing and sum the decoded size. Bail NGX_AGAIN if
+     * we hit the end of what we have mid-chunk. */
+    for ( ;; ) {
+        eol = ngx_autocert_memmem(p, end - p, CRLF, sizeof(CRLF) - 1);
+        if (eol == NULL) {
+            return NGX_AGAIN;               /* size line not complete yet */
+        }
+
+        /* hex chunk-size, optionally followed by ";ext" */
+        {
+            u_char  *q = p;
+            size = 0;
+
+            if (q == eol) {
+                return NGX_ERROR;           /* empty size line */
+            }
+            for ( ; q < eol; q++) {
+                u_char  c = *q;
+                int     d;
+
+                if (c >= '0' && c <= '9')      d = c - '0';
+                else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+                else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+                else if (c == ';' || c == ' ' || c == '\t') break;  /* ext */
+                else return NGX_ERROR;
+
+                if (size > (NGX_MAX_SIZE_T_VALUE >> 4)) {
+                    return NGX_ERROR;       /* overflow guard */
+                }
+                size = (size << 4) | (size_t) d;
+            }
+        }
+
+        p = eol + sizeof(CRLF) - 1;         /* past the size line */
+
+        if (size == 0) {
+            /* last chunk; a trailing CRLF (after optional trailers) ends it. We
+             * tolerate trailers: require at least the final CRLF is present. */
+            eol = ngx_autocert_memmem(p, end - p, CRLF, sizeof(CRLF) - 1);
+            if (eol == NULL) {
+                return NGX_AGAIN;
+            }
+            break;
+        }
+
+        /* need size bytes + the trailing CRLF. Compare against the available
+         * span without forming size + CRLF (which could wrap for a huge size
+         * and let p escape the buffer). */
+        if ((size_t) (end - p) < sizeof(CRLF) - 1
+            || size > (size_t) (end - p) - (sizeof(CRLF) - 1))
+        {
+            return NGX_AGAIN;
+        }
+        total += size;
+        p += size;
+        if (ngx_memcmp(p, CRLF, sizeof(CRLF) - 1) != 0) {
+            return NGX_ERROR;               /* chunk not CRLF-terminated */
+        }
+        p += sizeof(CRLF) - 1;
+    }
+
+    /* Second pass: copy chunk data into a fresh contiguous buffer. */
+    out = ngx_pnalloc(r->pool, total ? total : 1);
+    if (out == NULL) {
+        return NGX_ERROR;
+    }
+    o = out;
+    p = b->start + r->body_offset;
+    for ( ;; ) {
+        eol = ngx_autocert_memmem(p, end - p, CRLF, sizeof(CRLF) - 1);
+        /* eol is guaranteed non-NULL here (validated in pass 1) */
+        size = 0;
+        {
+            u_char  *q;
+            for (q = p; q < eol; q++) {
+                u_char  c = *q;
+                if (c >= '0' && c <= '9')      size = (size << 4) | (c - '0');
+                else if (c >= 'a' && c <= 'f') size = (size << 4) | (c-'a'+10);
+                else if (c >= 'A' && c <= 'F') size = (size << 4) | (c-'A'+10);
+                else break;
+            }
+        }
+        p = eol + sizeof(CRLF) - 1;
+        if (size == 0) {
+            break;
+        }
+        o = ngx_cpymem(o, p, size);
+        p += size + sizeof(CRLF) - 1;
+    }
+
+    r->body_out.data = out;
+    r->body_out.len = total;
+    return NGX_DONE;
 }
 
 

@@ -1,9 +1,8 @@
 /*
- * ngx_autocert_order — ACME order + authorization flow (M6a).
+ * ngx_autocert_order — ACME order + authorization + issuance flow (M6a/M6b).
  *
- * Drives RFC 8555 issuance up to (but not including) finalization, on the
- * helper process event loop, reusing a LIVE registered account
- * (ngx_autocert_account_t) for every kid-signed POST:
+ * Drives full RFC 8555 issuance on the helper process event loop, reusing a
+ * LIVE registered account (ngx_autocert_account_t) for every kid-signed POST:
  *
  *   1. POST newOrder {identifiers:[{type:dns,value:<name>}]}
  *        -> order URL (Location), authorizations[], finalize URL
@@ -14,15 +13,20 @@
  *   4. POST the challenge url {} to tell the CA we are ready
  *   5. poll the authorization (POST-as-GET) until status=="valid"
  *      (or "invalid"/"deactivated"/"revoked"/"expired" -> fail)
- *   6. challenge store REMOVE token
+ *   6. challenge store REMOVE token                              <-- M6a ends
+ *   7. generate a fresh ECDSA certificate key (key_type), build a CSR with
+ *      SAN=<name> [M3], POST finalize {csr}                      <-- M6b
+ *   8. poll the order (POST-as-GET) until status=="valid", read certificate URL
+ *   9. POST-as-GET the certificate URL -> PEM chain
+ *  10. store cert key + fullchain to disk under store_path/<domain>/ (0600 key,
+ *      atomic temp+rename)
  *
- * M6a handles exactly ONE identifier (the first collected server name). The
- * order URL + finalize URL + the validated CSR are what M6b consumes to finish
- * issuance, so they are exposed on the order struct after a successful run.
+ * M6a/M6b handle exactly ONE identifier (the first collected server name).
+ * Multi-name iteration is a later milestone.
  *
  * Single in-flight order per helper. The caller allocates the order struct,
- * fills the inputs, and is notified once via the handler with NGX_OK (authz
- * valid; order_url/finalize_url set) or NGX_ERROR.
+ * fills the inputs, and is notified once via the handler with NGX_OK (cert
+ * issued + stored) or NGX_ERROR.
  */
 
 #ifndef _NGX_AUTOCERT_ORDER_H_INCLUDED_
@@ -31,6 +35,8 @@
 
 #include <ngx_config.h>
 #include <ngx_core.h>
+
+#include <openssl/evp.h>
 
 #include "ngx_autocert_account.h"
 
@@ -48,11 +54,13 @@ struct ngx_autocert_order_s {
     ngx_str_t                        directory_url;  /* ACME directory */
     ngx_str_t                        domain;         /* identifier (one) */
     ngx_shm_zone_t                  *challenge_zone; /* M5 token store */
+    ngx_uint_t                       key_type;       /* cert key curve (M6b) */
+    ngx_str_t                        store_path;     /* cert store dir (M6b) */
 
     ngx_autocert_order_handler_pt    handler;
     void                            *data;
 
-    /* outputs (valid on handler NGX_OK) — consumed by M6b */
+    /* outputs (valid on handler NGX_OK) */
     ngx_str_t                        order_url;      /* order resource URL */
     ngx_str_t                        finalize_url;   /* finalize endpoint */
 
@@ -63,10 +71,18 @@ struct ngx_autocert_order_s {
     ngx_str_t                        challenge_url;    /* http-01 challenge */
     ngx_str_t                        token;            /* http-01 token */
     ngx_str_t                        keyauth;          /* token.thumbprint */
-    ngx_uint_t                       poll_tries;
+    ngx_uint_t                       poll_tries;       /* authz poll counter */
+    ngx_uint_t                       order_poll_tries; /* order poll counter */
     ngx_uint_t                       challenge_set;    /* token in store? */
     ngx_uint_t                       done;
-    ngx_event_t                      poll_timer;
+    ngx_event_t                      poll_timer;       /* authz polling */
+    ngx_event_t                      order_timer;      /* order polling (M6b) */
+
+    /* M6b issuance state */
+    EVP_PKEY                        *cert_key;        /* fresh cert key */
+    ngx_str_t                        cert_key_pem;     /* PEM of cert_key */
+    ngx_str_t                        cert_url;         /* download URL */
+    ngx_str_t                        cert_chain;       /* PEM fullchain */
 };
 
 
