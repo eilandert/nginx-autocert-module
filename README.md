@@ -3,175 +3,201 @@
 [![Build & Test](https://github.com/eilandert/nginx-autocert-module/actions/workflows/build-test.yml/badge.svg)](https://github.com/eilandert/nginx-autocert-module/actions/workflows/build-test.yml)
 [![Valgrind](https://github.com/eilandert/nginx-autocert-module/actions/workflows/valgrind.yml/badge.svg)](https://github.com/eilandert/nginx-autocert-module/actions/workflows/valgrind.yml)
 
-NGINX dynamic module for **automatic ACME certificate provisioning**. Declare
-`autocert on;` on a vhost (or globally) and the module obtains and renews a
+**Automatic TLS certificates for NGINX — built into the server.**
+
+Write `autocert on;` on a vhost and NGINX obtains, serves, and renews a
 certificate from an ACME CA (Let's Encrypt by default) for that vhost's
-`server_name`s — no certbot, no cron, no manual key handling.
+`server_name`s. No certbot, no cron, no deploy hook, no reload. The list of
+domains *is* your existing config.
 
-- **ECDSA keys only** (P-384 default, no RSA) — strongest widely-trusted certs.
-- **Per-vhost or global** — a `server{}` setting overrides the `http{}` global.
-- **Privilege-separated** — keys live in a dedicated helper process, never in
-  workers; the on-disk store is root-only (or certbot-compatible) by choice.
-- **No config reload on renewal** — certificates are loaded per-SNI at the TLS
-  handshake and hot-reload the instant a renewal rewrites the files.
-- **HTTP-01 and TLS-ALPN-01** challenges — the latter validates with **no port
-  80 listener** anywhere.
-- Builds and runs on both **nginx** and **angie**.
+- **No certbot, no cron** — a complete ACME client runs inside NGINX itself.
+- **No reload on renewal** — certs load per-SNI at the TLS handshake and
+  hot-swap the instant a renewal rewrites the file. Zero downtime.
+- **Privilege-separated** — a dedicated helper process holds every private key;
+  workers never touch key material.
+- **ECDSA only** (P-384 default, P-256 optional) — no RSA.
+- **HTTP-01 and TLS-ALPN-01** — the latter validates with **no port 80** open.
+- **Builds on nginx and Angie** (Angie is compile-checked only — it has its own
+  native `acme`).
 
-## How it works
+> 📖 New here? Read the walkthrough:
+> **[Automatic TLS Certs, No Certbot](https://deb.myguard.nl/2026/06/nginx-autocert-module-automatic-acme-certificates/)**
+> on deb.myguard.nl.
 
-`autocert on;` on a `listen ... ssl;` vhost is all that's required — **no
-`ssl_certificate` line**. The module:
+---
 
-1. **Brings the listener up immediately** with a self-signed bootstrap
-   certificate, so a config with no real cert still starts.
-2. **Provisions a certificate** from the ACME CA (Let's Encrypt by default) for
-   every concrete `server_name` on that vhost. A single privilege-separated
-   **helper process** — spawned by the master, the only process that ever holds
-   the account and certificate keys — runs the full RFC 8555 order flow:
-   newAccount → newOrder → authorization → challenge (HTTP-01 or TLS-ALPN-01) →
-   finalize (ECDSA CSR) → download → store.
-3. **Serves the real certificate per-SNI** at the TLS handshake once issued,
-   transparently replacing the bootstrap cert. The store is hot-reloaded by
-   `mtime`, so a renewal takes effect with **no config reload and no downtime**.
-4. **Renews automatically.** A scheduler on the helper reads each stored
-   certificate's `notAfter` and reissues once it enters the
-   `autocert_renew_before` window (default 7d).
+## Quick start
 
-**Robustness.** A name that fails to provision is held off with an exponential
-per-name backoff (60s, doubling, capped at 1h) so it is never hammered. When the
-CA replies **HTTP 429**, the module honours the **`Retry-After`** header (taking
-the later of the backoff and the CA's request) instead of guessing. Account-
-registration and challenge POSTs retry once on a stale `badNonce`.
-
-**Challenge types.** HTTP-01 is served transparently on port 80 (no `location`
-block needed). With `autocert_challenge tls-alpn-01;` validation happens entirely
-inside the TLS handshake (RFC 8737): when a client negotiates ALPN `acme-tls/1`
-for a name with a pending challenge, the handshake serves the challenge
-certificate (critical `id-pe-acmeIdentifier`); every other client gets normal
-h2/http negotiation and the per-SNI cert. This needs **no port 80 listener**.
-
-The whole flow is verified end-to-end against [Pebble](https://github.com/letsencrypt/pebble)
-in CI on both nginx (mainline + stable) and angie, for HTTP-01 and TLS-ALPN-01.
-
-## Directives
-
-### `autocert on|off [email];`
-
-Valid in `http` (global) and `server` (per-vhost). Optional `email` is the ACME
-account contact. A per-vhost value overrides the global one.
-
-```nginx
-http {
-    autocert on admin@example.com;     # global default for all vhosts
-
-    server {
-        listen 443 ssl;
-        server_name a.example.com www.a.example.com;
-        autocert on;                   # both names provisioned
-    }
-
-    server {
-        listen 443 ssl;
-        server_name c.example.com;
-        ssl_certificate /etc/ssl/c.crt;  # real cert -> overridden per-SNI;
-        ssl_certificate_key /etc/ssl/c.key;  # kept as the fallback
-        autocert off;                    # opt this vhost out (real cert needed)
-    }
-}
-```
-
-> The no-`ssl_certificate` bootstrap is seeded for a **server-level**
-> `autocert on` (the form above). A vhost enabled only by the `http`-level
-> global `autocert on` still needs its own `autocert on;` line (or an
-> `ssl_certificate`) to serve TLS — the global sets the issuance default but
-> does not seed every inherited vhost's TLS context.
-
-A `listen ... ssl;` server with `autocert on` needs **no `ssl_certificate`**:
-the module gives it a self-signed bootstrap certificate so the listener starts,
-then serves the real certificate per-SNI once issued (and on every renewal,
-with no reload). If you *do* set `ssl_certificate`, it is kept as the
-pre-issuance fallback and overridden per-SNI. Two combinations are rejected at
-config time: a `listen ssl;` server with **`autocert off` and no
-`ssl_certificate`** (nothing would serve it), and `autocert on` together with a
-**variable** `ssl_certificate` (e.g. `ssl_certificate $var;` — the module
-can't honour the dynamic lookup).
-
-### Global tuning knobs
-
-These are `http{}`-only (a single ACME policy for the instance):
-
-```nginx
-autocert_ca <url>;                  # ACME directory URL
-                                    #   default: Let's Encrypt production
-autocert_renew_before 7d;           # renew this long before expiry (default 7d)
-autocert_key_type secp384r1;        # secp384r1 (default) | secp256r1 — ECDSA only
-autocert_store secure|certbot;      # secure = 0700 root-only (default)
-                                    #   certbot = live/ + archive/ symlink layout
-autocert_path <dir>;                # store location (default: autocert)
-autocert_challenge http-01|tls-alpn-01;  # default: http-01
-
-# Outbound ACME transport (used by the helper to reach the CA):
-autocert_resolver 1.1.1.1 8.8.8.8;       # DNS server(s) to resolve the CA host.
-                                         #   If unset, the http{}-level `resolver`
-                                         #   directive is used as a fallback;
-                                         #   one of the two is required to reach
-                                         #   a CA by name.
-autocert_resolver_timeout 30s;           # DNS query timeout (default 30s)
-autocert_ca_certificate <file>;          # PEM trust bundle to verify the CA
-                                         #   (default: system trust store —
-                                         #   correct for Let's Encrypt; set this
-                                         #   only for a private/test CA, e.g.
-                                         #   Pebble)
-```
-
-> The ACME server's certificate is **always verified** (hostname + chain). With
-> no `autocert_ca_certificate` the system CA store is used; a private CA (such as
-> Pebble for testing) must be supplied explicitly.
-
-### Which names get provisioned
-
-For every vhost with `autocert on`, the module collects its concrete
-`server_name`s (deduplicated across vhosts). **Skipped**: vhosts set `autocert
-off`, the empty catch-all `""`, and wildcard (`*.x` / `.x`) or regex (`~…`)
-`server_name`s — a single ACME order can't cover those (DNS-01 wildcard support
-is deferred). The resolved name set is published to a shared-memory zone for the
-ACME helper to consume.
-
-## Architecture
-
-- A single **helper process** (master-spawned) runs the ACME state machine and
-  holds the account + certificate private keys. Workers never touch keys.
-- The helper reaches the CA over a verified TLS connection (its own resolver +
-  HTTP/1.1 client); challenge tokens and cert state pass to workers through a
-  shared-memory zone.
-- HTTP-01 challenges are served **transparently** on port 80 (no location
-  block needed); TLS-ALPN-01 needs no port 80 at all.
-- Certificates are loaded **per-SNI at TLS handshake** from the store, so renewal
-  needs no config reload.
-
-## Build
-
-The addon ships **two** dynamic modules — `ngx_autocert_process_module` (CORE,
-the helper) and `ngx_http_autocert_module` (HTTP, directives + serving):
+**1. Build the two modules** against your nginx source:
 
 ```sh
 cd nginx-<version>
 ./configure --with-compat --with-http_ssl_module \
     --add-dynamic-module=/path/to/nginx-autocert-module
 make modules
-# -> objs/ngx_autocert_process_module.so
-#    objs/ngx_http_autocert_module.so
+# -> objs/ngx_autocert_process_module.so   (the helper)
+#    objs/ngx_http_autocert_module.so       (directives + serving)
 ```
 
-Load **both**, helper first:
+**2. Load both** (helper first) and turn it on:
 
 ```nginx
 load_module modules/ngx_autocert_process_module.so;
 load_module modules/ngx_http_autocert_module.so;
+
+events {}
+
+http {
+    resolver 1.1.1.1;                    # the helper needs DNS to reach the CA
+    autocert on admin@example.com;       # ACME account contact
+
+    server {
+        listen 443 ssl;
+        server_name example.com www.example.com;
+        autocert on;                     # both names get a certificate
+        # note: no ssl_certificate needed
+    }
+}
 ```
+
+That's it. The listener starts behind a self-signed bootstrap certificate, the
+helper provisions the real one in the background, and it gets served per-SNI as
+soon as it's issued — and on every renewal — without a reload.
+
+---
+
+## How it works
+
+1. **Starts immediately.** A `listen ssl; autocert on;` server with no
+   `ssl_certificate` comes up behind a self-signed **bootstrap certificate**, so
+   nothing fails while you wait for issuance.
+2. **Provisions in the background.** A single master-spawned **helper process** —
+   the only process that ever holds the account and certificate private keys —
+   runs the full [RFC 8555](https://datatracker.ietf.org/doc/html/rfc8555) order
+   flow for each `server_name`: account → order → challenge → finalize (ECDSA
+   CSR) → download → store.
+3. **Serves per-SNI.** Once issued, the real certificate is loaded at the TLS
+   handshake and replaces the bootstrap cert. The store is re-read only when the
+   file's mtime changes — so a renewal takes effect on the next handshake, **no
+   reload, no dropped connections**.
+4. **Renews itself.** The helper sweeps on a timer and reissues each certificate
+   once it enters the `autocert_renew_before` window (7 days by default). Failed
+   names back off (exponential, 60 s → 1 h); a CA `HTTP 429` `Retry-After` is
+   honoured.
+
+**Two challenge types.** HTTP-01 (default) is answered transparently on port 80
+by a built-in handler — no `location` block. TLS-ALPN-01
+([RFC 8737](https://datatracker.ietf.org/doc/html/rfc8737)),
+`autocert_challenge tls-alpn-01;`, validates entirely inside the TLS handshake,
+so **port 80 can stay closed**.
+
+The whole flow is verified end-to-end against
+[Pebble](https://github.com/letsencrypt/pebble) in CI, plus fuzzing, Valgrind,
+CodeQL and static analysis.
+
+---
+
+## Directives
+
+### `autocert on | off [email];`
+
+The only directive valid inside `server{}`. Optional `email` is the ACME account
+contact. A `server{}` value overrides the `http{}` global.
+
+```nginx
+http {
+    autocert on admin@example.com;       # global default for all vhosts
+
+    server {
+        listen 443 ssl;
+        server_name a.example.com www.a.example.com;
+        autocert on;                     # both names provisioned, no cert file
+    }
+
+    server {
+        listen 443 ssl;
+        server_name c.example.com;
+        ssl_certificate     /etc/ssl/c.crt;   # real cert kept as fallback,
+        ssl_certificate_key /etc/ssl/c.key;   #   overridden per-SNI if enabled
+        autocert off;                          # opt this vhost out
+    }
+}
+```
+
+A `listen ssl;` server with `autocert on` needs **no `ssl_certificate`**. If you
+do set one, it's kept as the pre-issuance fallback and overridden per-SNI.
+
+> **Gotcha:** the no-cert bootstrap is seeded only for a **server-level**
+> `autocert on`. A vhost enabled purely by the `http{}`-level global still needs
+> its own `autocert on;` line (or an `ssl_certificate`) to serve TLS.
+
+Two configs are rejected at parse time: a `listen ssl;` server with `autocert
+off` **and** no `ssl_certificate` (nothing would serve it), and `autocert on`
+together with a **variable** `ssl_certificate` (e.g. `ssl_certificate $var;`).
+
+### Global tuning knobs (`http{}` only)
+
+One ACME policy per instance. All optional.
+
+| Directive | Default | Purpose |
+|---|---|---|
+| `autocert_ca <url>;` | Let's Encrypt production | ACME directory URL |
+| `autocert_renew_before <time>;` | `7d` | renew this long before expiry |
+| `autocert_key_type secp384r1\|secp256r1;` | `secp384r1` | ECDSA curve (no RSA) |
+| `autocert_store secure;` | `secure` | on-disk layout (only `secure` is implemented) |
+| `autocert_path <dir>;` | `autocert` | store location (relative to the nginx prefix) |
+| `autocert_challenge http-01\|tls-alpn-01;` | `http-01` | challenge type |
+| `autocert_resolver <addr>...;` | the `http{}` `resolver` | DNS used to reach the CA |
+| `autocert_resolver_timeout <time>;` | `30s` | DNS query timeout |
+| `autocert_ca_certificate <file>;` | system trust store | PEM bundle to verify the CA |
+
+> `autocert_key_type` takes the OpenSSL curve names `secp384r1` / `secp256r1`,
+> not `p384` / `p256`. The ACME server's certificate is **always** verified
+> (chain + hostname); set `autocert_ca_certificate` only for a private/test CA
+> such as Pebble.
+
+### Which names get provisioned
+
+The module collects the concrete `server_name`s of every vhost with `autocert
+on` (deduplicated). **Skipped:** vhosts set `autocert off`, the empty catch-all
+`""`, and wildcard (`*.x` / `.x`) or regex (`~…`) names — a single ACME order
+can't cover those (wildcards need DNS-01, which isn't supported yet).
+
+---
+
+## Architecture
+
+- A single master-spawned **helper process** runs the ACME state machine and
+  holds the account + certificate private keys. Workers never touch keys.
+- The helper reaches the CA over a **verified TLS** connection (its own resolver
+  + HTTP/1.1 client); challenge tokens and cert state pass to workers through a
+  shared-memory zone.
+- HTTP-01 challenges are served transparently on port 80; TLS-ALPN-01 needs no
+  port 80 at all.
+- Certificates are loaded **per-SNI at the TLS handshake**, so renewal needs no
+  config reload.
+
+The addon ships **two** dynamic modules: `ngx_autocert_process_module` (CORE —
+the helper) and `ngx_http_autocert_module` (HTTP — directives + serving). Load
+the helper first.
+
+---
+
+## Status
+
+**Works today:** full issuance + renewal on nginx mainline, HTTP-01 and
+TLS-ALPN-01, per-SNI serving with bootstrap + zero-reload hot-swap, ECDSA
+P-384/P-256, secure root-only store, `badNonce` retry, per-name backoff, and
+`429` / `Retry-After` awareness.
+
+**Not yet:** wildcard / DNS-01 certificates, multiple CAs / EAB, the `certbot`
+store layout, and a packaged Debian sub-package. Angie is compile-checked only —
+on Angie, use its native `acme` directive instead.
+
+---
 
 ## See also
 
-- Repo: <https://github.com/eilandert/nginx-autocert-module>
-<!-- TODO: cross-link blog article / Docker README / Docker Hub when they exist -->
+- 📝 Article: [Automatic TLS Certs, No Certbot](https://deb.myguard.nl/2026/06/nginx-autocert-module-automatic-acme-certificates/) — what it is and how it works, in plain English.
+- 📦 [NGINX modules repository for Debian & Ubuntu](https://deb.myguard.nl/nginx-modules/) — 100+ ready-built NGINX modules, no compiling.
+- 💻 Source: <https://github.com/eilandert/nginx-autocert-module>
