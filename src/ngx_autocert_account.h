@@ -73,6 +73,7 @@ struct ngx_autocert_account_s {
     ngx_autocert_acme_handler_pt     post_handler;   /* caller completion */
     void                            *post_data;      /* caller context */
     ngx_uint_t                       post_retried;   /* badNonce retry guard */
+    ngx_uint_t                       register_retried; /* newAccount badNonce guard */
 };
 
 
