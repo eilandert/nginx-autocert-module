@@ -35,6 +35,7 @@ static ngx_uint_t ngx_autocert_account_is_bad_nonce(
     ngx_autocert_acme_request_t *req);
 static ngx_int_t ngx_autocert_account_set_nonce(ngx_autocert_account_t *acct,
     ngx_str_t *nonce);
+static ngx_uint_t ngx_autocert_account_json_safe(ngx_str_t *s);
 static void ngx_autocert_account_finish(ngx_autocert_account_t *acct,
     ngx_int_t rc);
 
@@ -119,7 +120,7 @@ ngx_autocert_account_load_key(ngx_autocert_account_t *acct)
 
     /* O_NOFOLLOW: never read a key through a planted symlink. */
     file.fd = open((const char *) acct->key_path.data,
-                   O_RDONLY | O_NOFOLLOW);
+                   O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
 
     if (file.fd == NGX_INVALID_FILE) {
         if (ngx_errno != NGX_ENOENT) {
@@ -228,7 +229,7 @@ ngx_autocert_account_save_key(ngx_autocert_account_t *acct)
      * NOFOLLOW open macro; the helper is unix-only like the rest of this file.
      */
     fd = open((const char *) acct->key_path.data,
-              O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+              O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (fd == NGX_INVALID_FILE) {
         ngx_log_error(NGX_LOG_ERR, acct->log, ngx_errno,
                       "autocert: create account key \"%V\" failed",
@@ -251,6 +252,21 @@ ngx_autocert_account_save_key(ngx_autocert_account_t *acct)
             return NGX_ERROR;
         }
         off += (size_t) n;
+    }
+
+    /* Durably persist before close: the O_EXCL load path only regenerates on
+     * ENOENT, so a crash that left a zero/partial key would be refused forever.
+     * fsync the file (EINTR-retried); a dir fsync is omitted (best-effort). */
+    while (fsync(fd) != 0) {
+        if (ngx_errno == NGX_EINTR) {
+            continue;
+        }
+        ngx_log_error(NGX_LOG_ERR, acct->log, ngx_errno,
+                      "autocert: fsync account key \"%V\" failed",
+                      &acct->key_path);
+        ngx_close_file(fd);
+        (void) ngx_delete_file(acct->key_path.data);
+        return NGX_ERROR;
     }
 
     if (ngx_close_file(fd) == NGX_FILE_ERROR) {
@@ -418,6 +434,20 @@ ngx_autocert_account_post_account(ngx_autocert_account_t *acct)
     }
 
     if (ngx_http_autocert_jwk_public(acct->pool, acct->key, &jwk) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    /* nonce (Replay-Nonce header) and new_account_url (directory JSON) are
+     * server-controlled and spliced verbatim into the signed protected header
+     * below; reject `"`/`\`/control bytes here exactly as the kid-signed path
+     * does (ngx_autocert_account_send_post), so a hostile response can't break
+     * out of or inject into the protected JSON. */
+    if (!ngx_autocert_account_json_safe(&acct->nonce)
+        || !ngx_autocert_account_json_safe(&acct->new_account_url))
+    {
+        ngx_log_error(NGX_LOG_ERR, acct->log, 0,
+                      "autocert: unsafe character in ACME nonce or directory "
+                      "newAccount URL");
         return NGX_ERROR;
     }
 

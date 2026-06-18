@@ -86,6 +86,38 @@ ngx_autocert_order_dup(ngx_autocert_order_t *order, ngx_str_t *dst,
 
 
 /*
+ * Validate a CA-supplied challenge token before it is used as the http-01
+ * challenge-store key, spliced into the key authorization, or fed into the
+ * tls-alpn-01 challenge certificate. RFC 8555 §8.3 tokens are base64url
+ * (`[A-Za-z0-9_-]`); reject anything else, the empty token, and anything
+ * longer than the store accepts. This keeps a hostile/buggy CA from injecting
+ * path/control bytes into the :80 handler's match key or unbounded data into
+ * cert generation. Returns 1 if safe.
+ */
+static ngx_uint_t
+ngx_autocert_order_token_safe(ngx_str_t *token)
+{
+    size_t  i;
+    u_char  c;
+
+    if (token->len == 0 || token->len > NGX_AUTOCERT_TOKEN_MAX) {
+        return 0;
+    }
+
+    for (i = 0; i < token->len; i++) {
+        c = token->data[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+              || (c >= '0' && c <= '9') || c == '-' || c == '_'))
+        {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+
+/*
  * Inspect a completed ACME response for an HTTP 429 (rate limited) and, if so,
  * stamp order->retry_after with the absolute time before which this name must
  * not be retried. RFC 7231 Retry-After is either delta-seconds or an HTTP-date;
@@ -335,7 +367,8 @@ ngx_autocert_order_new_order_done(ngx_autocert_acme_request_t *req,
                 a0 = ngx_autocert_json_array_item(authzs, 0);
                 if (a0 != NULL
                     && a0->type == NGX_AUTOCERT_JSON_STRING
-                    && (az = a0->u.string, 1)
+                    && (az = a0->u.string, az.len > 0)   /* reject "" authz URL */
+                    && fin.len > 0
                     && ngx_autocert_order_dup(order, &order->order_url, loc)
                        == NGX_OK
                     && ngx_autocert_order_dup(order, &order->finalize_url,
@@ -450,6 +483,7 @@ ngx_autocert_order_authz_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
                     continue;
                 }
                 if (ngx_autocert_json_object_str(ch, "token", &token) == NGX_OK
+                    && ngx_autocert_order_token_safe(&token)
                     && ngx_autocert_json_object_str(ch, "url", &url) == NGX_OK
                     && ngx_autocert_order_dup(order, &order->token, &token)
                        == NGX_OK
@@ -459,7 +493,8 @@ ngx_autocert_order_authz_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
                     ok = NGX_OK;
                     break;          /* complete usable http-01 challenge */
                 }
-                /* malformed http-01 entry — keep scanning for a usable one */
+                /* malformed/unsafe challenge entry — keep scanning for a usable
+                 * one (a hostile token never reaches the keyauth/store/cert). */
             }
         }
     }
