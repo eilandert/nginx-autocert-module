@@ -317,6 +317,17 @@ ngx_autocert_acme_resolve_handler(ngx_resolver_ctx_t *ctx)
         return;
     }
 
+    /* state==0 means success, for which the resolver guarantees naddrs>=1;
+     * guard defensively so a contract violation can't read addrs[0] OOB. */
+    if (ctx->naddrs == 0) {
+        ngx_log_error(NGX_LOG_ERR, r->log, 0,
+                      "autocert: resolve \"%V\" returned no addresses", &r->host);
+        ngx_resolve_name_done(ctx);
+        r->resolve = NULL;
+        ngx_autocert_acme_finalize(r, NGX_ERROR);
+        return;
+    }
+
     /* Use the first address; copy it out before releasing the resolver ctx. */
     socklen = ctx->addrs[0].socklen;
 

@@ -31,6 +31,12 @@
 #define NGX_AUTOCERT_TOKEN_MAX     128
 #define NGX_AUTOCERT_KEYAUTH_MAX   512
 
+/* token_len is stored as u_short and the inline token copy uses the full
+ * token->len, so the cap MUST fit in a u_short or the two would desync on an
+ * over-long token. Compile-time guard (negative array size if violated). */
+typedef char ngx_autocert_token_max_fits_ushort[
+    (NGX_AUTOCERT_TOKEN_MAX <= 65535) ? 1 : -1];
+
 
 /* One challenge entry in the slab rbtree: token is the key, keyauth the value.
  * The token bytes follow the node inline (str rbtree node convention); keyauth

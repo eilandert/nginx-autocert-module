@@ -52,6 +52,10 @@
 #define NGX_AUTOCERT_WATCH        1000    /* ms; master-liveness poll */
 #define NGX_AUTOCERT_STARTUP_BUDGET 30000 /* ms; give up if master never seen */
 #define NGX_AUTOCERT_KICK         500     /* ms; defer first ACME fetch */
+#define NGX_AUTOCERT_KICK_RETRY   30000   /* ms; re-kick after a transient
+                                           * bootstrap failure (client build /
+                                           * OOM / register start) so the helper
+                                           * doesn't sit idle until reload */
 #define NGX_AUTOCERT_HTTP_TIMEOUT 30000   /* ms; per-request transport timeout */
 
 
@@ -736,6 +740,7 @@ ngx_autocert_kick_handler(ngx_event_t *ev)
         {
             ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
                           "autocert: failed to build ACME client");
+            ngx_add_timer(ev, NGX_AUTOCERT_KICK_RETRY);   /* retry, don't idle */
             return;
         }
         ngx_autocert_client.resolver_timeout = acf.resolver_timeout * 1000;
@@ -749,6 +754,7 @@ ngx_autocert_kick_handler(ngx_event_t *ev)
 
     pool = ngx_create_pool(NGX_MIN_POOL_SIZE, cycle->log);
     if (pool == NULL) {
+        ngx_add_timer(ev, NGX_AUTOCERT_KICK_RETRY);
         return;
     }
 
@@ -756,6 +762,7 @@ ngx_autocert_kick_handler(ngx_event_t *ev)
                                        sizeof(ngx_autocert_account_t));
     if (ngx_autocert_account == NULL) {
         ngx_destroy_pool(pool);
+        ngx_add_timer(ev, NGX_AUTOCERT_KICK_RETRY);
         return;
     }
     ngx_autocert_account_pool = pool;
@@ -776,6 +783,7 @@ ngx_autocert_kick_handler(ngx_event_t *ev)
         ngx_destroy_pool(pool);
         ngx_autocert_account = NULL;
         ngx_autocert_account_pool = NULL;
+        ngx_add_timer(ev, NGX_AUTOCERT_KICK_RETRY);
         return;
     }
     {
@@ -793,6 +801,7 @@ ngx_autocert_kick_handler(ngx_event_t *ev)
         ngx_destroy_pool(pool);
         ngx_autocert_account = NULL;
         ngx_autocert_account_pool = NULL;
+        ngx_add_timer(ev, NGX_AUTOCERT_KICK_RETRY);
     }
 }
 
@@ -1023,9 +1032,13 @@ rearm:
         ngx_uint_t  i;
 
         if (acf.configured && acf.renew_before > 0) {
-            ngx_msec_t  half = (ngx_msec_t) acf.renew_before * 1000 / 2;
-            if (half < interval) {
-                interval = half;
+            /* Compute in 64-bit: renew_before is time_t seconds; a large
+             * operator value would overflow a 32-bit ngx_msec_t if narrowed
+             * before the *1000, yielding a bogusly small (too-frequent)
+             * interval. Clamp to the ceiling before narrowing. */
+            uint64_t  half = (uint64_t) acf.renew_before * 1000 / 2;
+            if (half < (uint64_t) interval) {
+                interval = (ngx_msec_t) half;
             }
         }
 
