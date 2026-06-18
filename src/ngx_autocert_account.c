@@ -12,6 +12,9 @@
 
 #include <openssl/pem.h>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 
 static ngx_int_t ngx_autocert_account_load_key(ngx_autocert_account_t *acct);
 static ngx_int_t ngx_autocert_account_save_key(ngx_autocert_account_t *acct);
@@ -49,6 +52,16 @@ ngx_autocert_account_dup(ngx_autocert_account_t *acct, ngx_str_t *dst,
 ngx_int_t
 ngx_autocert_account_register(ngx_autocert_account_t *acct)
 {
+    /* Reset run state so a reused acct struct can't suppress the terminal
+     * handler or surface a stale kid. (The caller is expected to pcalloc it,
+     * but don't depend on that.) */
+    acct->done = 0;
+    acct->key = NULL;
+    ngx_str_null(&acct->kid);
+    ngx_str_null(&acct->new_nonce_url);
+    ngx_str_null(&acct->new_account_url);
+    ngx_str_null(&acct->nonce);
+
     acct->pool = ngx_create_pool(NGX_DEFAULT_POOL_SIZE, acct->log);
     if (acct->pool == NULL) {
         return NGX_ERROR;
@@ -97,8 +110,9 @@ ngx_autocert_account_load_key(ngx_autocert_account_t *acct)
     file.name = acct->key_path;
     file.log = acct->log;
 
-    file.fd = ngx_open_file(acct->key_path.data, NGX_FILE_RDONLY,
-                            NGX_FILE_OPEN, 0);
+    /* O_NOFOLLOW: never read a key through a planted symlink. */
+    file.fd = open((const char *) acct->key_path.data,
+                   O_RDONLY | O_NOFOLLOW);
 
     if (file.fd == NGX_INVALID_FILE) {
         if (ngx_errno != NGX_ENOENT) {
@@ -115,7 +129,12 @@ ngx_autocert_account_load_key(ngx_autocert_account_t *acct)
                           "autocert: account key generation failed");
             return NGX_ERROR;
         }
-        return ngx_autocert_account_save_key(acct);
+        if (ngx_autocert_account_save_key(acct) != NGX_OK) {
+            ngx_http_autocert_key_free(acct->key);
+            acct->key = NULL;
+            return NGX_ERROR;
+        }
+        return NGX_OK;
     }
 
     /* present -> read whole file, parse PEM */
@@ -129,6 +148,23 @@ ngx_autocert_account_load_key(ngx_autocert_account_t *acct)
             ngx_log_error(NGX_LOG_ERR, acct->log, 0,
                           "autocert: account key \"%V\" bad size",
                           &acct->key_path);
+            ngx_close_file(file.fd);
+            return NGX_ERROR;
+        }
+
+        /* Must be a plain file owned tightly: reject anything with group/other
+         * permission bits set (the private key must stay 0600). */
+        if (!S_ISREG(fi.st_mode)) {
+            ngx_log_error(NGX_LOG_ERR, acct->log, 0,
+                          "autocert: account key \"%V\" is not a regular file",
+                          &acct->key_path);
+            ngx_close_file(file.fd);
+            return NGX_ERROR;
+        }
+        if (fi.st_mode & (S_IRWXG | S_IRWXO)) {
+            ngx_log_error(NGX_LOG_ERR, acct->log, 0,
+                          "autocert: account key \"%V\" has group/other "
+                          "permissions (must be 0600)", &acct->key_path);
             ngx_close_file(file.fd);
             return NGX_ERROR;
         }
@@ -170,17 +206,22 @@ ngx_autocert_account_save_key(ngx_autocert_account_t *acct)
 {
     ngx_str_t  pem;
     ngx_fd_t   fd;
-    ssize_t    n;
+    size_t     off;
 
     if (ngx_http_autocert_key_to_pem(acct->pool, acct->key, &pem) != NGX_OK) {
         return NGX_ERROR;
     }
 
-    /* O_CREAT|O_EXCL|O_WRONLY with 0600: never world-readable, never clobber. */
-    fd = ngx_open_file(acct->key_path.data,
-                       NGX_FILE_WRONLY,
-                       NGX_FILE_CREATE_OR_OPEN | NGX_FILE_TRUNCATE,
-                       0600);
+    /*
+     * Exclusive create at 0600, no symlink follow: never world-readable, never
+     * clobber an existing key, never be redirected through a planted symlink.
+     * O_EXCL is the point — this is only reached when the load open returned
+     * ENOENT, so the file should not exist; if it now does (race) we bail
+     * rather than overwrite. Raw open() because nginx has no portable EXCL/
+     * NOFOLLOW open macro; the helper is unix-only like the rest of this file.
+     */
+    fd = open((const char *) acct->key_path.data,
+              O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
     if (fd == NGX_INVALID_FILE) {
         ngx_log_error(NGX_LOG_ERR, acct->log, ngx_errno,
                       "autocert: create account key \"%V\" failed",
@@ -188,13 +229,28 @@ ngx_autocert_account_save_key(ngx_autocert_account_t *acct)
         return NGX_ERROR;
     }
 
-    n = ngx_write_fd(fd, pem.data, pem.len);
-    ngx_close_file(fd);
+    for (off = 0; off < pem.len; /* void */) {
+        ssize_t  n = write(fd, pem.data + off, pem.len - off);
 
-    if (n != (ssize_t) pem.len) {
-        ngx_log_error(NGX_LOG_ERR, acct->log, 0,
-                      "autocert: write account key \"%V\" failed",
+        if (n < 0) {
+            if (ngx_errno == NGX_EINTR) {
+                continue;
+            }
+            ngx_log_error(NGX_LOG_ERR, acct->log, ngx_errno,
+                          "autocert: write account key \"%V\" failed",
+                          &acct->key_path);
+            ngx_close_file(fd);
+            (void) ngx_delete_file(acct->key_path.data);  /* no partial key */
+            return NGX_ERROR;
+        }
+        off += (size_t) n;
+    }
+
+    if (ngx_close_file(fd) == NGX_FILE_ERROR) {
+        ngx_log_error(NGX_LOG_ERR, acct->log, ngx_errno,
+                      "autocert: close account key \"%V\" failed",
                       &acct->key_path);
+        (void) ngx_delete_file(acct->key_path.data);
         return NGX_ERROR;
     }
 
