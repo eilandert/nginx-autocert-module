@@ -13,12 +13,14 @@ name: Build & Test
 #                                   load/serve tests, upload build-<flavor>.
 
 # Neither nginx nor angie is pinned: the `resolve` job scrapes the current
-# mainline nginx and the latest angie release at run time. There are two
-# independent build jobs (build-nginx, build-angie) so each is built exactly
-# once and the downstream unit/e2e jobs depend on ONLY the flavor they consume
-# (they download that flavor's artifact instead of recompiling). The Pebble
-# issuance/renewal e2e runs on BOTH flavors: the nginx jobs gate on build-nginx
-# (not blocked by a slow angie build), the e2e-angie matrix gates on build-angie.
+# mainline nginx and the latest angie release at run time.
+#   - build-nginx fully builds nginx + the module, runs the no-network
+#     load/serve tests, and uploads the tree; the unit + Pebble e2e jobs all
+#     download build-nginx instead of recompiling.
+#   - build-angie is COMPILE-ONLY: angie ships its own native `acme` directive,
+#     so this module is not meant to run there. We only prove it still compiles
+#     against angie's API (upstream-drift guard) and deliberately do not load it
+#     or run the issuance suite, to stay out of angie's native ACME.
 
 on:
   push:
@@ -93,21 +95,44 @@ jobs:
           url: ${{ needs.resolve.outputs.nginx_url }}
           dir: ${{ needs.resolve.outputs.nginx_dir }}
 
+  # angie ships its own native `acme` directive, so this module is not intended
+  # to run on the angie stack — we only assert it still COMPILES against angie's
+  # API (catch upstream drift), and deliberately do NOT load it or run the
+  # issuance suite, to stay out of the way of angie's native ACME.
   build-angie:
-    name: Build & load (angie ${{ needs.resolve.outputs.angie_version }})
+    name: Compile-only (angie ${{ needs.resolve.outputs.angie_version }})
     needs: resolve
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: Checkout module
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Build module + load/serve tests
-        uses: ./.github/actions/build-module
+
+      - name: Setup build deps
+        uses: ./.github/actions/setup
         with:
-          flavor: angie
-          version: ${{ needs.resolve.outputs.angie_version }}
-          url: ${{ needs.resolve.outputs.angie_url }}
-          dir: ${{ needs.resolve.outputs.angie_dir }}
+          ccache-key: build-angie-${{ needs.resolve.outputs.angie_version }}
+
+      - name: Fetch angie ${{ needs.resolve.outputs.angie_version }}
+        run: |
+          set -euo pipefail
+          curl -fsSL -o src.tar.gz "${{ needs.resolve.outputs.angie_url }}"
+          tar -xzf src.tar.gz
+
+      - name: Configure + compile module against angie
+        run: |
+          set -euo pipefail
+          cd "${{ needs.resolve.outputs.angie_dir }}"
+          ./configure --with-compat --with-http_ssl_module \
+            --with-cc="ccache cc" \
+            --add-dynamic-module="$GITHUB_WORKSPACE" > /tmp/conf.log 2>&1 \
+            || { tail -40 /tmp/conf.log; exit 1; }
+          # `make modules`: we only need the .so to compile+link, not a server.
+          make modules > /tmp/make.log 2>&1 || { tail -40 /tmp/make.log; exit 1; }
+          test -f objs/ngx_http_autocert_module.so
+          test -f objs/ngx_autocert_process_module.so
+          ccache -s || true
+          echo "✓ autocert modules compile against angie ${{ needs.resolve.outputs.angie_version }}"
 
   crypto-unit:
     name: Crypto unit tests (M3)
@@ -324,45 +349,3 @@ jobs:
           chmod +x "$NGX/objs/nginx"
           sudo env SERVER_BIN="$NGX/objs/nginx" NGX_BUILD_DIR="$NGX" \
             bash "$GITHUB_WORKSPACE/tests/retry-after.sh"
-
-  # ------------------------------------------------------------------ angie e2e
-  # The same Pebble issuance/renewal suite against the angie build (FLOW-2:
-  # angie previously only got build+load+serve, never full issuance). One job,
-  # matrixed over the test scripts; gates on build-angie only. Run uniformly
-  # under sudo (the http-01/renewal/backoff/retry scripts bind :80; harmless for
-  # the tls-alpn/account ones). The test scripts auto-detect objs/angie.
-
-  e2e-angie:
-    name: angie e2e (${{ matrix.test }})
-    needs: [resolve, build-angie]
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        test:
-          - acme-directory
-          - order-authz
-          - tls-alpn-issue
-          - renewal
-          - backoff
-          - retry-after
-    steps:
-      - name: Checkout module
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Setup runtime deps
-        uses: ./.github/actions/setup
-        with:
-          packages: libpcre2-8-0
-      - name: Download angie build
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: build-angie
-          path: ${{ needs.resolve.outputs.angie_dir }}
-      - name: ${{ matrix.test }} against Pebble on angie
-        run: |
-          set -euo pipefail
-          NGX="$GITHUB_WORKSPACE/${{ needs.resolve.outputs.angie_dir }}"
-          chmod +x "$NGX/objs/angie"
-          sudo env SERVER_BIN="$NGX/objs/angie" NGX_BUILD_DIR="$NGX" \
-            bash "$GITHUB_WORKSPACE/tests/${{ matrix.test }}.sh"
