@@ -17,8 +17,11 @@
 #include <ngx_core.h>
 #include <ngx_http.h>
 
+#include <ngx_http_ssl_module.h>
+
 #include "ngx_http_autocert_conf.h"
 #include "ngx_autocert_challenge.h"
+#include "ngx_autocert_serve.h"
 
 
 #define NGX_HTTP_AUTOCERT_DEFAULT_CA \
@@ -238,6 +241,18 @@ ngx_http_autocert_init_main_conf(ngx_conf_t *cf, void *conf)
         ngx_str_set(&amcf->path, "autocert");
     }
 
+    /*
+     * M7: make the store path absolute relative to the nginx prefix, NOT the
+     * process CWD. The helper (account.key) and the serve path (cert store)
+     * both read it; the helper's CWD is undefined, so a relative path would
+     * resolve differently between config-time and the helper. ngx_conf_full_name
+     * prepends the prefix when the path is not already absolute. (Folds the M6b
+     * residual.)
+     */
+    if (ngx_conf_full_name(cf->cycle, &amcf->path, 1) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
     ngx_conf_init_value(amcf->resolver_timeout, 30);
 
     return NGX_CONF_OK;
@@ -365,6 +380,16 @@ ngx_http_autocert_postconfig(ngx_conf_t *cf)
     ngx_log_error(NGX_LOG_NOTICE, cf->log, 0,
                   "autocert: %ui name(s) enabled for issuance",
                   amcf->names->nelts);
+
+    /*
+     * M7: install per-SNI cert serving on every enabled ssl server (builds a
+     * bootstrap SSL_CTX where the operator gave no ssl_certificate). Runs after
+     * ssl merge has created the ctxs. Independent of whether any concrete name
+     * was collected (a wildcard-only vhost still needs a working listener).
+     */
+    if (ngx_http_autocert_serve_init(cf, amcf) != NGX_OK) {
+        return NGX_ERROR;
+    }
 
     if (amcf->names->nelts == 0 && amcf->test_token.len == 0) {
         /* Nothing to provision and no test seed; skip both zones. */
@@ -612,6 +637,41 @@ ngx_http_autocert(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     if (ngx_strcasecmp(value[1].data, (u_char *) "on") == 0) {
         ascf->enable = 1;
+
+        /*
+         * Make nginx build the server's SSL_CTX even though the operator gave
+         * no ssl_certificate. ngx_http_ssl_module's merge returns before
+         * ngx_ssl_create when sscf->certificates == NULL, and its postconfig
+         * (ngx_http_ssl_init) rejects a `listen ssl` server with no
+         * certificates. Both gate on sscf->certificates being non-NULL — so we
+         * seed EMPTY certificates + certificate_keys arrays here, at parse time
+         * (before any merge/postconfig, dodging the module-order problem that
+         * blocks a dynamic module from hooking earlier). ssl then creates a
+         * fully nginx-wired ctx (ALPN, servername cb, ciphers, session cache)
+         * that loads zero certs; ngx_http_autocert_serve_init installs a
+         * bootstrap cert + the per-SNI cert_cb on top. Skip the seeding if the
+         * operator already configured ssl_certificate (we override per-SNI but
+         * keep their cert as the bootstrap fallback). Runs in this directive
+         * handler because the ssl srv conf already exists (ssl create_srv_conf
+         * ran at http{} block start) and parse precedes every later phase.
+         */
+        {
+            ngx_http_ssl_srv_conf_t  *sscf;
+
+            sscf = ngx_http_conf_get_module_srv_conf(cf, ngx_http_ssl_module);
+
+            if (sscf != NULL && sscf->certificates == NGX_CONF_UNSET_PTR) {
+                sscf->certificates = ngx_array_create(cf->pool, 1,
+                                                      sizeof(ngx_str_t));
+                sscf->certificate_keys = ngx_array_create(cf->pool, 1,
+                                                          sizeof(ngx_str_t));
+                if (sscf->certificates == NULL
+                    || sscf->certificate_keys == NULL)
+                {
+                    return NGX_CONF_ERROR;
+                }
+            }
+        }
 
     } else if (ngx_strcasecmp(value[1].data, (u_char *) "off") == 0) {
         ascf->enable = 0;

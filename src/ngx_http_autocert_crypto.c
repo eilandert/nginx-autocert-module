@@ -707,3 +707,80 @@ done:
     }
     return rc;
 }
+
+
+/*
+ * M7 bootstrap: self-signed dummy cert. See the header. The digest is chosen
+ * from the key's curve (SHA-256 for P-256, SHA-384 for P-384) so the signature
+ * matches the key strength; any EC key works.
+ */
+X509 *
+ngx_http_autocert_dummy_cert(EVP_PKEY *pkey)
+{
+    X509          *x = NULL;
+    X509_NAME     *name = NULL;
+    ASN1_INTEGER  *serial = NULL;
+    const EVP_MD  *md;
+
+    if (pkey == NULL) {
+        return NULL;
+    }
+
+    x = X509_new();
+    if (x == NULL) {
+        return NULL;
+    }
+
+    if (X509_set_version(x, 2) != 1) {                /* X.509 v3 */
+        goto failed;
+    }
+
+    serial = ASN1_INTEGER_new();
+    if (serial == NULL || ASN1_INTEGER_set(serial, 1) != 1
+        || X509_set_serialNumber(x, serial) != 1)
+    {
+        goto failed;
+    }
+
+    if (X509_gmtime_adj(X509_getm_notBefore(x), 0) == NULL
+        || X509_gmtime_adj(X509_getm_notAfter(x), 24L * 60 * 60) == NULL)
+    {
+        goto failed;
+    }
+
+    if (X509_set_pubkey(x, pkey) != 1) {
+        goto failed;
+    }
+
+    name = X509_get_subject_name(x);                  /* internal ptr */
+    if (name == NULL
+        || X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                                      (const unsigned char *) "localhost",
+                                      -1, -1, 0) != 1
+        || X509_set_issuer_name(x, name) != 1)        /* self-signed */
+    {
+        goto failed;
+    }
+
+    /*
+     * Curve-matched digest, picked from the key strength via the portable
+     * EVP_PKEY_bits API (P-384 -> 384) — avoids the OpenSSL 3 deprecated
+     * EC_KEY accessors (CI builds -Werror).
+     */
+    md = (EVP_PKEY_bits(pkey) > 256) ? EVP_sha384() : EVP_sha256();
+
+    if (X509_sign(x, pkey, md) == 0) {
+        goto failed;
+    }
+
+    ASN1_INTEGER_free(serial);
+    return x;
+
+failed:
+
+    if (serial != NULL) {
+        ASN1_INTEGER_free(serial);
+    }
+    X509_free(x);
+    return NULL;
+}

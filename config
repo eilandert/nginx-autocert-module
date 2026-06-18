@@ -40,9 +40,11 @@ if test -n "$ngx_module_link"; then
     ngx_module_name=ngx_http_autocert_module
     ngx_module_srcs="$ngx_addon_dir/src/ngx_http_autocert_module.c \
                      $ngx_addon_dir/src/ngx_autocert_challenge.c \
+                     $ngx_addon_dir/src/ngx_autocert_serve.c \
                      $ngx_addon_dir/src/ngx_http_autocert_crypto.c"
     ngx_module_libs="-lssl -lcrypto"
     ngx_module_deps="$ngx_addon_dir/src/ngx_autocert_challenge.h \
+                     $ngx_addon_dir/src/ngx_autocert_serve.h \
                      $ngx_addon_dir/src/ngx_http_autocert_crypto.h \
                      $ngx_addon_dir/src/ngx_http_autocert_conf.h"
     . auto/module
@@ -58,6 +60,7 @@ else
                     $ngx_addon_dir/src/ngx_autocert_challenge.c \
                     $ngx_addon_dir/src/ngx_autocert_conf.c \
                     $ngx_addon_dir/src/ngx_http_autocert_module.c \
+                    $ngx_addon_dir/src/ngx_autocert_serve.c \
                     $ngx_addon_dir/src/ngx_http_autocert_crypto.c"
     CORE_LIBS="$CORE_LIBS -lssl -lcrypto"
 fi
