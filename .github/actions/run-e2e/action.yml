@@ -1,0 +1,45 @@
+name: Run a Pebble e2e test
+description: >
+  Shared setup for the nginx Pebble end-to-end jobs: checkout is done by the
+  caller, this restores the build-nginx artifact, makes the server binary
+  executable, and runs one tests/*.sh script with SERVER_BIN + NGX_BUILD_DIR
+  set. Factored out of build-test.yml so the six e2e jobs share one definition
+  instead of repeating the same download/chmod/run boilerplate (FLOW-4).
+
+inputs:
+  nginx-dir:
+    description: Unpacked nginx source dir name (e.g. nginx-1.31.2).
+    required: true
+  script:
+    description: Test script under tests/ to run (e.g. order-authz.sh).
+    required: true
+  sudo:
+    description: Run the script under sudo (needed when it binds :80). "true"/"false".
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Setup runtime deps
+      uses: ./.github/actions/setup
+      with:
+        packages: libpcre2-8-0
+
+    - name: Download nginx build
+      uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+      with:
+        name: build-nginx
+        path: ${{ inputs.nginx-dir }}
+
+    - name: Run ${{ inputs.script }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        NGX="$GITHUB_WORKSPACE/${{ inputs.nginx-dir }}"
+        chmod +x "$NGX/objs/nginx"
+        script="$GITHUB_WORKSPACE/tests/${{ inputs.script }}"
+        if [ "${{ inputs.sudo }}" = "true" ]; then
+          sudo env SERVER_BIN="$NGX/objs/nginx" NGX_BUILD_DIR="$NGX" bash "$script"
+        else
+          SERVER_BIN="$NGX/objs/nginx" NGX_BUILD_DIR="$NGX" bash "$script"
+        fi

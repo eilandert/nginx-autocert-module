@@ -44,7 +44,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential clang curl libpcre2-dev libssl-dev zlib1g-dev
+            build-essential ccache clang curl libpcre2-dev libssl-dev zlib1g-dev
 
       - name: Resolve latest mainline nginx
         run: |
@@ -74,14 +74,30 @@ jobs:
             -o "$HOME/.cache/src-tarballs/nginx-${NGINX_VERSION}.tar.gz" \
             "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
 
+      # ccache the from-scratch nginx compile (this workflow builds its own tree,
+      # so it doesn't benefit from build-test.yml's build cache).
+      - name: Restore ccache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.ccache
+          key: ccache-fuzz-${{ env.NGINX_VERSION }}-${{ github.sha }}
+          restore-keys: |
+            ccache-fuzz-${{ env.NGINX_VERSION }}-
+            ccache-fuzz-
+
       - name: Build nginx objects used by the parser harness
         run: |
           set -euo pipefail
+          # Match the dir the ccache restore step saves/restores (~/.ccache);
+          # ccache 4 would otherwise default to ~/.cache/ccache and never warm.
+          export CCACHE_DIR="$HOME/.ccache"
+          ccache --max-size=500M
           mkdir -p .build
           tar -xzf "$HOME/.cache/src-tarballs/nginx-${NGINX_VERSION}.tar.gz" -C .build
           cd ".build/nginx-${NGINX_VERSION}"
-          ./configure --with-http_ssl_module
+          ./configure --with-http_ssl_module --with-cc="ccache cc"
           make -j"$(nproc)"
+          ccache -s || true
 
       - name: Build fuzz targets
         run: |
