@@ -9,3 +9,6 @@ objs/
 
 # local build/test scratch
 .build/
+
+# agent worktrees / local tooling
+.claude/
