@@ -320,6 +320,7 @@ test_malformed(void)
         "\"unterminated",         /* unterminated string */
         "\"bad\\xescape\"",       /* invalid escape */
         "\"\\u00g0\"",            /* bad hex in \u */
+        "\"\\u00\"",              /* truncated \u: <4 hex digits before quote */
         "\"\\ud83d\"",            /* lone high surrogate */
         "\"\\udc00\"",            /* lone low surrogate */
         "\"\\ud83dx\"",           /* high surrogate not followed by \\u */
@@ -372,6 +373,46 @@ test_no_overread(void)
 
 
 static void
+test_unicode_edge_bounded(void)
+{
+    /*
+     * Surrogate / \u handling at the EXACT length boundary: the buffer ends
+     * with no trailing bytes, so a parser that peeks past the high surrogate
+     * for the "\u" of a low surrogate (or past a \u for its 4 hex digits)
+     * would over-read. These must be rejected (NULL) without touching
+     * buf[len]. Built as length-bounded buffers (not C strings) so there is
+     * genuinely nothing after the final byte for the parser to read.
+     */
+    ngx_autocert_json_value_t  *v;
+
+    /* "\ud83d  — a high surrogate as the very last token, buffer ends right
+     * after the closing quote: no low surrogate follows, must reject. */
+    {
+        static const u_char hi[] = { '"', '\\', 'u', 'd', '8', '3', 'd', '"' };
+        v = ngx_autocert_json_parse(pool, (u_char *) hi, sizeof(hi));
+        CHECK(v == NULL, "bounded: lone high surrogate at buffer end rejected");
+    }
+
+    /* High surrogate immediately followed by a backslash but the buffer ends
+     * before the 'u' of the would-be low surrogate — must reject, not read on. */
+    {
+        static const u_char hb[] = {
+            '"', '\\', 'u', 'd', '8', '3', 'd', '\\'
+        };
+        v = ngx_autocert_json_parse(pool, (u_char *) hb, sizeof(hb));
+        CHECK(v == NULL, "bounded: high surrogate + bare backslash at end rejected");
+    }
+
+    /* A \u escape whose 4 hex digits run past the buffer end: "\u00 then EOF. */
+    {
+        static const u_char tu[] = { '"', '\\', 'u', '0', '0' };
+        v = ngx_autocert_json_parse(pool, (u_char *) tu, sizeof(tu));
+        CHECK(v == NULL, "bounded: \\u with <4 hex digits before end rejected");
+    }
+}
+
+
+static void
 test_depth_limit(void)
 {
     /* Nesting beyond the bound must be rejected, not recurse unbounded. */
@@ -416,6 +457,7 @@ main(void)
     test_type_mismatch();
     test_malformed();
     test_no_overread();
+    test_unicode_edge_bounded();
     test_depth_limit();
 
     ngx_destroy_pool(p);

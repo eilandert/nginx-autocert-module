@@ -60,8 +60,8 @@ jobs:
 
       - name: Validate scripts and source
         run: |
-          bash -n tests/*.sh fuzz/build.sh
-          shellcheck tests/*.sh fuzz/build.sh
+          bash -n tests/*.sh fuzz/*.sh test/*.sh
+          shellcheck tests/*.sh fuzz/*.sh test/*.sh
           # Tell cppcheck the OpenSSL version so it takes the satisfied branch
           # of the >= 3.0.0 floor guard instead of evaluating the intentional
           # `#error` with the macro undefined (cppcheck doesn't parse the system
@@ -271,6 +271,188 @@ jobs:
             "$GITHUB_WORKSPACE/src/ngx_autocert_json.c" \
             $OBJS
           ./test_json
+
+  http-unit:
+    name: HTTP parser unit tests (M4b)
+    needs: [resolve, build-nginx]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Setup build deps
+        uses: ./.github/actions/setup
+        with:
+          packages: build-essential
+
+      - name: Build + run HTTP parser unit tests
+        run: |
+          set -euo pipefail
+          # Self-contained: the parser bodies are sliced from the shipped
+          # ngx_autocert_acme.c by extract_http.sh and compiled against the
+          # fuzz shim — no nginx objects needed (the rest of that TU is
+          # event/SSL/resolver machinery the parser does not touch).
+          bash fuzz/extract_http.sh
+          gcc -Wall -Wextra -Werror -I"$GITHUB_WORKSPACE" \
+            -o test_http "$GITHUB_WORKSPACE/test/test_http.c"
+          ./test_http
+
+  challenge-unit:
+    name: Challenge store unit tests (M5)
+    needs: [resolve, build-nginx]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Setup build deps
+        uses: ./.github/actions/setup
+        with:
+          packages: build-essential
+
+      - name: Download nginx build
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: build-nginx
+          path: ${{ needs.resolve.outputs.nginx_dir }}
+
+      - name: Build + run challenge store unit tests
+        run: |
+          set -euo pipefail
+          NGX="$GITHUB_WORKSPACE/${{ needs.resolve.outputs.nginx_dir }}"
+          INC="-I$NGX/src/core -I$NGX/src/event -I$NGX/src/os/unix -I$NGX/objs"
+          # slab/rbtree/crc32/shmtx on top of the base pool/string/time objs.
+          OBJS="$NGX/objs/src/core/ngx_palloc.o $NGX/objs/src/core/ngx_string.o \
+                $NGX/objs/src/os/unix/ngx_time.o $NGX/objs/src/core/ngx_times.o \
+                $NGX/objs/src/os/unix/ngx_alloc.o $NGX/objs/src/core/ngx_slab.o \
+                $NGX/objs/src/core/ngx_rbtree.o $NGX/objs/src/core/ngx_crc32.o \
+                $NGX/objs/src/core/ngx_shmtx.o"
+          # The store source carries an (intentional) unused init-zone `data`
+          # param, so compile it with nginx's own -Wall (no -Wextra), and keep
+          # -Wextra -Werror on the test TU.
+          # shellcheck disable=SC2086
+          gcc -Wall -Werror $INC -c \
+            "$GITHUB_WORKSPACE/src/ngx_autocert_challenge.c" -o challenge.o
+          # shellcheck disable=SC2086
+          gcc -Wall -Wextra -Werror $INC -c \
+            "$GITHUB_WORKSPACE/test/test_challenge.c" -o test_challenge_tu.o
+          # shellcheck disable=SC2086
+          gcc -o test_challenge test_challenge_tu.o challenge.o $OBJS
+          ./test_challenge
+
+  alpn-unit:
+    name: ALPN store unit tests (M10b)
+    needs: [resolve, build-nginx]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Setup build deps
+        uses: ./.github/actions/setup
+        with:
+          packages: build-essential
+
+      - name: Download nginx build
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: build-nginx
+          path: ${{ needs.resolve.outputs.nginx_dir }}
+
+      - name: Build + run ALPN store unit tests
+        run: |
+          set -euo pipefail
+          NGX="$GITHUB_WORKSPACE/${{ needs.resolve.outputs.nginx_dir }}"
+          INC="-I$NGX/src/core -I$NGX/src/event -I$NGX/src/os/unix -I$NGX/objs"
+          OBJS="$NGX/objs/src/core/ngx_palloc.o $NGX/objs/src/core/ngx_string.o \
+                $NGX/objs/src/os/unix/ngx_time.o $NGX/objs/src/core/ngx_times.o \
+                $NGX/objs/src/os/unix/ngx_alloc.o $NGX/objs/src/core/ngx_slab.o \
+                $NGX/objs/src/core/ngx_rbtree.o $NGX/objs/src/core/ngx_crc32.o \
+                $NGX/objs/src/core/ngx_shmtx.o"
+          # shellcheck disable=SC2086
+          gcc -Wall -Werror $INC -c \
+            "$GITHUB_WORKSPACE/src/ngx_autocert_alpn.c" -o alpn.o
+          # shellcheck disable=SC2086
+          gcc -Wall -Wextra -Werror $INC -c \
+            "$GITHUB_WORKSPACE/test/test_alpn.c" -o test_alpn_tu.o
+          # shellcheck disable=SC2086
+          gcc -o test_alpn test_alpn_tu.o alpn.o $OBJS
+          ./test_alpn
+
+  cert-time-unit:
+    name: Cert-expiry unit tests (M8)
+    needs: [resolve, build-nginx]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Setup build deps
+        uses: ./.github/actions/setup
+        with:
+          packages: build-essential libssl-dev
+
+      - name: Download nginx build
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: build-nginx
+          path: ${{ needs.resolve.outputs.nginx_dir }}
+
+      - name: Build + run cert-expiry unit tests
+        run: |
+          set -euo pipefail
+          NGX="$GITHUB_WORKSPACE/${{ needs.resolve.outputs.nginx_dir }}"
+          INC="-I$NGX/src/core -I$NGX/src/event -I$NGX/src/os/unix -I$NGX/objs"
+          OBJS="$NGX/objs/src/core/ngx_palloc.o $NGX/objs/src/core/ngx_string.o \
+                $NGX/objs/src/os/unix/ngx_time.o $NGX/objs/src/core/ngx_times.o \
+                $NGX/objs/src/os/unix/ngx_alloc.o"
+          # _GNU_SOURCE: the test cross-checks ngx_autocert_timegm against libc
+          # timegm(3). The test include-shims the crypto .c to reach the static
+          # ngx_autocert_timegm, so run it from the repo root (relative fixture
+          # path test/fixture_leaf.pem).
+          # shellcheck disable=SC2086
+          gcc -D_GNU_SOURCE -Wall -Wextra -Werror $INC -o test_cert_time \
+            "$GITHUB_WORKSPACE/test/test_cert_time.c" \
+            $OBJS -lssl -lcrypto
+          ./test_cert_time
+
+  account-jsonsafe-unit:
+    name: Account json_safe unit tests (M4d)
+    needs: [resolve, build-nginx]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Setup build deps
+        uses: ./.github/actions/setup
+        with:
+          packages: build-essential
+
+      - name: Download nginx build
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: build-nginx
+          path: ${{ needs.resolve.outputs.nginx_dir }}
+
+      - name: Build + run account json_safe unit tests
+        run: |
+          set -euo pipefail
+          NGX="$GITHUB_WORKSPACE/${{ needs.resolve.outputs.nginx_dir }}"
+          INC="-I$NGX/src/core -I$NGX/src/event -I$NGX/src/os/unix -I$NGX/objs"
+          # Slice just ngx_autocert_account_json_safe from the shipped account
+          # source — the function depends only on ngx_str_t, so no nginx objects
+          # are linked.
+          bash test/extract_jsonsafe.sh
+          # shellcheck disable=SC2086
+          gcc -Wall -Wextra -Werror -Itest $INC -o test_account_jsonsafe \
+            "$GITHUB_WORKSPACE/test/test_account_jsonsafe.c"
+          ./test_account_jsonsafe
 
   # ------------------------------------------------------------------ nginx e2e
   # The full Pebble issuance/renewal suite against the nginx build. Gates on

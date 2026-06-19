@@ -1,0 +1,4 @@
+# HTTP fuzz corpus seeds are raw response bytes (CRLF framing, sometimes
+# non-text). Treat them as binary so git does not normalise line endings or
+# flag CRLF / trailing bytes in diff --check.
+fuzz/corpus_http/* binary
