@@ -1,8 +1,8 @@
 name: Fuzzing
 
-# Coverage-guided fuzzing of the ACME JSON parser. Monthly discovery run plus
-# manual dispatch; kept off PR feedback because the normal JSON unit tests run
-# on every push/PR.
+# Coverage-guided fuzzing of the ACME JSON parser and the HTTP-response parser.
+# Monthly discovery run plus manual dispatch; kept off PR feedback because the
+# normal unit tests run on every push/PR.
 #
 # Action pins:
 # actions/checkout@v5        -> 93cb6efe18208431cddfb8368fd83d5badbf9bfd
@@ -32,7 +32,7 @@ permissions:
 
 jobs:
   fuzz:
-    name: JSON parser fuzz
+    name: Parser fuzz (JSON + HTTP)
     runs-on: ubuntu-latest
     timeout-minutes: 35
 
@@ -118,32 +118,48 @@ jobs:
         id: corpus-cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          path: fuzz/corpus
+          path: |
+            fuzz/corpus
+            fuzz/corpus_http
           key: fuzz-corpus-${{ github.run_id }}
           restore-keys: |
             fuzz-corpus-
 
       - name: Run fuzzers
         run: |
+          set -euo pipefail
           cd fuzz
+          # Split the budget across the two targets so a dispatch duration is
+          # honoured overall (each gets half, min 30s).
+          half=$(( FUZZ_SECS / 2 ))
+          [ "$half" -lt 30 ] && half=30
+          mkdir -p corpus_http
           ./fuzz_json \
-            -max_total_time="$FUZZ_SECS" \
+            -max_total_time="$half" \
             -print_final_stats=1 \
             -artifact_prefix="crash-json-" \
             corpus/
+          ./fuzz_http \
+            -max_total_time="$half" \
+            -print_final_stats=1 \
+            -artifact_prefix="crash-http-" \
+            corpus_http/
 
-      # Merge-minimize into corpus/ so the cache stays compact and the next run
+      # Merge-minimize each corpus so the cache stays compact and the next run
       # seeds from the distilled set.
       - name: Minimize and persist corpus growth
         if: success() && github.event_name == 'schedule'
         run: |
+          set -euo pipefail
           cd fuzz
-          mkdir -p corpus-min
-          ./fuzz_json -merge=1 corpus-min/ corpus/
-          echo "Merged corpus: $(find corpus-min -type f | wc -l) units"
-          # Replace corpus with minimized set for cache save.
-          rm -rf corpus
-          mv corpus-min corpus
+          for t in json http; do
+            src="corpus"; [ "$t" = http ] && src="corpus_http"
+            mkdir -p "${src}-min"
+            "./fuzz_${t}" -merge=1 "${src}-min/" "${src}/"
+            echo "Merged ${t} corpus: $(find "${src}-min" -type f | wc -l) units"
+            rm -rf "${src}"
+            mv "${src}-min" "${src}"
+          done
 
       - name: Upload crash artifacts
         if: failure()
@@ -158,5 +174,7 @@ jobs:
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: fuzz-corpus
-          path: ${{ github.workspace }}/fuzz/corpus
+          path: |
+            ${{ github.workspace }}/fuzz/corpus
+            ${{ github.workspace }}/fuzz/corpus_http
           retention-days: 30

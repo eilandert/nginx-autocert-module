@@ -1,9 +1,22 @@
-# build artifacts
-fuzz_json
+# build artifacts (compiled fuzz_<target> binaries) — but keep the
+# fuzz_<target>.c sources and their headers tracked.
 fuzz_*
+!fuzz_*.c
+!*.h
 generated_*.inc
 crash-*
 *-min/
 # libFuzzer-discovered corpus units (only named *.json seeds are tracked)
 corpus/*
 !corpus/*.json
+# HTTP corpus: ignore libFuzzer-discovered units (40-hex names); track only the
+# named seeds checked in below.
+corpus_http/*
+!corpus_http/bad_code
+!corpus_http/bad_ver
+!corpus_http/big_chunk
+!corpus_http/chunked
+!corpus_http/cl_ok
+!corpus_http/created
+!corpus_http/junk
+!corpus_http/notfound

@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
 #
-# Build the autocert JSON libFuzzer target.
-# Usage: fuzz/build.sh [out-binary]
+# Build the autocert libFuzzer targets.
+# Usage: fuzz/build.sh [out-dir]
 #
-#   - no arg      : build fuzz_json into fuzz/
-#   - a file path : build fuzz_json to that path (CI / OSS-Fuzz compat)
+#   - no arg   : build fuzz_json + fuzz_http into fuzz/
+#   - a dir    : build fuzz_json + fuzz_http into that directory
+#                (CI / OSS-Fuzz compat — $OUT/$OUT_DIR convention)
 #
-# No nginx build tree required — the parser source is extracted and compiled
-# against fuzz/ngx_shim.h by extract_parser.sh at build time.
+# Two targets:
+#   fuzz_json  — ngx_autocert_json_parse + accessors   (generated_json.inc)
+#   fuzz_http  — ngx_autocert_acme_parse_response/dechunk (generated_http.inc)
+#
+# No nginx build tree required — each parser's source is sliced from the shipped
+# .c by its extract_*.sh and compiled against the matching fuzz/ngx_*shim.h, so
+# the fuzzers always exercise production code with no copy drift.
 #
 # Requires clang with libFuzzer (clang >= 6).
 # CC / CFLAGS / LIB_FUZZING_ENGINE are overridable for OSS-Fuzz and the
@@ -22,19 +28,21 @@ CC="${CC:-clang}"
 ENGINE="${LIB_FUZZING_ENGINE:--fsanitize=fuzzer}"
 CFLAGS="${CFLAGS:--g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined}"
 
-ARG="${1:-}"
-if [ -n "$ARG" ]; then
-    OUT="$ARG"
-else
-    OUT="$FUZZ_DIR/fuzz_json"
-fi
+OUT_DIR="${1:-$FUZZ_DIR}"
 
+# Regenerate both slices from the shipped source.
 bash "$FUZZ_DIR/extract_parser.sh"
+bash "$FUZZ_DIR/extract_http.sh"
 
-# shellcheck disable=SC2086
-"$CC" $CFLAGS $ENGINE \
-    -I"$FUZZ_DIR" \
-    "$FUZZ_DIR/fuzz_json.c" \
-    -o "$OUT"
+build_one() {
+    target="$1"
+    # shellcheck disable=SC2086
+    "$CC" $CFLAGS $ENGINE \
+        -I"$FUZZ_DIR" \
+        "$FUZZ_DIR/${target}.c" \
+        -o "$OUT_DIR/${target}"
+    echo "✓ built fuzz target: $OUT_DIR/${target}"
+}
 
-echo "✓ built fuzz target: $OUT"
+build_one fuzz_json
+build_one fuzz_http
