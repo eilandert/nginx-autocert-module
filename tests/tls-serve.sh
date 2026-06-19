@@ -154,4 +154,60 @@ if ! { [ -n "$before" ] && [ -n "$after" ]; }; then echo "::error::missing seria
     echo "::error::serial unchanged after renew ($before) — no hot-reload"; exit 1; }
 echo "✓ renewed cert picked up without reload ($before -> $after)"
 
+echo "== mixed-case SNI resolves to the lowercased store entry =="
+# The serve path lowercases the SNI before the names gate / store-path build,
+# so an upper/mixed-case SNI must still hit <store>/<lowercased>/fullchain.pem.
+UPPER=$(printf '%s' "$DOMAIN" | tr '[:lower:]' '[:upper:]')   # A.EXAMPLE.COM
+mixed=$(served_subject "$UPPER")
+case "$mixed" in
+    *CN*=*"$DOMAIN") echo "✓ mixed-case SNI $UPPER served the $DOMAIN cert ($mixed)";;
+    *) echo "::error::mixed-case SNI $UPPER expected CN=$DOMAIN, got '$mixed'"; exit 1;;
+esac
+
+echo "== reload failure: garbage fullchain keeps the prior good cert =="
+# A renewal that writes an unparsable fullchain.pem must NOT be served; the
+# worker keeps the last good cert it already loaded (fails safe, no downtime).
+good_serial=$(served_serial "$DOMAIN")
+cp "$PREFIX/store/$DOMAIN/fullchain.pem" "$PREFIX/store/$DOMAIN/fullchain.pem.bak"
+cp "$PREFIX/store/$DOMAIN/privkey.pem"   "$PREFIX/store/$DOMAIN/privkey.pem.bak"
+printf 'not a certificate\n' > "$PREFIX/store/$DOMAIN/fullchain.pem"
+sleep 1.2
+garbage_subject=$(served_subject "$DOMAIN")
+garbage_serial=$(served_serial "$DOMAIN")
+case "$garbage_subject" in
+    *CN*=*"$DOMAIN")
+        if [ "$garbage_serial" = "$good_serial" ]; then
+            echo "✓ garbage fullchain ignored, prior cert still served ($good_serial)"
+        else
+            echo "::error::served a different cert after garbage write ($good_serial -> $garbage_serial)"; exit 1
+        fi;;
+    *) echo "::error::garbage fullchain broke serving, got '$garbage_subject'"; exit 1;;
+esac
+
+echo "== reload failure: cert/key mismatch keeps the prior good cert =="
+# Write a NEW (different-serial) fullchain paired with an UNRELATED key: the
+# mismatch (X509_check_private_key) must be rejected and the prior good pair
+# kept. Using a fresh serial means a broken path that loaded the new cert
+# regardless of the key would change the served serial and fail this check
+# (restoring the identical old cert could not distinguish the two outcomes).
+TMPD="$PREFIX/mismatch.tmp"
+mkdir -p "$TMPD"
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+    -keyout "$TMPD/new.key" -out "$TMPD/new.crt" \
+    -days 2 -subj "/CN=$DOMAIN" -addext "subjectAltName=DNS:$DOMAIN" >/dev/null 2>&1
+new_serial=$(openssl x509 -in "$TMPD/new.crt" -noout -serial 2>/dev/null)
+[ "$new_serial" != "$good_serial" ] || { echo "::error::test bug: new cert serial collided with good"; exit 1; }
+cp "$TMPD/new.crt" "$PREFIX/store/$DOMAIN/fullchain.pem"          # new cert ...
+openssl ecparam -name prime256v1 -genkey -noout \
+    -out "$PREFIX/store/$DOMAIN/privkey.pem" 2>/dev/null          # ... unrelated key
+chmod 600 "$PREFIX/store/$DOMAIN/privkey.pem"
+touch "$PREFIX/store/$DOMAIN/fullchain.pem"
+sleep 1.2
+mismatch_serial=$(served_serial "$DOMAIN")
+if [ "$mismatch_serial" = "$good_serial" ]; then
+    echo "✓ cert/key mismatch rejected, prior cert still served ($good_serial, not $new_serial)"
+else
+    echo "::error::mismatched pair was loaded ($good_serial -> $mismatch_serial)"; exit 1
+fi
+
 echo "✓ M7 per-SNI certificate serving verified"
