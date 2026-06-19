@@ -1,0 +1,1 @@
+{"identifier":{"type":"dns","value":"a.example.com"},"status":"pending","expires":"2026-01-01T00:00:00Z","challenges":[{"type":"http-01","url":"https://acme.example/acme/chall/1","token":"LoqXcYV8q5ONbJQxbmR7SCTNo3tiAXDfowyjxAjEuX0"},{"type":"dns-01","url":"https://acme.example/acme/chall/2","token":"LoqXcYV8q5ONbJQxbmR7SCTNo3tiAXDfowyjxAjEuX0"}]}

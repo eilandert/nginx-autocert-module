@@ -1,0 +1,9 @@
+# build artifacts
+fuzz_json
+fuzz_*
+generated_*.inc
+crash-*
+*-min/
+# libFuzzer-discovered corpus units (only named *.json seeds are tracked)
+corpus/*
+!corpus/*.json

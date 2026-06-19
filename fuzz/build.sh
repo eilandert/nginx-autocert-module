@@ -1,43 +1,40 @@
 #!/usr/bin/env bash
 #
-# Build autocert libFuzzer targets.
+# Build the autocert JSON libFuzzer target.
+# Usage: fuzz/build.sh [out-binary]
+#
+#   - no arg      : build fuzz_json into fuzz/
+#   - a file path : build fuzz_json to that path (CI / OSS-Fuzz compat)
+#
+# No nginx build tree required — the parser source is extracted and compiled
+# against fuzz/ngx_shim.h by extract_parser.sh at build time.
+#
+# Requires clang with libFuzzer (clang >= 6).
+# CC / CFLAGS / LIB_FUZZING_ENGINE are overridable for OSS-Fuzz and the
+# valgrind-replay path (which passes CFLAGS='-g -O1' without sanitizers).
 
 set -euo pipefail
 
 FUZZ_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OUT_DIR="${1:-$FUZZ_DIR}"
-NGX_BUILD_DIR="${NGX_BUILD_DIR:?set NGX_BUILD_DIR to a configured nginx build tree}"
 CC="${CC:-clang}"
 
+# OSS-Fuzz sets $LIB_FUZZING_ENGINE and its own $CFLAGS; honour them.
 ENGINE="${LIB_FUZZING_ENGINE:--fsanitize=fuzzer}"
 CFLAGS="${CFLAGS:--g -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined}"
 
-mkdir -p "$OUT_DIR"
+ARG="${1:-}"
+if [ -n "$ARG" ]; then
+    OUT="$ARG"
+else
+    OUT="$FUZZ_DIR/fuzz_json"
+fi
 
-INC=(
-    -I"$NGX_BUILD_DIR/src/core"
-    -I"$NGX_BUILD_DIR/src/event"
-    -I"$NGX_BUILD_DIR/src/os/unix"
-    -I"$NGX_BUILD_DIR/objs"
-)
-OBJS=(
-    "$NGX_BUILD_DIR/objs/src/core/ngx_palloc.o"
-    "$NGX_BUILD_DIR/objs/src/core/ngx_string.o"
-    "$NGX_BUILD_DIR/objs/src/os/unix/ngx_time.o"
-    "$NGX_BUILD_DIR/objs/src/core/ngx_times.o"
-    "$NGX_BUILD_DIR/objs/src/os/unix/ngx_alloc.o"
-)
+bash "$FUZZ_DIR/extract_parser.sh"
 
-for obj in "${OBJS[@]}"; do
-    test -f "$obj"
-done
-
-# CFLAGS and ENGINE are flag lists supplied by libFuzzer/OSS-Fuzz tooling.
 # shellcheck disable=SC2086
-"$CC" $CFLAGS $ENGINE "${INC[@]}" \
+"$CC" $CFLAGS $ENGINE \
+    -I"$FUZZ_DIR" \
     "$FUZZ_DIR/fuzz_json.c" \
-    "$FUZZ_DIR/../src/ngx_autocert_json.c" \
-    "${OBJS[@]}" \
-    -o "$OUT_DIR/fuzz_json"
+    -o "$OUT"
 
-echo "built fuzz target: $OUT_DIR/fuzz_json"
+echo "✓ built fuzz target: $OUT"
