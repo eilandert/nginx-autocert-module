@@ -64,6 +64,8 @@ ngx_autocert_challenge_init_zone(ngx_shm_zone_t *shm_zone, void *data)
 
     /* Inherit the previous incarnation's tree across reload (noreuse off). */
     if (shm_zone->shm.exists) {
+        ngx_log_debug0(NGX_LOG_DEBUG_CORE, shm_zone->shm.log, 0,
+                       "autocert: challenge zone inherited from old cycle");
         return NGX_OK;
     }
 
@@ -78,6 +80,9 @@ ngx_autocert_challenge_init_zone(ngx_shm_zone_t *shm_zone, void *data)
 
     ngx_rbtree_init(&sh->rbtree, &sh->sentinel,
                     ngx_autocert_challenge_insert_value);
+
+    ngx_log_debug0(NGX_LOG_DEBUG_CORE, shm_zone->shm.log, 0,
+                   "autocert: challenge zone initialized");
 
     return NGX_OK;
 }
@@ -136,8 +141,15 @@ ngx_autocert_challenge_set(ngx_shm_zone_t *shm_zone, ngx_str_t *token,
     if (token->len == 0 || token->len > NGX_AUTOCERT_TOKEN_MAX
         || keyauth->len == 0 || keyauth->len > NGX_AUTOCERT_KEYAUTH_MAX)
     {
+        ngx_log_debug2(NGX_LOG_DEBUG_CORE, shm_zone->shm.log, 0,
+                       "autocert: set rejected bounds token len %uz keyauth len %uz",
+                       token->len, keyauth->len);
         return NGX_ERROR;
     }
+
+    ngx_log_debug2(NGX_LOG_DEBUG_CORE, shm_zone->shm.log, 0,
+                   "autocert: set token \"%V\" keyauth %uz bytes",
+                   token, keyauth->len);
 
     shpool = (ngx_slab_pool_t *) shm_zone->shm.addr;
     sh = shpool->data;
@@ -149,6 +161,8 @@ ngx_autocert_challenge_set(ngx_shm_zone_t *shm_zone, ngx_str_t *token,
 
     if (cn != NULL) {
         /* replace the keyauth value in place */
+        ngx_log_debug1(NGX_LOG_DEBUG_CORE, shm_zone->shm.log, 0,
+                       "autocert: set replacing existing token \"%V\"", token);
         ka = ngx_slab_alloc_locked(shpool, keyauth->len);
         if (ka == NULL) {
             ngx_shmtx_unlock(&shpool->mutex);
@@ -163,6 +177,9 @@ ngx_autocert_challenge_set(ngx_shm_zone_t *shm_zone, ngx_str_t *token,
     }
 
     /* new node: header + inline token bytes */
+    ngx_log_debug1(NGX_LOG_DEBUG_CORE, shm_zone->shm.log, 0,
+                   "autocert: set inserting new token \"%V\"", token);
+
     cn = ngx_slab_alloc_locked(shpool,
              offsetof(ngx_autocert_challenge_node_t, token) + token->len);
     if (cn == NULL) {
@@ -200,6 +217,9 @@ ngx_autocert_challenge_remove(ngx_shm_zone_t *shm_zone, ngx_str_t *token)
     uint32_t                        hash;
 
     if (token->len == 0 || token->len > NGX_AUTOCERT_TOKEN_MAX) {
+        ngx_log_debug1(NGX_LOG_DEBUG_CORE, shm_zone->shm.log, 0,
+                       "autocert: remove rejected bounds token len %uz",
+                       token->len);
         return NGX_OK;
     }
 
@@ -211,9 +231,14 @@ ngx_autocert_challenge_remove(ngx_shm_zone_t *shm_zone, ngx_str_t *token)
 
     cn = ngx_autocert_challenge_lookup(sh, token, hash);
     if (cn != NULL) {
+        ngx_log_debug1(NGX_LOG_DEBUG_CORE, shm_zone->shm.log, 0,
+                       "autocert: remove found token \"%V\", deleting", token);
         ngx_rbtree_delete(&sh->rbtree, &cn->node);
         ngx_slab_free_locked(shpool, cn->keyauth.data);
         ngx_slab_free_locked(shpool, cn);
+    } else {
+        ngx_log_debug1(NGX_LOG_DEBUG_CORE, shm_zone->shm.log, 0,
+                       "autocert: remove token \"%V\" absent", token);
     }
 
     ngx_shmtx_unlock(&shpool->mutex);
@@ -229,9 +254,13 @@ ngx_autocert_challenge_get(ngx_shm_zone_t *shm_zone, ngx_str_t *token,
     ngx_autocert_challenge_sh_t    *sh;
     ngx_autocert_challenge_node_t  *cn;
     uint32_t                        hash;
-    ngx_int_t                       rc;
+    u_char                          buf[NGX_AUTOCERT_KEYAUTH_MAX];
+    size_t                          len;
 
     if (token->len == 0 || token->len > NGX_AUTOCERT_TOKEN_MAX) {
+        ngx_log_debug1(NGX_LOG_DEBUG_CORE, shm_zone->shm.log, 0,
+                       "autocert: get rejected bounds token len %uz",
+                       token->len);
         return NGX_DECLINED;
     }
 
@@ -244,19 +273,26 @@ ngx_autocert_challenge_get(ngx_shm_zone_t *shm_zone, ngx_str_t *token,
     cn = ngx_autocert_challenge_lookup(sh, token, hash);
     if (cn == NULL) {
         ngx_shmtx_unlock(&shpool->mutex);
+        ngx_log_debug1(NGX_LOG_DEBUG_CORE, shm_zone->shm.log, 0,
+                       "autocert: get miss token \"%V\"", token);
         return NGX_DECLINED;
     }
 
-    /* copy the value out under the lock so it stays valid after we unlock */
-    out->data = ngx_pnalloc(pool, cn->keyauth.len);
-    if (out->data == NULL) {
-        rc = NGX_ERROR;
-    } else {
-        ngx_memcpy(out->data, cn->keyauth.data, cn->keyauth.len);
-        out->len = cn->keyauth.len;
-        rc = NGX_OK;
-    }
+    len = cn->keyauth.len;
+    ngx_memcpy(buf, cn->keyauth.data, len);
+
+    ngx_log_debug2(NGX_LOG_DEBUG_CORE, shm_zone->shm.log, 0,
+                   "autocert: get hit token \"%V\" keyauth %uz bytes",
+                   token, len);
 
     ngx_shmtx_unlock(&shpool->mutex);
-    return rc;
+
+    out->data = ngx_pnalloc(pool, len);
+    if (out->data == NULL) {
+        return NGX_ERROR;
+    }
+    ngx_memcpy(out->data, buf, len);
+    out->len = len;
+
+    return NGX_OK;
 }

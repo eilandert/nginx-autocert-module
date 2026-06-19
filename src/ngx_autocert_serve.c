@@ -123,6 +123,12 @@ ngx_http_autocert_serve_init(ngx_conf_t *cf,
     sctx->names = amcf->names;       /* bounds the per-worker cache */
     sctx->alpn_zone = amcf->alpn_zone;  /* M10b: NULL unless tls-alpn-01 wired */
 
+    ngx_log_debug3(NGX_LOG_DEBUG_HTTP, cf->log, 0,
+                   "autocert: serve init path \"%V\" names:%ui alpn:%ui",
+                   &sctx->path,
+                   sctx->names ? sctx->names->nelts : 0,
+                   sctx->alpn_zone != NULL);
+
     /*
      * Allocate the per-connection ex_data slot the ALPN callback uses to flag
      * an acme-tls/1 handshake for the cert callback. Once per process; -1 means
@@ -177,6 +183,9 @@ ngx_http_autocert_serve_init(ngx_conf_t *cf,
          * ssl listener, a no-op for serving.
          */
         if (sscf->ssl.ctx == NULL) {
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, cf->log, 0,
+                           "autocert: server \"%V\" has no SSL_CTX, "
+                           "skipping cert_cb install", &cscf->server_name);
             continue;
         }
 
@@ -208,10 +217,16 @@ ngx_http_autocert_serve_init(ngx_conf_t *cf,
             {
                 return NGX_ERROR;
             }
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, cf->log, 0,
+                           "autocert: installed bootstrap cert for \"%V\"",
+                           &cscf->server_name);
         }
 
         /* Install the per-SNI cert callback (overrides whatever is on the ctx). */
         SSL_CTX_set_cert_cb(sscf->ssl.ctx, ngx_http_autocert_cert_cb, sctx);
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, cf->log, 0,
+                       "autocert: installed cert_cb for \"%V\"",
+                       &cscf->server_name);
 
         /*
          * M10b: when tls-alpn-01 is active, replace nginx's ALPN selection
@@ -223,6 +238,9 @@ ngx_http_autocert_serve_init(ngx_conf_t *cf,
         if (sctx->alpn_zone != NULL) {
             SSL_CTX_set_alpn_select_cb(sscf->ssl.ctx,
                                        ngx_http_autocert_alpn_select, sctx);
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, cf->log, 0,
+                           "autocert: installed ALPN callback for \"%V\"",
+                           &cscf->server_name);
         }
     }
 
@@ -290,6 +308,7 @@ ngx_http_autocert_cert_cb(SSL *ssl_conn, void *arg)
     ngx_connection_t          *c;
     ngx_autocert_cert_t       *cert;
     ngx_str_t                  host;
+    u_char                     host_buf[256];
     const char                *servername;
     uint32_t                   hash;
 
@@ -297,6 +316,11 @@ ngx_http_autocert_cert_cb(SSL *ssl_conn, void *arg)
     if (c == NULL) {
         return 1;
     }
+
+    servername = SSL_get_servername(ssl_conn, TLSEXT_NAMETYPE_host_name);
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                   "autocert: cert_cb sni=\"%s\"",
+                   servername ? servername : (const char *) "");
 
     /*
      * M10b tls-alpn-01: our ALPN callback flagged this handshake as the CA's
@@ -311,6 +335,9 @@ ngx_http_autocert_cert_cb(SSL *ssl_conn, void *arg)
     {
         servername = SSL_get_servername(ssl_conn, TLSEXT_NAMETYPE_host_name);
         if (servername == NULL) {
+            ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                           "autocert: acme-tls/1 handshake without SNI, "
+                           "failing");
             return 0;
         }
 
@@ -318,14 +345,24 @@ ngx_http_autocert_cert_cb(SSL *ssl_conn, void *arg)
         host.len = ngx_strlen(servername);
 
         if (host.len == 0 || host.len > NGX_AUTOCERT_ALPN_DOMAIN_MAX) {
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                           "autocert: acme-tls/1 SNI length %uz out of range, "
+                           "failing", host.len);
             return 0;
         }
+        ngx_strlow(host_buf, host.data, host.len);
+        host.data = host_buf;
+
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                       "autocert: acme-tls/1 challenge for \"%V\"", &host);
 
         return ngx_http_autocert_serve_alpn_cert(c, ssl_conn, sctx, &host);
     }
 
     servername = SSL_get_servername(ssl_conn, TLSEXT_NAMETYPE_host_name);
     if (servername == NULL) {
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                       "autocert: no SNI, keeping bootstrap cert");
         return 1;                         /* no SNI -> keep bootstrap cert */
     }
 
@@ -333,8 +370,13 @@ ngx_http_autocert_cert_cb(SSL *ssl_conn, void *arg)
     host.len = ngx_strlen(servername);
 
     if (host.len == 0 || host.len > 255) {
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                       "autocert: SNI length %uz out of range, "
+                       "keeping bootstrap cert", host.len);
         return 1;
     }
+    ngx_strlow(host_buf, host.data, host.len);
+    host.data = host_buf;
 
     /*
      * Only serve names this instance is configured to issue for. This bounds
@@ -356,6 +398,9 @@ ngx_http_autocert_cert_cb(SSL *ssl_conn, void *arg)
         }
 
         if (!found) {
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                           "autocert: SNI \"%V\" not configured, keeping "
+                           "bootstrap cert", &host);
             return 1;                     /* unconfigured SNI -> bootstrap */
         }
     }
@@ -373,6 +418,8 @@ ngx_http_autocert_cert_cb(SSL *ssl_conn, void *arg)
         ngx_rbtree_init(&ngx_autocert_cache_rbtree,
                         &ngx_autocert_cache_sentinel,
                         ngx_str_rbtree_insert_value);
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                       "autocert: initialized worker cert cache");
     }
 
     hash = ngx_crc32_short(host.data, host.len);
@@ -381,16 +428,16 @@ ngx_http_autocert_cert_cb(SSL *ssl_conn, void *arg)
                ngx_str_rbtree_lookup(&ngx_autocert_cache_rbtree, &host, hash);
 
     if (cert == NULL) {
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                       "autocert: cache miss for \"%V\", creating entry",
+                       &host);
         cert = ngx_pcalloc(ngx_autocert_cache_pool,
-                           sizeof(ngx_autocert_cert_t));
+                           sizeof(ngx_autocert_cert_t) + host.len);
         if (cert == NULL) {
             return 1;
         }
 
-        cert->sn.str.data = ngx_pnalloc(ngx_autocert_cache_pool, host.len);
-        if (cert->sn.str.data == NULL) {
-            return 1;
-        }
+        cert->sn.str.data = (u_char *) cert + sizeof(ngx_autocert_cert_t);
         ngx_memcpy(cert->sn.str.data, host.data, host.len);
         cert->sn.str.len = host.len;
         cert->sn.node.key = hash;
@@ -408,6 +455,9 @@ ngx_http_autocert_cert_cb(SSL *ssl_conn, void *arg)
     (void) ngx_http_autocert_cache_reload(cert, &host, sctx, c->log);
 
     if (cert->cert == NULL || cert->key == NULL) {
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                       "autocert: no cached cert for \"%V\", keeping "
+                       "bootstrap cert", &host);
         return 1;                         /* nothing issued yet -> bootstrap */
     }
 
@@ -460,6 +510,8 @@ ngx_http_autocert_cache_reload(ngx_autocert_cert_t *c, ngx_str_t *host,
         || host->data[0] == '.'
         || ngx_strlchr(host->data, host->data + host->len, '/') != NULL)
     {
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, log, 0,
+                       "autocert: unsafe SNI \"%V\" for store lookup", host);
         return NGX_ERROR;
     }
 
@@ -471,6 +523,9 @@ ngx_http_autocert_cache_reload(ngx_autocert_cert_t *c, ngx_str_t *host,
      */
     now = ngx_time();
     if (now == c->checked) {
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, log, 0,
+                       "autocert: cert cache check for \"%V\" throttled",
+                       host);
         return NGX_OK;                    /* throttled; use what we have */
     }
     c->checked = now;
@@ -495,12 +550,20 @@ ngx_http_autocert_cache_reload(ngx_autocert_cert_t *c, ngx_str_t *host,
     ngx_memcpy(p, "/privkey.pem", sizeof("/privkey.pem"));
 
     if (ngx_file_info(chain_path, &fi) == NGX_FILE_ERROR) {
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, log, ngx_errno,
+                       "autocert: no stored fullchain for \"%V\"", host);
         return NGX_ERROR;                 /* no cert yet -> bootstrap */
     }
 
     if (c->mtime == ngx_file_mtime(&fi)) {
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, log, 0,
+                       "autocert: stored cert for \"%V\" unchanged", host);
         return NGX_OK;                    /* unchanged */
     }
+
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, log, 0,
+                   "autocert: reloading stored cert for \"%V\" mtime:%T",
+                   host, ngx_file_mtime(&fi));
 
     /* Read both PEMs into a scratch pool we destroy before returning. */
     tmp = ngx_create_pool(4096, log);
@@ -891,5 +954,3 @@ done:
 
     return ret;
 }
-
-

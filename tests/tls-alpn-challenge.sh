@@ -77,14 +77,14 @@ echo "✓ helper seeded tls-alpn-01 challenge cert"
 ACME_OID="1.3.6.1.5.5.7.1.31"
 
 fetch_cert() {
-    # $1 = extra s_client args ; prints the served leaf cert as PEM
+    # extra s_client args; prints the served leaf cert as PEM
     printf '' | openssl s_client -connect "127.0.0.1:$PORT" \
-        -servername "$DOMAIN" "$1" 2>/dev/null \
+        -servername "$DOMAIN" "$@" 2>/dev/null \
         | openssl x509 2>/dev/null
 }
 
 echo "== acme-tls/1 handshake serves the challenge cert =="
-ALPN_CERT="$(fetch_cert "-alpn acme-tls/1")"
+ALPN_CERT="$(fetch_cert -alpn acme-tls/1)"
 [ -n "$ALPN_CERT" ] || { echo "::error::no cert returned under acme-tls/1"; exit 1; }
 
 ALPN_TEXT="$(printf '%s\n' "$ALPN_CERT" | openssl x509 -text -noout)"
@@ -95,7 +95,7 @@ printf '%s\n' "$ALPN_TEXT" | grep -qi "DNS:$DOMAIN" \
 echo "✓ acme-tls/1 served a cert with acmeIdentifier + SAN=$DOMAIN"
 
 echo "== normal handshake serves the ordinary (bootstrap) cert, not the challenge =="
-NORMAL_TEXT="$(fetch_cert "-alpn http/1.1" | openssl x509 -text -noout)"
+NORMAL_TEXT="$(fetch_cert -alpn http/1.1 | openssl x509 -text -noout)"
 [ -n "$NORMAL_TEXT" ] || { echo "::error::no cert returned on a normal handshake"; exit 1; }
 if printf '%s\n' "$NORMAL_TEXT" | grep -q "$ACME_OID"; then
     echo "::error::normal handshake served the challenge cert"; exit 1

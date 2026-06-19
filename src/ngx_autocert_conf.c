@@ -35,6 +35,8 @@ ngx_autocert_get_conf(ngx_cycle_t *cycle, ngx_autocert_conf_t *out)
 
     /* No http{} block -> no autocert config. */
     if (cycle->conf_ctx[ngx_http_module.index] == NULL) {
+        ngx_log_debug0(NGX_LOG_DEBUG_CORE, cycle->log, 0,
+                       "autocert: no http{} block, no autocert config");
         return NGX_OK;
     }
 
@@ -54,17 +56,30 @@ ngx_autocert_get_conf(ngx_cycle_t *cycle, ngx_autocert_conf_t *out)
     }
 
     if (!found) {
+        ngx_log_debug0(NGX_LOG_DEBUG_CORE, cycle->log, 0,
+                       "autocert: ngx_http_autocert_module not loaded");
         return NGX_OK;                 /* HTTP module not loaded */
     }
+
+    ngx_log_debug1(NGX_LOG_DEBUG_CORE, cycle->log, 0,
+                   "autocert: found ngx_http_autocert_module ctx_index:%ui",
+                   ctx_index);
 
     http_ctx = (ngx_http_conf_ctx_t *) cycle->conf_ctx[ngx_http_module.index];
 
     amcf = http_ctx->main_conf[ctx_index];
     if (amcf == NULL) {
+        ngx_log_debug0(NGX_LOG_DEBUG_CORE, cycle->log, 0,
+                       "autocert: http main_conf absent, not configured");
         return NGX_OK;
     }
 
     out->configured = 1;
+
+    ngx_log_debug2(NGX_LOG_DEBUG_CORE, cycle->log, 0,
+                   "autocert: resolved http conf, challenge:%ui names:%ui",
+                   amcf->challenge,
+                   amcf->names ? amcf->names->nelts : (ngx_uint_t) 0);
     out->ca = amcf->ca;
     out->resolver = amcf->resolver;
     out->resolver_timeout = amcf->resolver_timeout;

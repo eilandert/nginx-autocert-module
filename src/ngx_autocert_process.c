@@ -65,6 +65,8 @@ static void ngx_autocert_channel_handler(ngx_event_t *ev);
 static void ngx_autocert_heartbeat_handler(ngx_event_t *ev);
 static void ngx_autocert_watch_handler(ngx_event_t *ev);
 static ngx_uint_t ngx_autocert_master_gone(ngx_cycle_t *cycle);
+static void ngx_autocert_mark_reused_listening(ngx_cycle_t *cycle,
+    ngx_cycle_t *old_cycle);
 static void ngx_autocert_close_listening(ngx_cycle_t *cycle);
 static void ngx_autocert_kick_handler(ngx_event_t *ev);
 static void ngx_autocert_account_done(ngx_autocert_account_t *acct,
@@ -87,6 +89,7 @@ static ngx_autocert_order_t        *ngx_autocert_order;
 static ngx_pool_t                  *ngx_autocert_order_pool;
 static ngx_uint_t                   ngx_autocert_test_seeded;
 static ngx_uint_t                   ngx_autocert_test_alpn_seeded;
+static ngx_event_t                  ngx_autocert_kick_timer;
 
 
 static ngx_core_module_t  ngx_autocert_process_module_ctx = {
@@ -204,6 +207,10 @@ ngx_autocert_process_init_module(ngx_cycle_t *cycle)
     type = ngx_autocert_started ? NGX_PROCESS_JUST_RESPAWN
                                 : NGX_PROCESS_RESPAWN;
 
+    ngx_log_debug2(NGX_LOG_DEBUG_CORE, cycle->log, 0,
+                   "autocert: spawning helper, type %i cold_orphan %ui",
+                   type, cold_orphan);
+
     pid = ngx_spawn_process(cycle, ngx_autocert_process_cycle, NULL,
                             (char *) NGX_AUTOCERT_PROC_NAME, type);
 
@@ -233,6 +240,10 @@ ngx_autocert_process_init_module(ngx_cycle_t *cycle)
         ngx_int_t      s = ngx_autocert_cold_slot;
         ngx_pid_t      cpid = ngx_processes[s].pid;
         ngx_channel_t  ch;
+
+        ngx_log_debug2(NGX_LOG_DEBUG_CORE, cycle->log, 0,
+                       "autocert: retiring cold-orphan helper slot %i pid %P",
+                       s, cpid);
 
         if (ngx_processes[s].channel[0] != -1) {
             ngx_memzero(&ch, sizeof(ngx_channel_t));
@@ -293,6 +304,10 @@ ngx_autocert_process_init_module(ngx_cycle_t *cycle)
         ngx_processes[ngx_process_slot].detached = 1;
         ngx_processes[ngx_process_slot].respawn = 0;
         ngx_autocert_cold_slot = ngx_process_slot;   /* retire via channel later */
+
+        ngx_log_debug1(NGX_LOG_DEBUG_CORE, cycle->log, 0,
+                       "autocert: helper detached as cold orphan, slot %i",
+                       ngx_process_slot);
     }
 
     ngx_autocert_started = 1;
@@ -324,7 +339,6 @@ ngx_autocert_process_cycle(ngx_cycle_t *cycle, void *data)
     sigset_t     set;
     ngx_event_t  heartbeat;
     ngx_event_t  watch;
-    ngx_event_t  kick;
 
     ngx_process = NGX_PROCESS_HELPER;
 
@@ -354,6 +368,9 @@ ngx_autocert_process_cycle(ngx_cycle_t *cycle, void *data)
      * and do the same for the old cycle on a reload, whose listeners were also
      * inherited and would otherwise keep removed addresses bound.
      */
+    if (cycle->old_cycle) {
+        ngx_autocert_mark_reused_listening(cycle, cycle->old_cycle);
+    }
     ngx_autocert_close_listening(cycle);
     if (cycle->old_cycle) {
         ngx_autocert_close_listening(cycle->old_cycle);
@@ -468,11 +485,11 @@ ngx_autocert_process_cycle(ngx_cycle_t *cycle, void *data)
      * event loop (so the resolver/connect run with the loop fully up). M4b
      * proof-of-transport; M4c+ replaces this with the real ACME schedule.
      */
-    ngx_memzero(&kick, sizeof(ngx_event_t));
-    kick.handler = ngx_autocert_kick_handler;
-    kick.data = cycle;
-    kick.log = cycle->log;
-    ngx_add_timer(&kick, NGX_AUTOCERT_KICK);
+    ngx_memzero(&ngx_autocert_kick_timer, sizeof(ngx_event_t));
+    ngx_autocert_kick_timer.handler = ngx_autocert_kick_handler;
+    ngx_autocert_kick_timer.data = cycle;
+    ngx_autocert_kick_timer.log = cycle->log;
+    ngx_add_timer(&ngx_autocert_kick_timer, NGX_AUTOCERT_KICK);
 
     for ( ;; ) {
 
@@ -533,6 +550,8 @@ ngx_autocert_channel_handler(ngx_event_t *ev)
             ngx_close_connection(c);
 
             /* master closed the channel -> master is gone, exit cleanly */
+            ngx_log_debug0(NGX_LOG_DEBUG_CORE, ev->log, 0,
+                           "autocert: channel closed by master, quitting");
             ngx_quit = 1;
             return;
         }
@@ -546,6 +565,9 @@ ngx_autocert_channel_handler(ngx_event_t *ev)
         if (n == NGX_AGAIN) {
             return;
         }
+
+        ngx_log_debug1(NGX_LOG_DEBUG_CORE, ev->log, 0,
+                       "autocert: channel command %ui received", ch.command);
 
         switch (ch.command) {
 
@@ -666,6 +688,11 @@ ngx_autocert_kick_handler(ngx_event_t *ev)
         return;
     }
 
+    ngx_log_debug3(NGX_LOG_DEBUG_CORE, cycle->log, 0,
+                   "autocert: kick config ca \"%V\" names:%ui challenge:%ui",
+                   &acf.ca, acf.names ? acf.names->nelts : 0,
+                   (ngx_uint_t) acf.challenge);
+
     /* TEST-ONLY: seed the configured challenge into the shared store once, so
      * the :80 serve path can be exercised before the order flow exists. */
     if (!ngx_autocert_test_seeded
@@ -745,10 +772,16 @@ ngx_autocert_kick_handler(ngx_event_t *ev)
         }
         ngx_autocert_client.resolver_timeout = acf.resolver_timeout * 1000;
         ngx_autocert_client_ready = 1;
+
+        ngx_log_debug1(NGX_LOG_DEBUG_CORE, cycle->log, 0,
+                       "autocert: ACME client ready, resolver timeout %M ms",
+                       ngx_autocert_client.resolver_timeout);
     }
 
     /* Run the account bootstrap once. */
     if (ngx_autocert_account != NULL) {
+        ngx_log_debug0(NGX_LOG_DEBUG_CORE, cycle->log, 0,
+                       "autocert: account bootstrap already in progress/live");
         return;                         /* already registering / registered */
     }
 
@@ -827,8 +860,17 @@ ngx_autocert_account_done(ngx_autocert_account_t *acct, ngx_int_t rc)
             ngx_destroy_pool(ngx_autocert_account_pool);
             ngx_autocert_account_pool = NULL;
         }
+        if (!ngx_quit && !ngx_terminate && !ngx_exiting
+            && ngx_autocert_kick_timer.handler != NULL
+            && !ngx_autocert_kick_timer.timer_set)
+        {
+            ngx_add_timer(&ngx_autocert_kick_timer, NGX_AUTOCERT_KICK_RETRY);
+        }
         return;
     }
+
+    ngx_log_debug1(NGX_LOG_DEBUG_CORE, acct->log, 0,
+                   "autocert: ACME account ready, kid \"%V\"", &acct->kid);
 
     /* Keep the account alive; chain into the order flow. */
     ngx_autocert_start_order(cycle);
@@ -898,6 +940,8 @@ static void
 ngx_autocert_start_order(ngx_cycle_t *cycle)
 {
     if (ngx_autocert_sched_timer.handler != NULL) {
+        ngx_log_debug0(NGX_LOG_DEBUG_CORE, cycle->log, 0,
+                       "autocert: renewal scheduler already armed");
         return;                         /* already armed */
     }
 
@@ -907,6 +951,9 @@ ngx_autocert_start_order(ngx_cycle_t *cycle)
     ngx_autocert_sched_timer.log = cycle->log;
 
     ngx_add_timer(&ngx_autocert_sched_timer, NGX_AUTOCERT_SCHED_INITIAL);
+    ngx_log_debug1(NGX_LOG_DEBUG_CORE, cycle->log, 0,
+                   "autocert: renewal scheduler armed in %M ms",
+                   (ngx_msec_t) NGX_AUTOCERT_SCHED_INITIAL);
 }
 
 
@@ -922,10 +969,14 @@ ngx_autocert_sched_handler(ngx_event_t *ev)
     if (ngx_autocert_order != NULL) {
         /* An order is still in flight from a previous tick; let its completion
          * drive the scan. Rearm so we don't lose the periodic beat. */
+        ngx_log_debug0(NGX_LOG_DEBUG_CORE, cycle->log, 0,
+                       "autocert: scheduler tick while order in flight");
         ngx_add_timer(&ngx_autocert_sched_timer, NGX_AUTOCERT_SCHED_INTERVAL);
         return;
     }
 
+    ngx_log_debug0(NGX_LOG_DEBUG_CORE, cycle->log, 0,
+                   "autocert: scheduler sweep starting");
     ngx_autocert_sched_index = 0;
     ngx_autocert_sched_pump(cycle);
 }
@@ -945,6 +996,8 @@ ngx_autocert_sched_pump(ngx_cycle_t *cycle)
     ngx_memzero(&acf, sizeof(ngx_autocert_conf_t));
 
     if (ngx_autocert_order != NULL) {
+        ngx_log_debug0(NGX_LOG_DEBUG_CORE, cycle->log, 0,
+                       "autocert: scheduler pump paused, order in flight");
         return;                         /* one order at a time */
     }
 
@@ -1000,10 +1053,15 @@ ngx_autocert_sched_pump(ngx_cycle_t *cycle)
 
         /* Honour the per-name failure backoff before any disk/clock check. */
         if (ngx_autocert_backoff[i].next_eligible > ngx_time()) {
+            ngx_log_debug2(NGX_LOG_DEBUG_CORE, cycle->log, 0,
+                           "autocert: name \"%V\" held by backoff until %T",
+                           name, ngx_autocert_backoff[i].next_eligible);
             continue;
         }
 
         if (!ngx_autocert_name_due(cycle, &acf, name)) {
+            ngx_log_debug1(NGX_LOG_DEBUG_CORE, cycle->log, 0,
+                           "autocert: name \"%V\" not due", name);
             continue;
         }
 
@@ -1085,6 +1143,8 @@ ngx_autocert_backoff_record(ngx_uint_t index, ngx_uint_t success)
     b = &ngx_autocert_backoff[index];
 
     if (success) {
+        ngx_log_debug1(NGX_LOG_DEBUG_CORE, ngx_cycle->log, 0,
+                       "autocert: clearing backoff for name index %ui", index);
         b->fails = 0;
         b->next_eligible = 0;
         return;
@@ -1102,6 +1162,9 @@ ngx_autocert_backoff_record(ngx_uint_t index, ngx_uint_t success)
     }
 
     b->next_eligible = ngx_time() + delay;
+    ngx_log_debug3(NGX_LOG_DEBUG_CORE, ngx_cycle->log, 0,
+                   "autocert: backoff for name index %ui fails:%ui until %T",
+                   index, b->fails, b->next_eligible);
 }
 
 
@@ -1124,6 +1187,9 @@ ngx_autocert_backoff_hold(ngx_uint_t index, time_t when)
     b = &ngx_autocert_backoff[index];
     if (when > b->next_eligible) {
         b->next_eligible = when;
+        ngx_log_debug2(NGX_LOG_DEBUG_CORE, ngx_cycle->log, 0,
+                       "autocert: Retry-After holds name index %ui until %T",
+                       index, when);
     }
 }
 
@@ -1144,6 +1210,9 @@ ngx_autocert_name_due(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
     ngx_int_t  rc;
 
     if (acf->path.len == 0) {
+        ngx_log_debug1(NGX_LOG_DEBUG_CORE, cycle->log, 0,
+                       "autocert: name \"%V\" due because store path is unset",
+                       name);
         return 1;                       /* store path unset; let order log it */
     }
 
@@ -1182,6 +1251,9 @@ ngx_autocert_name_due(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
     rc = ngx_http_autocert_cert_not_after((char *) path, &not_after);
 
     if (rc == NGX_DECLINED) {
+        ngx_log_debug1(NGX_LOG_DEBUG_CORE, cycle->log, 0,
+                       "autocert: name \"%V\" due because no cert is stored",
+                       name);
         return 1;                       /* no cert yet -> issue */
     }
     if (rc != NGX_OK) {
@@ -1199,6 +1271,9 @@ ngx_autocert_name_due(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
         return 1;
     }
 
+    ngx_log_debug2(NGX_LOG_DEBUG_CORE, cycle->log, 0,
+                   "autocert: cert for \"%V\" fresh until %T",
+                   name, not_after);
     return 0;                           /* still fresh */
 }
 
@@ -1315,7 +1390,7 @@ ngx_autocert_order_complete(ngx_autocert_order_t *order, ngx_int_t rc)
  *   - Only ENOENT/ENOTDIR (the pidfile is really gone) counts as "master gone".
  *     A transient open error (EMFILE, EACCES, EINTR) must NOT be read as a dead
  *     master, or we would kill the helper on a hiccup.
- *   - Strict decimal parse of the pid: stop at the first non-digit, reject empty.
+ *   - Strict decimal parse of the pid: only CR/LF may trail the digits.
  *   - kill(pid, 0): ESRCH => gone; EPERM => alive (different owner); other errors
  *     are inconclusive and treated as alive.
  */
@@ -1348,7 +1423,7 @@ ngx_autocert_master_gone(ngx_cycle_t *cycle)
         return 0;                          /* unreadable -> inconclusive */
     }
 
-    /* strict decimal: digits up to the first non-digit (e.g. the trailing \n) */
+    /* strict decimal: digits plus optional CR/LF only */
     len = 0;
     for (p = buf; p < buf + n; p++) {
         if (*p < '0' || *p > '9') {
@@ -1361,6 +1436,12 @@ ngx_autocert_master_gone(ngx_cycle_t *cycle)
         return 0;
     }
 
+    for (p = buf + len; p < buf + n; p++) {
+        if (*p != CR && *p != LF) {
+            return 0;
+        }
+    }
+
     mpid = ngx_atoi(buf, len);
     if (mpid == NGX_ERROR || mpid <= 0) {
         return 0;
@@ -1371,6 +1452,41 @@ ngx_autocert_master_gone(ngx_cycle_t *cycle)
     }
 
     return 0;
+}
+
+
+/*
+ * Reload cycles can carry reused listener fds in both cycle->listening and
+ * old_cycle->listening. The helper closes both arrays because it inherited both,
+ * so mark any old-cycle duplicate as already closed before calling nginx's close
+ * helper. That keeps each live fd closed exactly once and avoids EBADF alert
+ * noise on every reload.
+ */
+static void
+ngx_autocert_mark_reused_listening(ngx_cycle_t *cycle, ngx_cycle_t *old_cycle)
+{
+    ngx_uint_t        i, j;
+    ngx_listening_t  *ls, *ols;
+
+    if (cycle == NULL || old_cycle == NULL) {
+        return;
+    }
+
+    ls = cycle->listening.elts;
+    ols = old_cycle->listening.elts;
+
+    for (j = 0; j < old_cycle->listening.nelts; j++) {
+        if (ols[j].fd == (ngx_socket_t) -1) {
+            continue;
+        }
+
+        for (i = 0; i < cycle->listening.nelts; i++) {
+            if (ls[i].fd != (ngx_socket_t) -1 && ls[i].fd == ols[j].fd) {
+                ols[j].fd = (ngx_socket_t) -1;
+                break;
+            }
+        }
+    }
 }
 
 

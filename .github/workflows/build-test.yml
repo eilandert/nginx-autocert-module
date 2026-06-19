@@ -183,6 +183,7 @@ jobs:
           cd "${{ needs.resolve.outputs.angie_dir }}"
           ./configure --with-compat --with-http_ssl_module \
             --with-cc="ccache cc" \
+            --with-cc-opt="-Wall -Wextra -Werror" \
             --add-dynamic-module="$GITHUB_WORKSPACE" > /tmp/conf.log 2>&1 \
             || { tail -40 /tmp/conf.log; exit 1; }
           # `make modules`: we only need the .so to compile+link, not a server.

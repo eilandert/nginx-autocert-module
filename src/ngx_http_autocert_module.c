@@ -522,6 +522,7 @@ static ngx_int_t
 ngx_http_autocert_challenge_handler(ngx_http_request_t *r)
 {
     ngx_http_autocert_main_conf_t  *amcf;
+    ngx_http_autocert_srv_conf_t   *ascf;
     ngx_str_t                       token, keyauth;
     ngx_buf_t                      *b;
     ngx_chain_t                     out;
@@ -533,6 +534,11 @@ ngx_http_autocert_challenge_handler(ngx_http_request_t *r)
         || ngx_strncmp(r->uri.data, NGX_HTTP_AUTOCERT_WK_PREFIX, pfxlen) != 0)
     {
         return NGX_DECLINED;            /* not our path — let others handle it */
+    }
+
+    ascf = ngx_http_get_module_srv_conf(r, ngx_http_autocert_module);
+    if (ascf == NULL || ascf->enable != 1) {
+        return NGX_DECLINED;
     }
 
     /*
@@ -703,6 +709,10 @@ ngx_http_autocert(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     if (ngx_strcasecmp(value[1].data, (u_char *) "on") == 0) {
         ascf->enable = 1;
 
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, cf->log, 0,
+                       "autocert: directive parsed: on (cmd_type %xi)",
+                       cf->cmd_type);
+
         /*
          * Make nginx build the server's SSL_CTX even though the operator gave
          * no ssl_certificate. ngx_http_ssl_module's merge returns before
@@ -746,6 +756,9 @@ ngx_http_autocert(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     } else if (ngx_strcasecmp(value[1].data, (u_char *) "off") == 0) {
         ascf->enable = 0;
 
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, cf->log, 0,
+                       "autocert: directive parsed: off");
+
     } else {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            "invalid value \"%V\" in \"autocert\" directive, "
@@ -775,6 +788,9 @@ ngx_http_autocert(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         }
 
         ascf->email = value[2];
+
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, cf->log, 0,
+                       "autocert: account email \"%V\"", &ascf->email);
     }
 
     return NGX_CONF_OK;
@@ -825,7 +841,10 @@ ngx_http_autocert_store(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         amcf->store = NGX_HTTP_AUTOCERT_STORE_SECURE;
 
     } else if (ngx_strcmp(value[1].data, "certbot") == 0) {
-        amcf->store = NGX_HTTP_AUTOCERT_STORE_CERTBOT;
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "autocert_store certbot is not implemented yet; "
+                           "use \"secure\"");
+        return NGX_CONF_ERROR;
 
     } else {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
@@ -906,6 +925,10 @@ ngx_http_autocert_test_challenge(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     amcf->test_token = value[1];
     amcf->test_keyauth = value[2];
 
+    ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                       "\"autocert_test_challenge\" is test-only and should "
+                       "not be used in production configs");
+
     return NGX_CONF_OK;
 }
 
@@ -949,6 +972,10 @@ ngx_http_autocert_test_alpn(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     amcf->test_alpn_domain = value[1];
     amcf->test_alpn_keyauth = value[2];
+
+    ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
+                       "\"autocert_test_alpn\" is test-only and should "
+                       "not be used in production configs");
 
     return NGX_CONF_OK;
 }

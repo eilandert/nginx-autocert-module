@@ -75,21 +75,34 @@ ngx_autocert_json_parse(ngx_pool_t *pool, u_char *data, size_t len)
     ngx_autocert_json_ctx_t     c;
     ngx_autocert_json_value_t  *v;
 
+    if (data == NULL || len == 0) {
+        return NULL;
+    }
+
     c.p = data;
     c.last = data + len;
     c.pool = pool;
     c.depth = 0;
 
+    ngx_log_debug1(NGX_LOG_DEBUG_CORE, pool->log, 0,
+                   "autocert: json parse start, %uz bytes", len);
+
     ngx_autocert_json_skip_ws(&c);
 
     v = ngx_autocert_json_value(&c);
     if (v == NULL) {
+        ngx_log_debug1(NGX_LOG_DEBUG_CORE, pool->log, 0,
+                       "autocert: json parse failed at offset %z",
+                       (ssize_t) (c.p - data));
         return NULL;
     }
 
     /* Whole input must be a single value; only trailing whitespace allowed. */
     ngx_autocert_json_skip_ws(&c);
     if (c.p != c.last) {
+        ngx_log_debug1(NGX_LOG_DEBUG_CORE, pool->log, 0,
+                       "autocert: json trailing data at offset %z",
+                       (ssize_t) (c.p - data));
         return NULL;
     }
 
@@ -146,6 +159,9 @@ ngx_autocert_json_object(ngx_autocert_json_ctx_t *c)
     ngx_autocert_json_member_t  *m, **tail;
 
     if (++c->depth > NGX_AUTOCERT_JSON_MAX_DEPTH) {
+        ngx_log_debug1(NGX_LOG_DEBUG_CORE, c->pool->log, 0,
+                       "autocert: json object exceeds max depth %ui",
+                       (ngx_uint_t) NGX_AUTOCERT_JSON_MAX_DEPTH);
         return NULL;
     }
 
@@ -215,6 +231,9 @@ ngx_autocert_json_array(ngx_autocert_json_ctx_t *c)
     ngx_autocert_json_element_t  *e, **tail;
 
     if (++c->depth > NGX_AUTOCERT_JSON_MAX_DEPTH) {
+        ngx_log_debug1(NGX_LOG_DEBUG_CORE, c->pool->log, 0,
+                       "autocert: json array exceeds max depth %ui",
+                       (ngx_uint_t) NGX_AUTOCERT_JSON_MAX_DEPTH);
         return NULL;
     }
 

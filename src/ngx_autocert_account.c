@@ -75,6 +75,10 @@ ngx_autocert_account_register(ngx_autocert_account_t *acct)
         return NGX_ERROR;
     }
 
+    ngx_log_debug1(NGX_LOG_DEBUG_CORE, acct->log, 0,
+                   "autocert: account register start, directory \"%V\"",
+                   &acct->directory_url);
+
     if (ngx_autocert_account_load_key(acct) != NGX_OK) {
         ngx_destroy_pool(acct->pool);
         acct->pool = NULL;
@@ -131,6 +135,9 @@ ngx_autocert_account_load_key(ngx_autocert_account_t *acct)
         }
 
         /* absent -> generate + persist */
+        ngx_log_debug2(NGX_LOG_DEBUG_CORE, acct->log, 0,
+                       "autocert: account key \"%V\" absent, generating "
+                       "(key_type %ui)", &acct->key_path, acct->key_type);
         acct->key = ngx_http_autocert_key_generate(acct->key_type);
         if (acct->key == NULL) {
             ngx_log_error(NGX_LOG_ERR, acct->log, 0,
@@ -176,6 +183,13 @@ ngx_autocert_account_load_key(ngx_autocert_account_t *acct)
             ngx_close_file(file.fd);
             return NGX_ERROR;
         }
+        if (fi.st_uid != geteuid()) {
+            ngx_log_error(NGX_LOG_ERR, acct->log, 0,
+                          "autocert: account key \"%V\" is not owned by "
+                          "the helper user", &acct->key_path);
+            ngx_close_file(file.fd);
+            return NGX_ERROR;
+        }
         pem.len = (size_t) ngx_file_size(&fi);
     }
 
@@ -187,6 +201,10 @@ ngx_autocert_account_load_key(ngx_autocert_account_t *acct)
 
     n = ngx_read_file(&file, pem.data, pem.len, 0);
     ngx_close_file(file.fd);
+
+    ngx_log_debug2(NGX_LOG_DEBUG_CORE, acct->log, 0,
+                   "autocert: read account key PEM from \"%V\", %z bytes",
+                   &acct->key_path, n);
 
     if (n != (ssize_t) pem.len) {
         ngx_log_error(NGX_LOG_ERR, acct->log, 0,
@@ -219,6 +237,10 @@ ngx_autocert_account_save_key(ngx_autocert_account_t *acct)
     if (ngx_http_autocert_key_to_pem(acct->pool, acct->key, &pem) != NGX_OK) {
         return NGX_ERROR;
     }
+
+    ngx_log_debug2(NGX_LOG_DEBUG_CORE, acct->log, 0,
+                   "autocert: persisting account key to \"%V\", %uz PEM bytes",
+                   &acct->key_path, pem.len);
 
     /*
      * Exclusive create at 0600, no symlink follow: never world-readable, never
@@ -334,6 +356,7 @@ ngx_autocert_account_directory_done(ngx_autocert_acme_request_t *req,
     ngx_autocert_account_t     *acct = req->data;
     ngx_autocert_json_value_t  *root;
     ngx_str_t                   nn, na;
+    ngx_str_t                   scheme = ngx_string("https://");
     ngx_int_t                   ok = NGX_ERROR;
 
     if (rc == NGX_OK && req->status == 200) {
@@ -342,6 +365,10 @@ ngx_autocert_account_directory_done(ngx_autocert_acme_request_t *req,
         if (root != NULL
             && ngx_autocert_json_object_str(root, "newNonce", &nn) == NGX_OK
             && ngx_autocert_json_object_str(root, "newAccount", &na) == NGX_OK
+            && nn.len > scheme.len
+            && na.len > scheme.len
+            && ngx_strncasecmp(nn.data, scheme.data, scheme.len) == 0
+            && ngx_strncasecmp(na.data, scheme.data, scheme.len) == 0
             && ngx_autocert_account_dup(acct, &acct->new_nonce_url, &nn)
                == NGX_OK
             && ngx_autocert_account_dup(acct, &acct->new_account_url, &na)

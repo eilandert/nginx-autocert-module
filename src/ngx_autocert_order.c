@@ -18,13 +18,13 @@
 #include <sys/stat.h>
 
 
-/* Authorization poll: up to ~30 tries, 1s apart (Pebble validates fast; real
- * CAs take a few seconds). */
-#define NGX_AUTOCERT_ORDER_POLL_MAX     30
+/* Authorization poll: up to ~180 tries, 1s apart. Pebble validates fast, but
+ * production CAs can legitimately take longer than the old 30s test budget. */
+#define NGX_AUTOCERT_ORDER_POLL_MAX     180
 #define NGX_AUTOCERT_ORDER_POLL_DELAY   1000    /* ms */
 
 /* Order (finalize) poll: same budget. */
-#define NGX_AUTOCERT_ORDER_FIN_POLL_MAX 30
+#define NGX_AUTOCERT_ORDER_FIN_POLL_MAX 180
 #define NGX_AUTOCERT_ORDER_FIN_DELAY    1000    /* ms */
 
 
@@ -53,6 +53,7 @@ static void ngx_autocert_order_download_done(
     ngx_autocert_acme_request_t *req, ngx_int_t rc);
 static ngx_int_t ngx_autocert_order_store(ngx_autocert_order_t *order);
 static ngx_int_t ngx_autocert_order_domain_safe(ngx_str_t *domain);
+static ngx_int_t ngx_autocert_order_domain_identifier_safe(ngx_str_t *domain);
 static u_char *ngx_autocert_order_tmp_path(ngx_autocert_order_t *order,
     u_char *path);
 static ngx_int_t ngx_autocert_order_write_tmp(ngx_autocert_order_t *order,
@@ -178,6 +179,9 @@ ngx_autocert_order_note_retry_after(ngx_autocert_order_t *order,
 
     /* 429 with no usable hint: hold off 60s rather than retrying immediately. */
     order->retry_after = ngx_time() + 60;
+    ngx_log_debug1(NGX_LOG_DEBUG_CORE, order->log, 0,
+                   "autocert: 429 with no usable Retry-After for \"%V\"",
+                   &order->domain);
     ngx_log_error(NGX_LOG_WARN, order->log, 0,
                   "autocert: rate limited (429) for \"%V\", no usable "
                   "Retry-After; holding 60 s", &order->domain);
@@ -191,6 +195,7 @@ ngx_autocert_order_start(ngx_autocert_order_t *order)
     order->challenge_set = 0;
     order->alpn_set = 0;
     order->poll_tries = 0;
+    order->order_poll_tries = 0;
     order->retry_after = 0;
     ngx_str_null(&order->order_url);
     ngx_str_null(&order->finalize_url);
@@ -200,11 +205,22 @@ ngx_autocert_order_start(ngx_autocert_order_t *order)
     ngx_str_null(&order->token);
     ngx_str_null(&order->keyauth);
 
+    ngx_log_debug2(NGX_LOG_DEBUG_CORE, order->log, 0,
+                   "autocert: order start for \"%V\", challenge %ui",
+                   &order->domain, (ngx_uint_t) order->challenge);
+
     if (order->account == NULL || order->account->kid.len == 0
         || order->domain.len == 0)
     {
         ngx_log_error(NGX_LOG_ERR, order->log, 0,
                       "autocert: order start without account/domain");
+        return NGX_ERROR;
+    }
+
+    if (ngx_autocert_order_domain_identifier_safe(&order->domain) != NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                      "autocert: refusing unsafe domain identifier \"%V\"",
+                      &order->domain);
         return NGX_ERROR;
     }
 
@@ -214,6 +230,8 @@ ngx_autocert_order_start(ngx_autocert_order_t *order)
     }
 
     /* Step 1: GET the directory to discover the newOrder URL. */
+    ngx_log_debug1(NGX_LOG_DEBUG_CORE, order->log, 0,
+                   "autocert: GET directory \"%V\"", &order->directory_url);
     if (ngx_autocert_order_get(order, &order->directory_url,
                                ngx_autocert_order_directory_done)
         != NGX_OK)
@@ -275,6 +293,10 @@ ngx_autocert_order_directory_done(ngx_autocert_acme_request_t *req,
 
     ngx_autocert_order_note_retry_after(order, req);
 
+    ngx_log_debug2(NGX_LOG_DEBUG_CORE, order->log, 0,
+                   "autocert: directory done rc:%i status:%ui", rc,
+                   req->status);
+
     if (rc == NGX_OK && req->status == 200) {
         root = ngx_autocert_json_parse(req->pool, req->body_out.data,
                                        req->body_out.len);
@@ -284,6 +306,9 @@ ngx_autocert_order_directory_done(ngx_autocert_acme_request_t *req,
                == NGX_OK)
         {
             ok = NGX_OK;
+            ngx_log_debug1(NGX_LOG_DEBUG_CORE, order->log, 0,
+                           "autocert: discovered newOrder \"%V\"",
+                           &order->new_order_url);
         }
     }
 
@@ -327,6 +352,10 @@ ngx_autocert_order_new_order(ngx_autocert_order_t *order)
     p = ngx_cpymem(p, "\"}]}", sizeof("\"}]}") - 1);
     payload.len = p - payload.data;
 
+    ngx_log_debug2(NGX_LOG_DEBUG_CORE, order->log, 0,
+                   "autocert: POST newOrder for \"%V\" to \"%V\"",
+                   &order->domain, &order->new_order_url);
+
     return ngx_autocert_account_post(order->account, &order->new_order_url,
                                      &payload,
                                      ngx_autocert_order_new_order_done, order);
@@ -350,6 +379,10 @@ ngx_autocert_order_new_order_done(ngx_autocert_acme_request_t *req,
 
     order = req->data;
     ngx_autocert_order_note_retry_after(order, req);
+
+    ngx_log_debug2(NGX_LOG_DEBUG_CORE, order->log, 0,
+                   "autocert: newOrder done rc:%i status:%ui", rc,
+                   req->status);
 
     /* newOrder replies 201 Created with the order URL in Location. */
     if (rc == NGX_OK && req->status == 201) {
@@ -406,6 +439,9 @@ ngx_autocert_order_get_authz(ngx_autocert_order_t *order)
 {
     ngx_str_t  empty = ngx_null_string;
 
+    ngx_log_debug1(NGX_LOG_DEBUG_CORE, order->log, 0,
+                   "autocert: POST-as-GET authz \"%V\"", &order->authz_url);
+
     return ngx_autocert_account_post(order->account, &order->authz_url, &empty,
                                      ngx_autocert_order_authz_done, order);
 }
@@ -416,7 +452,7 @@ ngx_autocert_order_authz_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
 {
     ngx_autocert_order_t       *order;
     ngx_autocert_json_value_t  *root, *challenges, *ch;
-    ngx_str_t                   thumb, token, type, url, keyauth;
+    ngx_str_t                   thumb, token, type, url, keyauth, chstatus;
     ngx_uint_t                  i, n;
     u_char                     *p;
     ngx_int_t                   ok = NGX_ERROR;
@@ -427,6 +463,9 @@ ngx_autocert_order_authz_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
 
     order = req->data;
     ngx_autocert_order_note_retry_after(order, req);
+
+    ngx_log_debug2(NGX_LOG_DEBUG_CORE, order->log, 0,
+                   "autocert: authz done rc:%i status:%ui", rc, req->status);
 
     if (rc == NGX_OK && req->status == 200) {
         ngx_str_t  azstatus;
@@ -470,6 +509,9 @@ ngx_autocert_order_authz_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
 
         if (challenges != NULL) {
             n = ngx_autocert_json_array_count(challenges);
+            ngx_log_debug2(NGX_LOG_DEBUG_CORE, order->log, 0,
+                           "autocert: authz has %ui challenge(s), want \"%V\"",
+                           n, &want);
 
             for (i = 0; i < n; i++) {
                 ch = ngx_autocert_json_array_item(challenges, i);
@@ -482,6 +524,16 @@ ngx_autocert_order_authz_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
                 {
                     continue;
                 }
+                if (ngx_autocert_json_object_str(ch, "status", &chstatus)
+                    == NGX_OK)
+                {
+                    if (chstatus.len != sizeof("pending") - 1
+                        || ngx_strncmp(chstatus.data, "pending",
+                                       sizeof("pending") - 1) != 0)
+                    {
+                        continue;
+                    }
+                }
                 if (ngx_autocert_json_object_str(ch, "token", &token) == NGX_OK
                     && ngx_autocert_order_token_safe(&token)
                     && ngx_autocert_json_object_str(ch, "url", &url) == NGX_OK
@@ -491,6 +543,9 @@ ngx_autocert_order_authz_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
                                               &url) == NGX_OK)
                 {
                     ok = NGX_OK;
+                    ngx_log_debug2(NGX_LOG_DEBUG_CORE, order->log, 0,
+                                   "autocert: selected %V challenge token "
+                                   "\"%V\"", &want, &order->token);
                     break;          /* complete usable http-01 challenge */
                 }
                 /* malformed/unsafe challenge entry — keep scanning for a usable
@@ -532,6 +587,10 @@ ngx_autocert_order_authz_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
     ngx_memcpy(p, thumb.data, thumb.len);
     order->keyauth = keyauth;
 
+    ngx_log_debug2(NGX_LOG_DEBUG_CORE, order->log, 0,
+                   "autocert: built key authorization for \"%V\", %uz bytes",
+                   &order->domain, keyauth.len);
+
     ngx_destroy_pool(req->pool);
 
     /*
@@ -556,6 +615,9 @@ ngx_autocert_order_authz_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
             return;
         }
         order->challenge_set = 1;
+        ngx_log_debug1(NGX_LOG_DEBUG_CORE, order->log, 0,
+                       "autocert: published http-01 challenge for \"%V\"",
+                       &order->domain);
     }
 
     if (ngx_autocert_order_respond(order) != NGX_OK) {
@@ -585,6 +647,10 @@ ngx_autocert_order_publish_alpn(ngx_autocert_order_t *order)
                       "autocert: tls-alpn-01 selected but no ALPN store");
         return NGX_ERROR;
     }
+
+    ngx_log_debug1(NGX_LOG_DEBUG_CORE, order->log, 0,
+                   "autocert: publishing tls-alpn-01 challenge for \"%V\"",
+                   &order->domain);
 
     tmp = ngx_create_pool(4096, order->log);
     if (tmp == NULL) {
@@ -619,6 +685,10 @@ ngx_autocert_order_publish_alpn(ngx_autocert_order_t *order)
     order->alpn_set = 1;
     rc = NGX_OK;
 
+    ngx_log_debug1(NGX_LOG_DEBUG_CORE, order->log, 0,
+                   "autocert: published tls-alpn-01 challenge for \"%V\"",
+                   &order->domain);
+
     X509_free(cert);
 
 done_key:
@@ -638,6 +708,10 @@ ngx_autocert_order_respond(ngx_autocert_order_t *order)
 {
     ngx_str_t  payload = ngx_string("{}");
 
+    ngx_log_debug1(NGX_LOG_DEBUG_CORE, order->log, 0,
+                   "autocert: POST challenge response \"%V\"",
+                   &order->challenge_url);
+
     return ngx_autocert_account_post(order->account, &order->challenge_url,
                                      &payload,
                                      ngx_autocert_order_respond_done, order);
@@ -655,6 +729,10 @@ ngx_autocert_order_respond_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
 
     order = req->data;
     ngx_autocert_order_note_retry_after(order, req);
+
+    ngx_log_debug2(NGX_LOG_DEBUG_CORE, order->log, 0,
+                   "autocert: challenge response done rc:%i status:%ui", rc,
+                   req->status);
 
     /* The CA accepts the challenge with 200 and status "pending"/"processing". */
     if (rc != NGX_OK || (req->status != 200 && req->status != 202)) {
@@ -674,6 +752,9 @@ ngx_autocert_order_respond_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
     order->poll_timer.data = order;
     order->poll_timer.log = order->log;
     ngx_add_timer(&order->poll_timer, NGX_AUTOCERT_ORDER_POLL_DELAY);
+    ngx_log_debug1(NGX_LOG_DEBUG_CORE, order->log, 0,
+                   "autocert: authz poll armed in %M ms",
+                   (ngx_msec_t) NGX_AUTOCERT_ORDER_POLL_DELAY);
 }
 
 
@@ -689,6 +770,10 @@ ngx_autocert_order_poll_timer(ngx_event_t *ev)
         ngx_autocert_order_finish(order, NGX_ERROR);
         return;
     }
+
+    ngx_log_debug2(NGX_LOG_DEBUG_CORE, order->log, 0,
+                   "autocert: authz poll try %ui for \"%V\"",
+                   order->poll_tries, &order->domain);
 
     if (ngx_autocert_account_post(order->account, &order->authz_url, &empty,
                                   ngx_autocert_order_poll_done, order)
@@ -715,6 +800,10 @@ ngx_autocert_order_poll_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
     ngx_autocert_order_note_retry_after(order, req);
     valid = 0;
     pending = 0;
+
+    ngx_log_debug2(NGX_LOG_DEBUG_CORE, order->log, 0,
+                   "autocert: authz poll done rc:%i status:%ui", rc,
+                   req->status);
 
     if (rc == NGX_OK && req->status == 200) {
         root = ngx_autocert_json_parse(req->pool, req->body_out.data,
@@ -765,6 +854,8 @@ ngx_autocert_order_poll_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
     }
 
     /* still pending/processing -> poll again after the delay */
+    ngx_log_debug1(NGX_LOG_DEBUG_CORE, order->log, 0,
+                   "autocert: authz still pending for \"%V\"", &order->domain);
     ngx_add_timer(&order->poll_timer, NGX_AUTOCERT_ORDER_POLL_DELAY);
 }
 
@@ -836,6 +927,10 @@ ngx_autocert_order_finalize(ngx_autocert_order_t *order)
     *p++ = '}';
     payload.len = p - payload.data;
 
+    ngx_log_debug3(NGX_LOG_DEBUG_CORE, order->log, 0,
+                   "autocert: finalize \"%V\" csr_der:%uz csr_b64:%uz",
+                   &order->domain, csr_der.len, csr_b64.len);
+
     return ngx_autocert_account_post(order->account, &order->finalize_url,
                                      &payload,
                                      ngx_autocert_order_finalize_done, order);
@@ -853,6 +948,10 @@ ngx_autocert_order_finalize_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
 
     order = req->data;
     ngx_autocert_order_note_retry_after(order, req);
+
+    ngx_log_debug2(NGX_LOG_DEBUG_CORE, order->log, 0,
+                   "autocert: finalize done rc:%i status:%ui", rc,
+                   req->status);
 
     /* Finalize returns the order object (200). The order may already be
      * "valid" with a certificate URL, or still "processing" -> poll. */
@@ -872,6 +971,9 @@ ngx_autocert_order_finalize_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
     order->order_timer.data = order;
     order->order_timer.log = order->log;
     ngx_add_timer(&order->order_timer, NGX_AUTOCERT_ORDER_FIN_DELAY);
+    ngx_log_debug1(NGX_LOG_DEBUG_CORE, order->log, 0,
+                   "autocert: order poll armed in %M ms",
+                   (ngx_msec_t) NGX_AUTOCERT_ORDER_FIN_DELAY);
 }
 
 
@@ -888,6 +990,10 @@ ngx_autocert_order_poll_order_timer(ngx_event_t *ev)
         ngx_autocert_order_finish(order, NGX_ERROR);
         return;
     }
+
+    ngx_log_debug2(NGX_LOG_DEBUG_CORE, order->log, 0,
+                   "autocert: order poll try %ui for \"%V\"",
+                   order->order_poll_tries, &order->domain);
 
     if (ngx_autocert_account_post(order->account, &order->order_url, &empty,
                                   ngx_autocert_order_poll_order_done, order)
@@ -916,6 +1022,10 @@ ngx_autocert_order_poll_order_done(ngx_autocert_acme_request_t *req,
     valid = 0;
     pending = 0;
     ngx_str_null(&cert_url);
+
+    ngx_log_debug2(NGX_LOG_DEBUG_CORE, order->log, 0,
+                   "autocert: order poll done rc:%i status:%ui", rc,
+                   req->status);
 
     if (rc == NGX_OK && req->status == 200) {
         root = ngx_autocert_json_parse(req->pool, req->body_out.data,
@@ -954,6 +1064,9 @@ ngx_autocert_order_poll_order_done(ngx_autocert_acme_request_t *req,
     ngx_destroy_pool(req->pool);
 
     if (valid) {
+        ngx_log_debug1(NGX_LOG_DEBUG_CORE, order->log, 0,
+                       "autocert: order valid, certificate URL \"%V\"",
+                       &order->cert_url);
         if (ngx_autocert_order_download(order) != NGX_OK) {
             ngx_autocert_order_finish(order, NGX_ERROR);
         }
@@ -967,6 +1080,8 @@ ngx_autocert_order_poll_order_done(ngx_autocert_acme_request_t *req,
         return;
     }
 
+    ngx_log_debug1(NGX_LOG_DEBUG_CORE, order->log, 0,
+                   "autocert: order still pending for \"%V\"", &order->domain);
     ngx_add_timer(&order->order_timer, NGX_AUTOCERT_ORDER_FIN_DELAY);
 }
 
@@ -976,6 +1091,10 @@ static ngx_int_t
 ngx_autocert_order_download(ngx_autocert_order_t *order)
 {
     ngx_str_t  empty = ngx_null_string;
+
+    ngx_log_debug1(NGX_LOG_DEBUG_CORE, order->log, 0,
+                   "autocert: downloading certificate from \"%V\"",
+                   &order->cert_url);
 
     return ngx_autocert_account_post(order->account, &order->cert_url, &empty,
                                      ngx_autocert_order_download_done, order);
@@ -993,6 +1112,10 @@ ngx_autocert_order_download_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
 
     order = req->data;
     ngx_autocert_order_note_retry_after(order, req);
+
+    ngx_log_debug3(NGX_LOG_DEBUG_CORE, order->log, 0,
+                   "autocert: certificate download done rc:%i status:%ui "
+                   "body:%uz", rc, req->status, req->body_out.len);
 
     if (rc != NGX_OK || req->status != 200 || req->body_out.len == 0) {
         ngx_log_error(NGX_LOG_ERR, order->log, 0,
@@ -1033,6 +1156,35 @@ ngx_autocert_order_download_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
  * not a configured name containing '/' or a "." / ".." segment, so guard here
  * before it becomes a filesystem path. Only NUL is otherwise unsafe.
  */
+static ngx_int_t
+ngx_autocert_order_domain_identifier_safe(ngx_str_t *domain)
+{
+    size_t  i;
+    u_char  c;
+
+    if (domain->len == 0 || domain->len > 253
+        || domain->data[0] == '.'
+        || domain->data[domain->len - 1] == '.')
+    {
+        return NGX_ERROR;
+    }
+
+    for (i = 0; i < domain->len; i++) {
+        c = domain->data[i];
+
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+            || c == '-' || c == '.')
+        {
+            continue;
+        }
+
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+
 static ngx_int_t
 ngx_autocert_order_domain_safe(ngx_str_t *domain)
 {
@@ -1196,7 +1348,8 @@ ngx_autocert_order_write_tmp(ngx_autocert_order_t *order, u_char *tmp,
     size_t   off;
     ssize_t  n;
 
-    fd = open((char *) tmp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW,
+    fd = open((char *) tmp,
+              O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,
               (mode_t) mode);
     if (fd == -1) {
         ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,

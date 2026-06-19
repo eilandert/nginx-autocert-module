@@ -39,6 +39,8 @@ make modules
 #    objs/ngx_http_autocert_module.so       (directives + serving)
 ```
 
+Requires OpenSSL 3.0.0 or newer.
+
 **2. Load both** (helper first) and turn it on:
 
 ```nginx
@@ -145,7 +147,7 @@ One ACME policy per instance. All optional.
 | `autocert_staging on\|off;` | `off` | use Let's Encrypt **staging** CA instead — see note |
 | `autocert_renew_before <time>;` | `7d` | renew this long before expiry |
 | `autocert_key_type secp384r1\|secp256r1;` | `secp384r1` | ECDSA curve (no RSA) |
-| `autocert_store secure;` | `secure` | on-disk layout (only `secure` is implemented) |
+| `autocert_store secure;` | `secure` | on-disk layout (`certbot` is rejected until implemented) |
 | `autocert_path <dir>;` | `autocert` | store location (relative to the nginx prefix) |
 | `autocert_challenge http-01\|tls-alpn-01;` | `http-01` | challenge type |
 | `autocert_resolver <addr>...;` | the `http{}` `resolver` | DNS used to reach the CA |

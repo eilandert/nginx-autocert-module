@@ -19,10 +19,10 @@
 #include <openssl/ecdsa.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
-
-#if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
 #include <openssl/core_names.h>
-#include <openssl/param_build.h>
+
+#if (OPENSSL_VERSION_NUMBER < 0x30000000L)
+#error "nginx-autocert-module requires OpenSSL 3.0.0 or newer"
 #endif
 
 
@@ -67,7 +67,6 @@ ngx_http_autocert_curve_of(EVP_PKEY *pkey)
         return NULL;
     }
 
-#if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
     {
         char    gname[64];
         size_t  glen = 0;
@@ -81,20 +80,6 @@ ngx_http_autocert_curve_of(EVP_PKEY *pkey)
             }
         }
     }
-#else
-    {
-        const EC_KEY    *ec;
-        const EC_GROUP  *group;
-
-        ec = EVP_PKEY_get0_EC_KEY(pkey);
-        if (ec != NULL) {
-            group = EC_KEY_get0_group(ec);
-            if (group != NULL) {
-                nid = EC_GROUP_get_curve_name(group);
-            }
-        }
-    }
-#endif
 
     if (nid == NID_X9_62_prime256v1) {
         return ngx_http_autocert_curve_by_id(NGX_HTTP_AUTOCERT_CRYPTO_P256);
@@ -181,6 +166,9 @@ ngx_http_autocert_key_to_pem(ngx_pool_t *pool, EVP_PKEY *pkey, ngx_str_t *out)
     out->data = buf;
     out->len = len;
 
+    ngx_log_debug1(NGX_LOG_DEBUG_CORE, pool->log, 0,
+                   "autocert: key PEM encoded, %O bytes", (off_t) len);
+
     BIO_free(bio);
     return NGX_OK;
 }
@@ -220,6 +208,9 @@ ngx_http_autocert_cert_to_pem(ngx_pool_t *pool, X509 *cert, ngx_str_t *out)
     out->data = buf;
     out->len = len;
 
+    ngx_log_debug1(NGX_LOG_DEBUG_CORE, pool->log, 0,
+                   "autocert: cert PEM encoded, %O bytes", (off_t) len);
+
     BIO_free(bio);
     return NGX_OK;
 }
@@ -245,6 +236,11 @@ ngx_http_autocert_key_from_pem(ngx_str_t *pem, EVP_PKEY **out)
     BIO_free(bio);
 
     if (pkey == NULL) {
+        return NGX_ERROR;
+    }
+
+    if (ngx_http_autocert_curve_of(pkey) == NULL) {
+        EVP_PKEY_free(pkey);
         return NGX_ERROR;
     }
 
@@ -330,8 +326,7 @@ ngx_http_autocert_base64url_decode(ngx_pool_t *pool, ngx_str_t *in,
 
 /*
  * Extract the affine public coordinates X and Y as fixed-width big-endian
- * buffers of exactly c->coord_len bytes (left-padded with zeros). Both 3.0+
- * (param API) and 1.1.1 (EC_POINT) paths land on the same BIGNUM pair.
+ * buffers of exactly c->coord_len bytes (left-padded with zeros).
  */
 static ngx_int_t
 ngx_http_autocert_ec_xy(ngx_pool_t *pool,
@@ -342,39 +337,11 @@ ngx_http_autocert_ec_xy(ngx_pool_t *pool,
     u_char   *xb, *yb;
     ngx_int_t rc = NGX_ERROR;
 
-#if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
     if (EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_EC_PUB_X, &bx) != 1
         || EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_EC_PUB_Y, &by) != 1)
     {
         goto done;
     }
-#else
-    {
-        const EC_KEY    *ec;
-        const EC_GROUP  *group;
-        const EC_POINT  *pub;
-
-        ec = EVP_PKEY_get0_EC_KEY(pkey);
-        if (ec == NULL) {
-            goto done;
-        }
-        group = EC_KEY_get0_group(ec);
-        pub = EC_KEY_get0_public_key(ec);
-        if (group == NULL || pub == NULL) {
-            goto done;
-        }
-
-        bx = BN_new();
-        by = BN_new();
-        if (bx == NULL || by == NULL) {
-            goto done;
-        }
-
-        if (EC_POINT_get_affine_coordinates(group, pub, bx, by, NULL) != 1) {
-            goto done;
-        }
-    }
-#endif
 
     xb = ngx_pnalloc(pool, c->coord_len);
     yb = ngx_pnalloc(pool, c->coord_len);
@@ -416,8 +383,13 @@ ngx_http_autocert_jwk_public(ngx_pool_t *pool, EVP_PKEY *pkey, ngx_str_t *out)
 
     c = ngx_http_autocert_curve_of(pkey);
     if (c == NULL) {
+        ngx_log_debug0(NGX_LOG_DEBUG_CORE, pool->log, 0,
+                       "autocert: jwk_public: unsupported/non-EC key");
         return NGX_ERROR;
     }
+
+    ngx_log_debug1(NGX_LOG_DEBUG_CORE, pool->log, 0,
+                   "autocert: building public JWK, crv=%s", c->jwk_crv);
 
     if (ngx_http_autocert_ec_xy(pool, c, pkey, &x, &y) != NGX_OK
         || ngx_http_autocert_base64url_encode(pool, &x, &xb64) != NGX_OK
@@ -447,6 +419,9 @@ ngx_http_autocert_jwk_public(ngx_pool_t *pool, EVP_PKEY *pkey, ngx_str_t *out)
     *p++ = '}';
 
     out->len = p - out->data;
+
+    ngx_log_debug1(NGX_LOG_DEBUG_CORE, pool->log, 0,
+                   "autocert: public JWK built, %uz bytes", out->len);
     return NGX_OK;
 }
 
@@ -1045,8 +1020,7 @@ ngx_http_autocert_cert_not_after(const char *path, time_t *out)
 
     rc = NGX_ERROR;
 
-    /* ASN1_TIME_to_tm fills a UTC struct tm (OpenSSL 1.1.1+, BoringSSL — both
-     * already required by the JOSE primitives). */
+    /* ASN1_TIME_to_tm fills a UTC struct tm. */
     if (ASN1_TIME_to_tm(X509_get0_notAfter(leaf), &tm) == 1) {
         t = ngx_autocert_timegm(&tm);
         if (t != (time_t) -1) {

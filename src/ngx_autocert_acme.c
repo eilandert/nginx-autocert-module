@@ -19,6 +19,7 @@
 
 
 static ngx_int_t ngx_autocert_acme_parse_url(ngx_autocert_acme_request_t *r);
+static ngx_int_t ngx_autocert_acme_url_part_safe(ngx_str_t *s);
 static void ngx_autocert_acme_resolve_handler(ngx_resolver_ctx_t *ctx);
 static ngx_int_t ngx_autocert_acme_connect(ngx_autocert_acme_request_t *r,
     struct sockaddr *sockaddr, socklen_t socklen);
@@ -131,11 +132,18 @@ ngx_autocert_acme_request(ngx_autocert_acme_request_t *r)
         ngx_str_set(&r->method, "GET");
     }
 
+    ngx_log_debug2(NGX_LOG_DEBUG_CORE, r->log, 0,
+                   "autocert: request %V \"%V\"", &r->method, &r->url);
+
     if (ngx_autocert_acme_parse_url(r) != NGX_OK) {
         ngx_log_error(NGX_LOG_ERR, r->log, 0,
                       "autocert: invalid CA URL \"%V\"", &r->url);
         return NGX_ERROR;
     }
+
+    ngx_log_debug3(NGX_LOG_DEBUG_CORE, r->log, 0,
+                   "autocert: parsed URL host %V port %d uri %V",
+                   &r->host, (int) r->port, &r->uri);
 
     if (r->client->resolver == NULL) {
         ngx_log_error(NGX_LOG_ERR, r->log, 0,
@@ -156,10 +164,16 @@ ngx_autocert_acme_request(ngx_autocert_acme_request_t *r)
         if (ngx_parse_addr(r->pool, &addr, r->host.data, r->host.len)
             == NGX_OK)
         {
+            ngx_log_debug1(NGX_LOG_DEBUG_CORE, r->log, 0,
+                           "autocert: host %V is a literal IP, skip resolve",
+                           &r->host);
             ngx_inet_set_port(addr.sockaddr, r->port);
             return ngx_autocert_acme_connect(r, addr.sockaddr, addr.socklen);
         }
     }
+
+    ngx_log_debug1(NGX_LOG_DEBUG_CORE, r->log, 0,
+                   "autocert: resolving host %V", &r->host);
 
     temp.name = r->host;
 
@@ -201,6 +215,23 @@ ngx_autocert_acme_request(ngx_autocert_acme_request_t *r)
  * ACME is TLS-only. IPv6 literals in [..] are supported. Defaults: port 443,
  * uri "/".
  */
+static ngx_int_t
+ngx_autocert_acme_url_part_safe(ngx_str_t *s)
+{
+    size_t  i;
+    u_char  ch;
+
+    for (i = 0; i < s->len; i++) {
+        ch = s->data[i];
+        if (ch < 0x21 || ch == 0x7f) {
+            return NGX_ERROR;
+        }
+    }
+
+    return NGX_OK;
+}
+
+
 static ngx_int_t
 ngx_autocert_acme_parse_url(ngx_autocert_acme_request_t *r)
 {
@@ -279,6 +310,12 @@ ngx_autocert_acme_parse_url(ngx_autocert_acme_request_t *r)
         return NGX_ERROR;
     }
 
+    if (ngx_autocert_acme_url_part_safe(&r->host) != NGX_OK
+        || ngx_autocert_acme_url_part_safe(&r->uri) != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+
     /*
      * Re-point host at a NUL-terminated pool copy: SSL_set_tlsext_host_name
      * needs a C string, and host as sliced from the URL buffer is not
@@ -327,6 +364,10 @@ ngx_autocert_acme_resolve_handler(ngx_resolver_ctx_t *ctx)
         ngx_autocert_acme_finalize(r, NGX_ERROR);
         return;
     }
+
+    ngx_log_debug2(NGX_LOG_DEBUG_CORE, r->log, 0,
+                   "autocert: resolve \"%V\" returned %ui address(es)",
+                   &r->host, ctx->naddrs);
 
     /* Use the first address; copy it out before releasing the resolver ctx. */
     socklen = ctx->addrs[0].socklen;
@@ -386,9 +427,14 @@ ngx_autocert_acme_connect(ngx_autocert_acme_request_t *r,
     c->read->handler = ngx_autocert_acme_connect_handler;
 
     if (rc == NGX_AGAIN) {
+        ngx_log_debug1(NGX_LOG_DEBUG_CORE, r->log, 0,
+                       "autocert: connect to \"%V\" in progress", &r->host);
         ngx_add_timer(c->write, r->client->connect_timeout);
         return NGX_OK;
     }
+
+    ngx_log_debug1(NGX_LOG_DEBUG_CORE, r->log, 0,
+                   "autocert: connected to \"%V\", starting TLS", &r->host);
 
     /*
      * rc == NGX_OK: connected immediately. If TLS setup fails synchronously
@@ -1021,6 +1067,13 @@ ngx_autocert_acme_parse_response(ngx_autocert_acme_request_t *r)
             }
 
             line = eol + sizeof(CRLF) - 1;
+        }
+
+        if (r->chunked && r->content_length >= 0) {
+            ngx_log_error(NGX_LOG_ERR, r->log, 0,
+                          "autocert: response from \"%V\" has both "
+                          "Transfer-Encoding and Content-Length", &r->host);
+            return NGX_ERROR;
         }
 
         r->headers_done = 1;

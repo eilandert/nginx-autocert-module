@@ -16,7 +16,7 @@
  * fixes the node layout both copies must agree on.
  *
  * Tokens are short ASCII (RFC 8555 base64url, ~43 chars); keyauths are a bit
- * longer. Both are bounded below so a malformed value can't bloat the slab.
+ * longer. Both are bounded above so a malformed value can't bloat the slab.
  */
 
 #ifndef _NGX_AUTOCERT_CHALLENGE_H_INCLUDED_

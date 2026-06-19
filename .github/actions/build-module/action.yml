@@ -57,6 +57,7 @@ runs:
         cd "${{ inputs.dir }}"
         ./configure --with-compat --with-http_ssl_module \
           --with-cc="ccache cc" \
+          --with-cc-opt="-Wall -Wextra -Werror" \
           --add-dynamic-module="$GITHUB_WORKSPACE" > /tmp/conf.log 2>&1 \
           || { tail -40 /tmp/conf.log; exit 1; }
         # Full build (not `make modules`): the load test needs the server
@@ -91,7 +92,7 @@ runs:
             autocert_ca https://acme-staging-v02.api.letsencrypt.org/directory;
             autocert_renew_before 10d;
             autocert_key_type secp256r1;
-            autocert_store certbot;
+            autocert_store secure;
             autocert_path /var/lib/autocert;
             autocert_challenge tls-alpn-01;
             server {
@@ -156,6 +157,7 @@ runs:
         run_neg "invalid email"        'server { listen 8080; autocert on x@; }'                          'invalid email'
         run_neg "bad key_type"         'autocert_key_type rsa2048;'                                       'invalid key type'
         run_neg "bad store"            'autocert_store vault;'                                            'invalid store'
+        run_neg "certbot store"        'autocert_store certbot;'                                          'not implemented yet'
         run_neg "bad challenge"        'autocert_challenge dns-01;'                                       'invalid challenge'
         run_neg "duplicate key"        'autocert_key_type secp384r1; autocert_key_type secp256r1;'        'is duplicate'
         run_neg "knob in server{}"     'server { listen 8080; autocert_ca http://x/; }'                   'directive is not allowed'
@@ -226,7 +228,7 @@ runs:
     # Publish the built tree (objs + src headers) so unit/integration jobs
     # link/run against it instead of recompiling.
     - name: Upload built tree
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
       with:
         name: build-${{ inputs.flavor }}
         path: |

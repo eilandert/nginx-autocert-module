@@ -114,10 +114,10 @@ void ngx_autocert_account_free(ngx_autocert_account_t *acct);
  * The completion handler is invoked exactly once with the finished request (so
  * the caller can read req->status / req->body_out / response headers) and rc
  * (NGX_OK if a response was received — inspect status — or NGX_ERROR on a
- * transport failure or if the retry was also exhausted). On NGX_OK the request
- * pool is the caller's to destroy from inside the handler, as with the raw
- * client; on NGX_ERROR the req argument may be NULL (no request survived) so
- * the handler MUST null-check before touching it.
+ * transport failure or if the retry was also exhausted). The request pool is
+ * the caller's to destroy from inside the handler, as with the raw client; on
+ * NGX_ERROR a reserved synthetic req is supplied with status 0 when no HTTP
+ * response survived.
  *
  * acct must be a registered account (acct->kid set). Returns NGX_OK once the
  * request is started (handler fires later) or NGX_ERROR if it could not start
