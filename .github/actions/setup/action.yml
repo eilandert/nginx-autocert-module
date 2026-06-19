@@ -27,6 +27,14 @@ runs:
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends ${{ inputs.packages }}
 
+    # Pin CCACHE_DIR: ccache 4 (the runner default) uses ~/.cache/ccache, but
+    # the cache step below saves/restores ~/.ccache. Point ccache at the cached
+    # dir so it actually warms across runs (otherwise it silently never hits).
+    - name: Point ccache at the cached dir
+      if: inputs.ccache-key != ''
+      shell: bash
+      run: echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
+
     - name: Restore ccache
       if: inputs.ccache-key != ''
       uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4

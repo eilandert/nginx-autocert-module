@@ -11,6 +11,8 @@ name: Build & Test
 #   ./.github/actions/setup         apt deps + optional ccache restore.
 #   ./.github/actions/build-module  fetch+build one flavor, run the no-network
 #                                   load/serve tests, upload build-<flavor>.
+#   ./.github/actions/run-e2e       restore build-nginx + run one tests/*.sh
+#                                   Pebble e2e (optionally under sudo).
 
 # Neither nginx nor angie is pinned: the `resolve` job scrapes the current
 # mainline nginx and the latest angie release at run time.
@@ -282,21 +284,11 @@ jobs:
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Setup runtime deps
-        uses: ./.github/actions/setup
-        with:
-          packages: libpcre2-8-0
-      - name: Download nginx build
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
-        with:
-          name: build-nginx
-          path: ${{ needs.resolve.outputs.nginx_dir }}
       - name: Helper registers an ACME account over verified TLS
-        run: |
-          NGX="$GITHUB_WORKSPACE/${{ needs.resolve.outputs.nginx_dir }}"
-          chmod +x "$NGX/objs/nginx"
-          SERVER_BIN="$NGX/objs/nginx" NGX_BUILD_DIR="$NGX" \
-            bash "$GITHUB_WORKSPACE/tests/acme-directory.sh"
+        uses: ./.github/actions/run-e2e
+        with:
+          nginx-dir: ${{ needs.resolve.outputs.nginx_dir }}
+          script: acme-directory.sh
 
   order-authz:
     name: ACME order + authz reaches valid (M6a)
@@ -306,21 +298,12 @@ jobs:
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Setup runtime deps
-        uses: ./.github/actions/setup
-        with:
-          packages: libpcre2-8-0
-      - name: Download nginx build
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
-        with:
-          name: build-nginx
-          path: ${{ needs.resolve.outputs.nginx_dir }}
       - name: Full order -> authz -> http-01 -> valid against Pebble
-        run: |
-          NGX="$GITHUB_WORKSPACE/${{ needs.resolve.outputs.nginx_dir }}"
-          chmod +x "$NGX/objs/nginx"
-          sudo env SERVER_BIN="$NGX/objs/nginx" NGX_BUILD_DIR="$NGX" \
-            bash "$GITHUB_WORKSPACE/tests/order-authz.sh"
+        uses: ./.github/actions/run-e2e
+        with:
+          nginx-dir: ${{ needs.resolve.outputs.nginx_dir }}
+          script: order-authz.sh
+          sudo: "true"
 
   tls-alpn-issue:
     name: tls-alpn-01 full issuance, no port 80 (M10c)
@@ -330,21 +313,11 @@ jobs:
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Setup runtime deps
-        uses: ./.github/actions/setup
-        with:
-          packages: libpcre2-8-0
-      - name: Download nginx build
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
-        with:
-          name: build-nginx
-          path: ${{ needs.resolve.outputs.nginx_dir }}
       - name: Full tls-alpn-01 issuance against Pebble (port 80 never used)
-        run: |
-          NGX="$GITHUB_WORKSPACE/${{ needs.resolve.outputs.nginx_dir }}"
-          chmod +x "$NGX/objs/nginx"
-          SERVER_BIN="$NGX/objs/nginx" NGX_BUILD_DIR="$NGX" \
-            bash "$GITHUB_WORKSPACE/tests/tls-alpn-issue.sh"
+        uses: ./.github/actions/run-e2e
+        with:
+          nginx-dir: ${{ needs.resolve.outputs.nginx_dir }}
+          script: tls-alpn-issue.sh
 
   renewal:
     name: ACME renewal + multi-name issuance (M8)
@@ -354,21 +327,12 @@ jobs:
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Setup runtime deps
-        uses: ./.github/actions/setup
-        with:
-          packages: libpcre2-8-0
-      - name: Download nginx build
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
-        with:
-          name: build-nginx
-          path: ${{ needs.resolve.outputs.nginx_dir }}
       - name: Provision two domains, then force a renewal reissue
-        run: |
-          NGX="$GITHUB_WORKSPACE/${{ needs.resolve.outputs.nginx_dir }}"
-          chmod +x "$NGX/objs/nginx"
-          sudo env SERVER_BIN="$NGX/objs/nginx" NGX_BUILD_DIR="$NGX" \
-            bash "$GITHUB_WORKSPACE/tests/renewal.sh"
+        uses: ./.github/actions/run-e2e
+        with:
+          nginx-dir: ${{ needs.resolve.outputs.nginx_dir }}
+          script: renewal.sh
+          sudo: "true"
 
   backoff:
     name: Per-name failure backoff (M9b)
@@ -378,21 +342,12 @@ jobs:
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Setup runtime deps
-        uses: ./.github/actions/setup
-        with:
-          packages: libpcre2-8-0
-      - name: Download nginx build
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
-        with:
-          name: build-nginx
-          path: ${{ needs.resolve.outputs.nginx_dir }}
       - name: A failing name must back off, a good name issues once
-        run: |
-          NGX="$GITHUB_WORKSPACE/${{ needs.resolve.outputs.nginx_dir }}"
-          chmod +x "$NGX/objs/nginx"
-          sudo env SERVER_BIN="$NGX/objs/nginx" NGX_BUILD_DIR="$NGX" \
-            bash "$GITHUB_WORKSPACE/tests/backoff.sh"
+        uses: ./.github/actions/run-e2e
+        with:
+          nginx-dir: ${{ needs.resolve.outputs.nginx_dir }}
+          script: backoff.sh
+          sudo: "true"
 
   retry-after:
     name: 429 / Retry-After rate-limit awareness (M9c)
@@ -402,18 +357,9 @@ jobs:
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: Setup runtime deps
-        uses: ./.github/actions/setup
-        with:
-          packages: libpcre2-8-0
-      - name: Download nginx build
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
-        with:
-          name: build-nginx
-          path: ${{ needs.resolve.outputs.nginx_dir }}
       - name: A 429 must honour Retry-After over the exponential backoff
-        run: |
-          NGX="$GITHUB_WORKSPACE/${{ needs.resolve.outputs.nginx_dir }}"
-          chmod +x "$NGX/objs/nginx"
-          sudo env SERVER_BIN="$NGX/objs/nginx" NGX_BUILD_DIR="$NGX" \
-            bash "$GITHUB_WORKSPACE/tests/retry-after.sh"
+        uses: ./.github/actions/run-e2e
+        with:
+          nginx-dir: ${{ needs.resolve.outputs.nginx_dir }}
+          script: retry-after.sh
+          sudo: "true"
