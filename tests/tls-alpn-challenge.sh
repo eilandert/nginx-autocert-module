@@ -110,4 +110,17 @@ printf '%s\n' "$ALPN_NEG" | grep -qi 'http/1.1' \
     || { echo "::error::ALPN did not negotiate http/1.1 (got: $ALPN_NEG)"; exit 1; }
 echo "✓ ALPN negotiated http/1.1 for a normal client"
 
+echo "== mixed-case SNI under acme-tls/1 still serves the challenge cert =="
+# The worker lowercases the SNI before ngx_autocert_alpn_get(), so an ACME CA
+# (or anything) presenting an upper/mixed-case SNI must still resolve to the
+# lowercased store entry the helper seeded.
+UPPER_DOMAIN=$(printf '%s' "$DOMAIN" | tr '[:lower:]' '[:upper:]')   # ALPN.EXAMPLE.COM
+MIXED_TEXT="$(printf '' | openssl s_client -connect "127.0.0.1:$PORT" \
+    -servername "$UPPER_DOMAIN" -alpn acme-tls/1 2>/dev/null \
+    | openssl x509 2>/dev/null | openssl x509 -text -noout 2>/dev/null)"
+[ -n "$MIXED_TEXT" ] || { echo "::error::no cert returned for mixed-case SNI $UPPER_DOMAIN under acme-tls/1"; exit 1; }
+printf '%s\n' "$MIXED_TEXT" | grep -q "$ACME_OID" \
+    || { echo "::error::mixed-case SNI $UPPER_DOMAIN did not get the challenge cert (no acmeIdentifier)"; exit 1; }
+echo "✓ mixed-case SNI $UPPER_DOMAIN served the tls-alpn-01 challenge cert"
+
 echo "ALL TLS-ALPN-01 SERVE-PATH CHECKS PASSED"
