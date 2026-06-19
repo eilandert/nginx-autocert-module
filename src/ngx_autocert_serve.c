@@ -333,7 +333,6 @@ ngx_http_autocert_cert_cb(SSL *ssl_conn, void *arg)
         && ngx_autocert_alpn_conn_index != -1
         && SSL_get_ex_data(ssl_conn, ngx_autocert_alpn_conn_index) != NULL)
     {
-        servername = SSL_get_servername(ssl_conn, TLSEXT_NAMETYPE_host_name);
         if (servername == NULL) {
             ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0,
                            "autocert: acme-tls/1 handshake without SNI, "
@@ -359,7 +358,6 @@ ngx_http_autocert_cert_cb(SSL *ssl_conn, void *arg)
         return ngx_http_autocert_serve_alpn_cert(c, ssl_conn, sctx, &host);
     }
 
-    servername = SSL_get_servername(ssl_conn, TLSEXT_NAMETYPE_host_name);
     if (servername == NULL) {
         ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->log, 0,
                        "autocert: no SNI, keeping bootstrap cert");
