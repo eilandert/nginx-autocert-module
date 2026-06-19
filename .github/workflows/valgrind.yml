@@ -62,13 +62,13 @@ jobs:
           set -euo pipefail
           mkdir -p ~/.cache/src-tarballs
           curl -fsSL \
-            -o ~/.cache/src-tarballs/nginx-${NGINX_VERSION}.tar.gz \
+            -o "$HOME/.cache/src-tarballs/nginx-${NGINX_VERSION}.tar.gz" \
             "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
 
       - name: Extract nginx
         run: |
           set -euo pipefail
-          tar -xzf ~/.cache/src-tarballs/nginx-${NGINX_VERSION}.tar.gz
+          tar -xzf "$HOME/.cache/src-tarballs/nginx-${NGINX_VERSION}.tar.gz"
 
       - name: Configure + build debug nginx with autocert
         run: |
