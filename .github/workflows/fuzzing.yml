@@ -71,14 +71,14 @@ jobs:
           set -euo pipefail
           mkdir -p ~/.cache/src-tarballs
           curl -fsSL \
-            -o ~/.cache/src-tarballs/nginx-${NGINX_VERSION}.tar.gz \
+            -o "$HOME/.cache/src-tarballs/nginx-${NGINX_VERSION}.tar.gz" \
             "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
 
       - name: Build nginx objects used by the parser harness
         run: |
           set -euo pipefail
           mkdir -p .build
-          tar -xzf ~/.cache/src-tarballs/nginx-${NGINX_VERSION}.tar.gz -C .build
+          tar -xzf "$HOME/.cache/src-tarballs/nginx-${NGINX_VERSION}.tar.gz" -C .build
           cd ".build/nginx-${NGINX_VERSION}"
           ./configure --with-http_ssl_module
           make -j"$(nproc)"

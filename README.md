@@ -1,6 +1,9 @@
 # nginx-autocert-module
 
 [![Build & Test](https://github.com/eilandert/nginx-autocert-module/actions/workflows/build-test.yml/badge.svg)](https://github.com/eilandert/nginx-autocert-module/actions/workflows/build-test.yml)
+[![CodeQL](https://github.com/eilandert/nginx-autocert-module/actions/workflows/codeql.yml/badge.svg)](https://github.com/eilandert/nginx-autocert-module/actions/workflows/codeql.yml)
+[![Security Scanners](https://github.com/eilandert/nginx-autocert-module/actions/workflows/security-scanners.yml/badge.svg)](https://github.com/eilandert/nginx-autocert-module/actions/workflows/security-scanners.yml)
+[![Fuzzing](https://github.com/eilandert/nginx-autocert-module/actions/workflows/fuzzing.yml/badge.svg)](https://github.com/eilandert/nginx-autocert-module/actions/workflows/fuzzing.yml)
 [![Valgrind](https://github.com/eilandert/nginx-autocert-module/actions/workflows/valgrind.yml/badge.svg)](https://github.com/eilandert/nginx-autocert-module/actions/workflows/valgrind.yml)
 
 **Automatic TLS certificates for NGINX — built into the server.**
@@ -21,7 +24,7 @@ domains *is* your existing config.
   native `acme`).
 
 > 📖 New here? Read the walkthrough:
-> **[Automatic TLS Certs, No Certbot](https://deb.myguard.nl/2026/06/nginx-autocert-module-automatic-acme-certificates/)**
+> **[Automatic TLS Certs, No Certbot](https://deb.myguard.nl/2026/06/nginx-autocert-module/)**
 > on deb.myguard.nl.
 
 ---
@@ -210,6 +213,6 @@ on Angie, use its native `acme` directive instead.
 
 ## See also
 
-- 📝 Article: [Automatic TLS Certs, No Certbot](https://deb.myguard.nl/2026/06/nginx-autocert-module-automatic-acme-certificates/) — what it is and how it works, in plain English.
+- 📝 Article: [Automatic TLS Certs, No Certbot](https://deb.myguard.nl/2026/06/nginx-autocert-module/) — what it is and how it works, in plain English.
 - 📦 [NGINX modules repository for Debian & Ubuntu](https://deb.myguard.nl/nginx-modules/) — 100+ ready-built NGINX modules, no compiling.
 - 💻 Source: <https://github.com/eilandert/nginx-autocert-module>

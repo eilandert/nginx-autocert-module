@@ -70,7 +70,11 @@ struct ngx_autocert_json_value_s {
 
     union {
         ngx_uint_t                    boolean;   /* BOOL: 0/1 */
-        ngx_str_t                     string;    /* STRING: decoded bytes */
+        ngx_str_t                     string;    /* STRING: decoded bytes; may
+                                                  * contain an interior NUL
+                                                  * (from a \u0000 escape) -
+                                                  * always use .len, never treat
+                                                  * as a C string. */
         ngx_str_t                     number;    /* NUMBER: raw token text */
         ngx_autocert_json_member_t   *members;   /* OBJECT: NULL if empty */
         ngx_autocert_json_element_t  *elements;  /* ARRAY: NULL if empty */
@@ -91,7 +95,8 @@ ngx_autocert_json_value_t *ngx_autocert_json_parse(ngx_pool_t *pool,
 /*
  * Look up a member by key in an OBJECT value. Returns the value, or NULL if v
  * is not an object or the key is absent. Key match is exact (case-sensitive),
- * as ACME member names are.
+ * as ACME member names are. On a duplicate key the FIRST occurrence (source
+ * order) wins — RFC 8259 leaves duplicates undefined; ACME never sends them.
  */
 ngx_autocert_json_value_t *ngx_autocert_json_object_get(
     ngx_autocert_json_value_t *v, const char *key);

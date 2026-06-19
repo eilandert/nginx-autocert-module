@@ -21,6 +21,16 @@
  * both address the same shared slab through the zone, so a duplicated copy in
  * each is correct (cf. ngx_autocert_challenge / the crypto TU). The shared
  * header fixes the node layout both copies must agree on.
+ *
+ * Domain key contract: the domain is matched byte-exact (crc32 + memcmp), so
+ * the writer and reader MUST agree on casing. This store does NOT lowercase
+ * internally — callers must pass an already NORMALIZED (lowercased) DNS name.
+ * The production paths honour this: server_name is lowercased by nginx at
+ * config time (so the helper inserts a lowercased name) and the worker
+ * lowercases the SNI before ngx_autocert_alpn_get(). The one exception is the
+ * test-only `autocert_test_alpn` directive, which seeds its argument verbatim;
+ * a mixed-case test domain therefore won't be found and must be given in lower
+ * case.
  */
 
 #ifndef _NGX_AUTOCERT_ALPN_H_INCLUDED_

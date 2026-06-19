@@ -60,9 +60,14 @@ jobs:
         run: |
           bash -n tests/*.sh fuzz/build.sh
           shellcheck tests/*.sh fuzz/build.sh
+          # Tell cppcheck the OpenSSL version so it takes the satisfied branch
+          # of the >= 3.0.0 floor guard instead of evaluating the intentional
+          # `#error` with the macro undefined (cppcheck doesn't parse the system
+          # opensslv.h). The real build enforces the same floor at compile time.
           cppcheck \
             --enable=warning,performance,portability \
             --error-exitcode=1 \
+            -DOPENSSL_VERSION_NUMBER=0x30000000L \
             --suppress=missingIncludeSystem \
             --suppress=normalCheckLevelMaxBranches \
             --suppress=unusedFunction \
