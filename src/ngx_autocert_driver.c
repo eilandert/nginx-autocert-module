@@ -931,6 +931,9 @@ ngx_autocert_driver_trylock(ngx_cycle_t *cycle)
         return NGX_ERROR;
     }
 
+    ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
+                  "autocert: acquired driver lock, pid %P", ngx_pid);
+
     return NGX_OK;                          /* we are now the sole driver */
 }
 
@@ -1067,5 +1070,7 @@ ngx_autocert_driver_exit_process(ngx_cycle_t *cycle)
     if (ngx_autocert_lock_fd != -1) {
         (void) close(ngx_autocert_lock_fd);
         ngx_autocert_lock_fd = -1;
+        ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
+                      "autocert: released driver lock, pid %P", ngx_pid);
     }
 }
