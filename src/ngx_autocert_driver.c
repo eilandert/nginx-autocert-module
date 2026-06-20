@@ -860,6 +860,45 @@ ngx_autocert_driver_trylock(ngx_cycle_t *cycle)
         return NGX_ERROR;
     }
 
+    /*
+     * Ensure the store directory exists before we put the lock file (and later
+     * the account key + certs) in it. The old root helper relied on the dir
+     * pre-existing; the worker driver creates it (idempotent, EEXIST is fine) so
+     * a fresh deploy with a not-yet-created autocert_path works out of the box.
+     * ngx_create_full_path makes intermediate components too. 0700: only the
+     * worker user needs it (it holds private keys).
+     */
+    ngx_memcpy(path, acf.path.data, acf.path.len);
+    path[acf.path.len] = '\0';
+
+    if (ngx_create_dir(path, 0700) == NGX_FILE_ERROR) {
+        ngx_err_t  err = ngx_errno;
+
+        if (err == NGX_ENOENT) {
+            /* A parent component is missing — create the whole chain (this makes
+             * the intermediates; ngx_create_full_path stops at the last '/', so
+             * retry the leaf mkdir afterwards). */
+            ngx_err_t  ferr = ngx_create_full_path(path, 0700);
+            if (ferr != 0 && ferr != NGX_EEXIST) {
+                ngx_log_error(NGX_LOG_ERR, cycle->log, ferr,
+                              "autocert: cannot create store path \"%s\"", path);
+                return NGX_ERROR;
+            }
+            if (ngx_create_dir(path, 0700) == NGX_FILE_ERROR
+                && ngx_errno != NGX_EEXIST)
+            {
+                ngx_log_error(NGX_LOG_ERR, cycle->log, ngx_errno,
+                              "autocert: cannot create store dir \"%s\"", path);
+                return NGX_ERROR;
+            }
+
+        } else if (err != NGX_EEXIST) {
+            ngx_log_error(NGX_LOG_ERR, cycle->log, err,
+                          "autocert: cannot create store dir \"%s\"", path);
+            return NGX_ERROR;
+        }
+    }
+
     p = ngx_cpymem(path, acf.path.data, acf.path.len);
     p = ngx_cpymem(p, "/.driver.lock", sizeof("/.driver.lock") - 1);
     *p = '\0';

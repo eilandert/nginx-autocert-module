@@ -86,6 +86,7 @@ runs:
         mkdir -p "$PREFIX/logs" "$PREFIX/conf"
         cat > "$PREFIX/conf/nginx.conf" <<EOF
         load_module $MOD;
+        error_log $PREFIX/logs/error.log notice;   # NOTICE level: the worker-0 driver-armed line is NOTICE
         events {}
         http {
             autocert on admin@example.com;   # global
@@ -94,7 +95,7 @@ runs:
             autocert_renew_before 10d;
             autocert_key_type secp256r1;
             autocert_store secure;
-            autocert_path /var/lib/autocert;
+            autocert_path $PREFIX/store;   # writable by the unprivileged runner; the worker-0 driver creates + locks it
             autocert_challenge tls-alpn-01;
             server {
                 listen 8080;
