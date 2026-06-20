@@ -1140,6 +1140,47 @@ ngx_autocert_acme_parse_response(ngx_autocert_acme_request_t *r)
 
 
 /*
+ * Parse one hex chunk-size token from [p, eol) (RFC 7230 §4.1.1), tolerating a
+ * trailing ";ext" / whitespace. Returns NGX_OK with *out set, or NGX_ERROR on
+ * an empty line (p == eol), a non-hex/non-delimiter byte, or a size that would
+ * overflow size_t. A line that starts with a delimiter (";", SP, HTAB) parses
+ * as size 0 — matching the original pass-1 grammar (so the terminating
+ * zero-chunk and a bare ";ext" line are both read as 0). Used by BOTH passes of
+ * the decoder so the overflow guard and grammar can't drift between a
+ * validating first pass and a trusting second pass.
+ */
+static ngx_int_t
+ngx_autocert_acme_chunk_size(u_char *p, u_char *eol, size_t *out)
+{
+    size_t   size = 0;
+    u_char  *q;
+
+    if (p == eol) {
+        return NGX_ERROR;                   /* empty size line */
+    }
+
+    for (q = p; q < eol; q++) {
+        u_char  c = *q;
+        int     d;
+
+        if (c >= '0' && c <= '9')      d = c - '0';
+        else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+        else if (c == ';' || c == ' ' || c == '\t') break;   /* ext / pad */
+        else return NGX_ERROR;
+
+        if (size > (NGX_MAX_SIZE_T_VALUE >> 4)) {
+            return NGX_ERROR;               /* would overflow size_t */
+        }
+        size = (size << 4) | (size_t) d;
+    }
+
+    *out = size;
+    return NGX_OK;
+}
+
+
+/*
  * Decode a chunked body (RFC 7230 §4.1). Operates on the whole accumulated
  * body region [body_offset, last) each call — cheap for the small ACME cert
  * responses. Returns NGX_DONE once the terminating zero-size chunk is seen
@@ -1168,28 +1209,8 @@ ngx_autocert_acme_dechunk(ngx_autocert_acme_request_t *r)
         }
 
         /* hex chunk-size, optionally followed by ";ext" */
-        {
-            u_char  *q = p;
-            size = 0;
-
-            if (q == eol) {
-                return NGX_ERROR;           /* empty size line */
-            }
-            for ( ; q < eol; q++) {
-                u_char  c = *q;
-                int     d;
-
-                if (c >= '0' && c <= '9')      d = c - '0';
-                else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
-                else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
-                else if (c == ';' || c == ' ' || c == '\t') break;  /* ext */
-                else return NGX_ERROR;
-
-                if (size > (NGX_MAX_SIZE_T_VALUE >> 4)) {
-                    return NGX_ERROR;       /* overflow guard */
-                }
-                size = (size << 4) | (size_t) d;
-            }
+        if (ngx_autocert_acme_chunk_size(p, eol, &size) != NGX_OK) {
+            return NGX_ERROR;
         }
 
         p = eol + sizeof(CRLF) - 1;         /* past the size line */
@@ -1229,17 +1250,10 @@ ngx_autocert_acme_dechunk(ngx_autocert_acme_request_t *r)
     p = b->start + r->body_offset;
     for ( ;; ) {
         eol = ngx_autocert_memmem(p, end - p, CRLF, sizeof(CRLF) - 1);
-        /* eol is guaranteed non-NULL here (validated in pass 1) */
-        size = 0;
-        {
-            u_char  *q;
-            for (q = p; q < eol; q++) {
-                u_char  c = *q;
-                if (c >= '0' && c <= '9')      size = (size << 4) | (c - '0');
-                else if (c >= 'a' && c <= 'f') size = (size << 4) | (c-'a'+10);
-                else if (c >= 'A' && c <= 'F') size = (size << 4) | (c-'A'+10);
-                else break;
-            }
+        /* eol is guaranteed non-NULL here (validated in pass 1); the same
+         * guarded parser is reused so pass 2 can't diverge from pass 1. */
+        if (ngx_autocert_acme_chunk_size(p, eol, &size) != NGX_OK) {
+            return NGX_ERROR;
         }
         p = eol + sizeof(CRLF) - 1;
         if (size == 0) {

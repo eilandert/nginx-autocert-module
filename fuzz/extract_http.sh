@@ -18,6 +18,7 @@
 #   ngx_autocert_memmem               static NUL-free needle search
 #   ngx_autocert_acme_header          public header lookup
 #   ngx_autocert_acme_parse_response  static incremental response parser
+#   ngx_autocert_acme_chunk_size      static guarded hex chunk-size parser
 #   ngx_autocert_acme_dechunk         static chunked-body decoder
 #
 # A function body runs from its signature line to the first line that is a lone
@@ -43,6 +44,7 @@ fns=(
     "ngx_autocert_memmem"
     "ngx_autocert_acme_header"
     "ngx_autocert_acme_parse_response"
+    "ngx_autocert_acme_chunk_size"
     "ngx_autocert_acme_dechunk"
 )
 
