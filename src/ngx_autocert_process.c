@@ -68,6 +68,7 @@ static ngx_uint_t ngx_autocert_master_gone(ngx_cycle_t *cycle);
 static void ngx_autocert_mark_reused_listening(ngx_cycle_t *cycle,
     ngx_cycle_t *old_cycle);
 static void ngx_autocert_close_listening(ngx_cycle_t *cycle);
+static void ngx_autocert_close_old_listening(ngx_cycle_t *old_cycle);
 static void ngx_autocert_kick_handler(ngx_event_t *ev);
 static void ngx_autocert_account_done(ngx_autocert_account_t *acct,
     ngx_int_t rc);
@@ -373,7 +374,7 @@ ngx_autocert_process_cycle(ngx_cycle_t *cycle, void *data)
     }
     ngx_autocert_close_listening(cycle);
     if (cycle->old_cycle) {
-        ngx_autocert_close_listening(cycle->old_cycle);
+        ngx_autocert_close_old_listening(cycle->old_cycle);
     }
 
     /* A helper needs only a handful of connections (channel + outbound ACME). */
@@ -1457,10 +1458,10 @@ ngx_autocert_master_gone(ngx_cycle_t *cycle)
 
 /*
  * Reload cycles can carry reused listener fds in both cycle->listening and
- * old_cycle->listening. The helper closes both arrays because it inherited both,
- * so mark any old-cycle duplicate as already closed before calling nginx's close
- * helper. That keeps each live fd closed exactly once and avoids EBADF alert
- * noise on every reload.
+ * old_cycle->listening. The cycle pass (ngx_autocert_close_listening) closes
+ * each new-cycle fd once; mark any old-cycle duplicate as already closed (fd=-1)
+ * here so the old-cycle pass skips it. That keeps each live fd closed exactly
+ * once across the two arrays.
  */
 static void
 ngx_autocert_mark_reused_listening(ngx_cycle_t *cycle, ngx_cycle_t *old_cycle)
@@ -1524,4 +1525,43 @@ ngx_autocert_close_listening(ngx_cycle_t *cycle)
 
     /* shared/TCP listeners + their connection teardown */
     ngx_close_listening_sockets(cycle);
+}
+
+
+/*
+ * Close the old cycle's inherited listeners on a reload. Unlike the new cycle,
+ * we cannot use ngx_close_listening_sockets() here: it calls ngx_close_socket()
+ * unconditionally, so a reused fd that ngx_autocert_mark_reused_listening() has
+ * already set to -1 (because the new-cycle pass closed it) would become a
+ * close(-1) -> EBADF and log [emerg] on every reload. Close each remaining real
+ * fd exactly once and skip the -1 entries. No connection/event teardown is
+ * needed: the helper has not run init_process yet, so it added no events for
+ * these inherited fds.
+ */
+static void
+ngx_autocert_close_old_listening(ngx_cycle_t *old_cycle)
+{
+    ngx_uint_t        i;
+    ngx_listening_t  *ls;
+
+    if (old_cycle == NULL) {
+        return;
+    }
+
+    ls = old_cycle->listening.elts;
+
+    for (i = 0; i < old_cycle->listening.nelts; i++) {
+        if (ls[i].fd == (ngx_socket_t) -1) {
+            continue;                  /* reused (already closed) or closed */
+        }
+
+        if (ngx_close_socket(ls[i].fd) == -1) {
+            ngx_log_error(NGX_LOG_ALERT, old_cycle->log, ngx_socket_errno,
+                          ngx_close_socket_n " on old listen socket failed");
+        }
+
+        ls[i].fd = (ngx_socket_t) -1;
+    }
+
+    old_cycle->listening.nelts = 0;
 }
