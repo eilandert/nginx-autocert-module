@@ -391,8 +391,17 @@ ngx_autocert_order_new_order_done(ngx_autocert_acme_request_t *req,
     ngx_int_t                   ok = NGX_ERROR;
 
     if (req == NULL) {
-        /* synthetic error from the POST primitive — order is unreachable here,
-         * but the account-side failure already logged; nothing to free. */
+        /*
+         * Defensive only — not reached in practice. The account POST primitive
+         * reserves a non-NULL post_fail_req up front (M9d), so an *async*
+         * failure still calls this handler with a real req; a *synchronous*
+         * ngx_autocert_account_post() error returns NGX_ERROR to the caller,
+         * which finishes the order itself and never invokes this handler. So a
+         * NULL req would mean the order is already being torn down elsewhere:
+         * we cannot recover the order (it lives in req->data), so just return.
+         * The same invariant covers the bare `req == NULL` guards in the other
+         * order *_done callbacks below.
+         */
         return;
     }
 
