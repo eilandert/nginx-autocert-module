@@ -85,6 +85,7 @@ struct ngx_autocert_order_s {
     ngx_str_t                        keyauth;          /* token.thumbprint */
     ngx_uint_t                       poll_tries;       /* authz poll counter */
     ngx_uint_t                       order_poll_tries; /* order poll counter */
+    ngx_uint_t                       finalize_retried; /* re-finalized after ready? */
     ngx_uint_t                       challenge_set;    /* token in store? */
     ngx_uint_t                       alpn_set;         /* M10c: cert in alpn store? */
     ngx_uint_t                       done;
