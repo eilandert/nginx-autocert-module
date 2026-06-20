@@ -182,6 +182,19 @@ runs:
         run_pos "store certbot"        'autocert_store certbot; autocert_path /tmp/ac-cb;'
         echo "✓ all positive cases accepted"
 
+    - name: Worker-0 ACME driver lifecycle (P1)
+      shell: bash
+      run: |
+        set -euo pipefail
+        # The ACME engine runs on worker 0 behind an flock singleton lock.
+        # Assert: driver arms on worker 0 at start; a reload hands the lock off
+        # to a fresh worker 0 (<=1 live driver); a SIGKILL of worker 0 is
+        # respawned + re-armed by the master; clean stop. Replaces the removed
+        # helper-lifecycle.sh / helper-usr2.sh. No network/docker, high port.
+        NGX_BUILD_DIR="$GITHUB_WORKSPACE/${{ inputs.dir }}" \
+          AC_TEST_PORT=18185 \
+          bash "$GITHUB_WORKSPACE/tests/worker0-driver.sh"
+
     - name: HTTP-01 challenge serve (M5)
       shell: bash
       run: |
