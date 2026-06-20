@@ -18,6 +18,8 @@
 
 static ngx_int_t ngx_autocert_account_load_key(ngx_autocert_account_t *acct);
 static ngx_int_t ngx_autocert_account_save_key(ngx_autocert_account_t *acct);
+static ngx_int_t ngx_autocert_account_fsync_keydir(
+    ngx_autocert_account_t *acct);
 static ngx_int_t ngx_autocert_account_start(ngx_autocert_account_t *acct,
     ngx_str_t *method, ngx_str_t *url, ngx_str_t *body, ngx_str_t *ctype,
     ngx_autocert_acme_handler_pt handler);
@@ -278,7 +280,7 @@ ngx_autocert_account_save_key(ngx_autocert_account_t *acct)
 
     /* Durably persist before close: the O_EXCL load path only regenerates on
      * ENOENT, so a crash that left a zero/partial key would be refused forever.
-     * fsync the file (EINTR-retried); a dir fsync is omitted (best-effort). */
+     * fsync the file (EINTR-retried). */
     while (fsync(fd) != 0) {
         if (ngx_errno == NGX_EINTR) {
             continue;
@@ -299,9 +301,77 @@ ngx_autocert_account_save_key(ngx_autocert_account_t *acct)
         return NGX_ERROR;
     }
 
+    /* Best-effort: fsync the containing directory so the new key's dentry is
+     * durable too (otherwise a crash after the file fsync but before the
+     * directory metadata reaches disk could leave the key unreferenced). The
+     * key file itself is already fully written + fsynced + closed, so a dir
+     * fsync failure (e.g. a filesystem that rejects directory fsync) must NOT
+     * delete it or fail the save -- just warn. */
+    (void) ngx_autocert_account_fsync_keydir(acct);
+
     ngx_log_error(NGX_LOG_NOTICE, acct->log, 0,
                   "autocert: generated + saved account key \"%V\"",
                   &acct->key_path);
+    return NGX_OK;
+}
+
+
+/*
+ * fsync the directory that contains acct->key_path, so the key file's directory
+ * entry is durable. key_path is NUL-terminated; the parent is the substring up
+ * to the last '/', or "." if there is none.
+ */
+static ngx_int_t
+ngx_autocert_account_fsync_keydir(ngx_autocert_account_t *acct)
+{
+    u_char  *slash, *dir;
+    size_t   dlen;
+    int      fd;
+
+    slash = (u_char *) strrchr((const char *) acct->key_path.data, '/');
+
+    if (slash == NULL) {
+        dir = (u_char *) ".";
+
+    } else {
+        dlen = (size_t) (slash - acct->key_path.data);
+        if (dlen == 0) {
+            dlen = 1;                   /* key at "/foo" -> parent is "/" */
+        }
+        dir = ngx_pnalloc(acct->pool, dlen + 1);
+        if (dir == NULL) {
+            return NGX_ERROR;
+        }
+        ngx_memcpy(dir, acct->key_path.data, dlen);
+        dir[dlen] = '\0';
+    }
+
+    fd = open((const char *) dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd == -1) {
+        ngx_log_error(NGX_LOG_WARN, acct->log, ngx_errno,
+                      "autocert: open(\"%s\") to fsync key dir failed "
+                      "(best-effort)", dir);
+        return NGX_ERROR;
+    }
+
+    while (fsync(fd) != 0) {
+        if (ngx_errno == NGX_EINTR) {
+            continue;
+        }
+        ngx_log_error(NGX_LOG_WARN, acct->log, ngx_errno,
+                      "autocert: fsync key dir \"%s\" failed (best-effort)",
+                      dir);
+        (void) close(fd);
+        return NGX_ERROR;
+    }
+
+    if (close(fd) == -1) {
+        ngx_log_error(NGX_LOG_WARN, acct->log, ngx_errno,
+                      "autocert: close key dir \"%s\" after fsync failed",
+                      dir);
+        return NGX_ERROR;
+    }
+
     return NGX_OK;
 }
 
