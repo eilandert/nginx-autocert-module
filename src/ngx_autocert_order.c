@@ -16,6 +16,22 @@
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
+
+/*
+ * Atomic two-file commit uses renameat2(RENAME_EXCHANGE) to swap the freshly
+ * written per-domain dir with the live one in a single syscall (Linux 3.15+).
+ * Called via syscall() so the build does not depend on a glibc renameat2
+ * wrapper; an old kernel / unsupporting filesystem returns ENOSYS/EINVAL and we
+ * fall back to the sequential rename. RENAME_EXCHANGE may be absent from old
+ * UAPI headers, so define it if needed.
+ */
+#if defined(__linux__)
+#include <sys/syscall.h>
+#ifndef RENAME_EXCHANGE
+#define RENAME_EXCHANGE (1 << 1)
+#endif
+#endif
 
 
 /* Authorization poll: up to ~180 tries, 1s apart. Pebble validates fast, but
@@ -54,10 +70,13 @@ static void ngx_autocert_order_download_done(
 static ngx_int_t ngx_autocert_order_store(ngx_autocert_order_t *order);
 static ngx_int_t ngx_autocert_order_domain_safe(ngx_str_t *domain);
 static ngx_int_t ngx_autocert_order_domain_identifier_safe(ngx_str_t *domain);
-static u_char *ngx_autocert_order_tmp_path(ngx_autocert_order_t *order,
-    u_char *path);
 static ngx_int_t ngx_autocert_order_write_tmp(ngx_autocert_order_t *order,
     u_char *tmp, ngx_str_t *data, ngx_uint_t mode);
+static ngx_int_t ngx_autocert_order_fsync_dir(ngx_autocert_order_t *order,
+    const char *dir);
+static void ngx_autocert_order_rm_staging(u_char *staging);
+static ngx_int_t ngx_autocert_order_swap_dirs(ngx_autocert_order_t *order,
+    u_char *staging, u_char *dir);
 static ngx_int_t ngx_autocert_order_publish_alpn(ngx_autocert_order_t *order);
 static void ngx_autocert_order_unpublish(ngx_autocert_order_t *order);
 static void ngx_autocert_order_finish(ngx_autocert_order_t *order,
@@ -1225,39 +1244,29 @@ ngx_autocert_order_domain_safe(ngx_str_t *domain)
 }
 
 
-/* Allocate "<path>.tmp" (NUL-terminated) in the order pool. */
-static u_char *
-ngx_autocert_order_tmp_path(ngx_autocert_order_t *order, u_char *path)
-{
-    u_char  *tmp, *p;
-    size_t   plen;
-
-    plen = ngx_strlen(path);
-    tmp = ngx_pnalloc(order->pool, plen + sizeof(".tmp"));
-    if (tmp == NULL) {
-        return NULL;
-    }
-    p = ngx_cpymem(tmp, path, plen);
-    ngx_memcpy(p, ".tmp", sizeof(".tmp"));
-    return tmp;
-}
-
-
 /*
  * M6b step 10: store the cert key + fullchain under store_path/<domain>/.
- * Secure layout (M7 will add the certbot layout): the per-domain directory is
- * 0700, privkey.pem 0600, fullchain.pem 0644. Both files are written to .tmp
- * siblings (fsync'd), then rename()d back-to-back so a reader never sees a
- * half-written file and the key/chain pair flips as close to atomically as a
- * two-file store allows. On a failure after the key has already been renamed,
- * the new chain temp is left behind (logged) — renewal will redo both.
+ * Secure layout: the per-domain directory is 0700, privkey.pem 0600,
+ * fullchain.pem 0644.
+ *
+ * The key and chain are a matched PAIR: a reader (the serve path) that ever sees
+ * a NEW key beside an OLD chain (or vice versa) gets a key/cert mismatch. To
+ * keep the pair consistent across a crash, both PEMs are written + fsync'd into
+ * a sibling staging dir "<domain>.tmp/", then committed atomically:
+ *   - first issuance (no live dir): rename(2) the staging dir into place;
+ *   - renewal (live dir exists): renameat2(RENAME_EXCHANGE) swaps the staging
+ *     and live dirs in a single syscall, so the whole pair flips at once.
+ * On a kernel/filesystem without RENAME_EXCHANGE we fall back to the old
+ * sequential two-file rename (key then chain), which keeps a small mismatch
+ * window only there. fsync of the parent dir makes the rename itself durable.
  */
 static ngx_int_t
 ngx_autocert_order_store(ngx_autocert_order_t *order)
 {
-    u_char       *dir, *key_path, *chain_path, *key_tmp, *chain_tmp, *p;
-    size_t        base;
+    u_char       *dir, *staging, *store_dir, *skey, *schain, *p;
+    size_t        base, slen;
     struct stat   st;
+    ngx_int_t     swap;
 
     if (order->store_path.len == 0) {
         ngx_log_error(NGX_LOG_ERR, order->log, 0,
@@ -1272,9 +1281,8 @@ ngx_autocert_order_store(ngx_autocert_order_t *order)
         return NGX_ERROR;
     }
 
-    /* store_path "/" domain "\0" */
+    /* live dir: store_path "/" domain "\0" */
     base = order->store_path.len + 1 + order->domain.len + 1;
-
     dir = ngx_pnalloc(order->pool, base);
     if (dir == NULL) {
         return NGX_ERROR;
@@ -1284,74 +1292,228 @@ ngx_autocert_order_store(ngx_autocert_order_t *order)
     p = ngx_cpymem(p, order->domain.data, order->domain.len);
     *p = '\0';
 
-    if (mkdir((char *) dir, 0700) == -1 && errno != EEXIST) {
+    /* staging dir: "<live>.tmp\0" */
+    slen = base - 1 + sizeof(".tmp");
+    staging = ngx_pnalloc(order->pool, slen);
+    if (staging == NULL) {
+        return NGX_ERROR;
+    }
+    p = ngx_cpymem(staging, dir, base - 1);
+    ngx_memcpy(p, ".tmp", sizeof(".tmp"));
+
+    /* staging files */
+    skey = ngx_pnalloc(order->pool, slen - 1 + sizeof("/privkey.pem"));
+    schain = ngx_pnalloc(order->pool, slen - 1 + sizeof("/fullchain.pem"));
+    if (skey == NULL || schain == NULL) {
+        return NGX_ERROR;
+    }
+    p = ngx_cpymem(skey, staging, slen - 1);
+    ngx_memcpy(p, "/privkey.pem", sizeof("/privkey.pem"));
+    p = ngx_cpymem(schain, staging, slen - 1);
+    ngx_memcpy(p, "/fullchain.pem", sizeof("/fullchain.pem"));
+
+    /* NUL-terminated copy of store_path for the parent-dir fsync (ngx_str_t
+     * data is not guaranteed NUL-terminated). */
+    store_dir = ngx_pnalloc(order->pool, order->store_path.len + 1);
+    if (store_dir == NULL) {
+        return NGX_ERROR;
+    }
+    p = ngx_cpymem(store_dir, order->store_path.data, order->store_path.len);
+    *p = '\0';
+
+    /* Clear any staging dir a previous crash left behind, then create a fresh
+     * one we own (0700). After the cleanup the mkdir must succeed; EEXIST means
+     * something raced/planted it, so refuse. */
+    ngx_autocert_order_rm_staging(staging);
+
+    if (mkdir((char *) staging, 0700) == -1) {
         ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
-                      "autocert: mkdir(\"%s\") failed", dir);
+                      "autocert: mkdir(\"%s\") failed", staging);
+        return NGX_ERROR;
+    }
+    /* Must be a real dir we just made, not a pre-planted symlink. */
+    if (lstat((char *) staging, &st) == -1 || !S_ISDIR(st.st_mode)) {
+        ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
+                      "autocert: staging \"%s\" is not a directory", staging);
+        ngx_autocert_order_rm_staging(staging);
         return NGX_ERROR;
     }
 
-    /* The per-domain dir must be a real directory we own, not a symlink an
-     * attacker pre-created to redirect the cert/key writes (O_NOFOLLOW only
-     * guards the leaf temp file, not the parent dir component). */
-    if (lstat((char *) dir, &st) == -1) {
-        ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
-                      "autocert: lstat(\"%s\") failed", dir);
+    /* Write + fsync both PEMs into the staging dir. */
+    if (ngx_autocert_order_write_tmp(order, skey, &order->cert_key_pem, 0600)
+        != NGX_OK)
+    {
+        ngx_autocert_order_rm_staging(staging);
         return NGX_ERROR;
     }
+    if (ngx_autocert_order_write_tmp(order, schain, &order->cert_chain, 0644)
+        != NGX_OK)
+    {
+        ngx_autocert_order_rm_staging(staging);
+        return NGX_ERROR;
+    }
+
+    /* fsync the staging dir so its new entries are durable before the swap. */
+    if (ngx_autocert_order_fsync_dir(order, (char *) staging) != NGX_OK) {
+        ngx_autocert_order_rm_staging(staging);
+        return NGX_ERROR;
+    }
+
+    /* Commit. */
+    if (lstat((char *) dir, &st) == -1) {
+
+        if (ngx_errno != NGX_ENOENT) {
+            ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
+                          "autocert: lstat(\"%s\") failed", dir);
+            ngx_autocert_order_rm_staging(staging);
+            return NGX_ERROR;
+        }
+
+        /* First issuance: no live dir -> move staging into place atomically. */
+        if (rename((char *) staging, (char *) dir) == -1) {
+            ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
+                          "autocert: rename(\"%s\" -> \"%s\") failed",
+                          staging, dir);
+            ngx_autocert_order_rm_staging(staging);
+            return NGX_ERROR;
+        }
+        return ngx_autocert_order_fsync_dir(order, (char *) store_dir);
+    }
+
+    /* Live path exists: it must be a real directory, not a file/symlink an
+     * attacker planted to redirect writes. */
     if (!S_ISDIR(st.st_mode)) {
         ngx_log_error(NGX_LOG_ERR, order->log, 0,
                       "autocert: store path \"%s\" is not a directory", dir);
+        ngx_autocert_order_rm_staging(staging);
         return NGX_ERROR;
     }
 
-    /* dir "/privkey.pem\0" and "/fullchain.pem\0" */
-    key_path = ngx_pnalloc(order->pool, base - 1 + sizeof("/privkey.pem"));
-    chain_path = ngx_pnalloc(order->pool, base - 1 + sizeof("/fullchain.pem"));
-    if (key_path == NULL || chain_path == NULL) {
-        return NGX_ERROR;
-    }
-    p = ngx_cpymem(key_path, dir, base - 1);   /* without the NUL */
-    ngx_memcpy(p, "/privkey.pem", sizeof("/privkey.pem"));
-    p = ngx_cpymem(chain_path, dir, base - 1);
-    ngx_memcpy(p, "/fullchain.pem", sizeof("/fullchain.pem"));
+    swap = ngx_autocert_order_swap_dirs(order, staging, dir);
 
-    key_tmp = ngx_autocert_order_tmp_path(order, key_path);
-    chain_tmp = ngx_autocert_order_tmp_path(order, chain_path);
-    if (key_tmp == NULL || chain_tmp == NULL) {
+    if (swap == NGX_OK) {
+        /* staging now holds the OLD pair; drop it. */
+        ngx_autocert_order_rm_staging(staging);
+        return ngx_autocert_order_fsync_dir(order, (char *) store_dir);
+    }
+
+    ngx_autocert_order_rm_staging(staging);
+
+    if (swap == NGX_ERROR) {
         return NGX_ERROR;
     }
 
-    /* Write + fsync both temps BEFORE either rename, so a write failure leaves
-     * the live cert/key untouched. */
-    if (ngx_autocert_order_write_tmp(order, key_tmp, &order->cert_key_pem, 0600)
-        != NGX_OK)
-    {
-        return NGX_ERROR;
-    }
-    if (ngx_autocert_order_write_tmp(order, chain_tmp, &order->cert_chain, 0644)
-        != NGX_OK)
-    {
-        (void) unlink((char *) key_tmp);
-        return NGX_ERROR;
-    }
+    /*
+     * swap == NGX_DECLINED: this filesystem has no RENAME_EXCHANGE, so the
+     * live pair cannot be replaced atomically. Rather than do a sequential
+     * two-file rename that could leave a mismatched key/chain on a crash, defer:
+     * the live cert is left untouched and renewal retries (backoff). First
+     * issuance is unaffected -- it has no live dir and commits with a single
+     * atomic rename above. This only blocks renewal on exotic stores (network /
+     * fuse / overlay fs); a local cert store always supports RENAME_EXCHANGE.
+     */
+    ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                  "autocert: cannot atomically replace \"%s\" (filesystem "
+                  "lacks RENAME_EXCHANGE); keeping the existing cert and "
+                  "deferring renewal", dir);
+    return NGX_ERROR;
+}
 
-    /* Commit. Key first then chain (back-to-back; no I/O between). */
-    if (rename((char *) key_tmp, (char *) key_path) == -1) {
+
+/* fsync a directory by path so a preceding rename/create in it is durable. */
+static ngx_int_t
+ngx_autocert_order_fsync_dir(ngx_autocert_order_t *order, const char *dir)
+{
+    int  fd;
+
+    fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd == -1) {
         ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
-                      "autocert: rename(\"%s\") failed", key_tmp);
-        (void) unlink((char *) key_tmp);
-        (void) unlink((char *) chain_tmp);
+                      "autocert: open(\"%s\") for fsync failed", dir);
         return NGX_ERROR;
     }
-    if (rename((char *) chain_tmp, (char *) chain_path) == -1) {
+    if (fsync(fd) == -1) {
         ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
-                      "autocert: rename(\"%s\") failed (key already committed, "
-                      "renewal will reconcile)", chain_tmp);
-        (void) unlink((char *) chain_tmp);
+                      "autocert: fsync(\"%s\") failed", dir);
+        (void) close(fd);
         return NGX_ERROR;
     }
-
+    if (close(fd) == -1) {
+        ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
+                      "autocert: close(\"%s\") after fsync failed", dir);
+        return NGX_ERROR;
+    }
     return NGX_OK;
+}
+
+
+/*
+ * Best-effort removal of the staging dir and its two known files. Opened
+ * O_NOFOLLOW so a planted symlink at "<domain>.tmp" is never followed: children
+ * are unlinked relative to the verified directory fd (unlinkat), and if the path
+ * is itself a symlink / non-directory it is unlinked as a plain entry so the
+ * caller's mkdir can proceed.
+ */
+static void
+ngx_autocert_order_rm_staging(u_char *staging)
+{
+    int  fd;
+
+    fd = open((char *) staging,
+              O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd == -1) {
+        if (ngx_errno == NGX_ENOENT) {
+            return;                     /* nothing there */
+        }
+        /* symlink (ELOOP), a file (ENOTDIR), etc. — remove the entry itself,
+         * without following it. */
+        (void) unlink((char *) staging);
+        return;
+    }
+
+    (void) unlinkat(fd, "privkey.pem", 0);
+    (void) unlinkat(fd, "fullchain.pem", 0);
+    (void) close(fd);
+    (void) rmdir((char *) staging);
+}
+
+
+/*
+ * Atomically swap the staging dir with the live dir via
+ * renameat2(RENAME_EXCHANGE). Returns NGX_OK on success, NGX_DECLINED when the
+ * kernel/filesystem does not support the flag (caller falls back), NGX_ERROR on
+ * any other failure.
+ */
+static ngx_int_t
+ngx_autocert_order_swap_dirs(ngx_autocert_order_t *order, u_char *staging,
+    u_char *dir)
+{
+#if defined(__linux__) && defined(SYS_renameat2)
+    if (syscall(SYS_renameat2, AT_FDCWD, (char *) staging,
+                AT_FDCWD, (char *) dir, RENAME_EXCHANGE)
+        == 0)
+    {
+        return NGX_OK;
+    }
+
+    /* ENOSYS: kernel too old; EINVAL/ENOTTY/EOPNOTSUPP: filesystem lacks the
+     * flag. All mean "unsupported here" -> let the caller fall back. */
+    if (ngx_errno == NGX_ENOSYS || ngx_errno == EINVAL
+        || ngx_errno == ENOTTY || ngx_errno == EOPNOTSUPP)
+    {
+        ngx_log_debug1(NGX_LOG_DEBUG_CORE, order->log, 0,
+                       "autocert: RENAME_EXCHANGE unsupported (%d), "
+                       "falling back to sequential rename", (int) ngx_errno);
+        return NGX_DECLINED;
+    }
+
+    ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
+                  "autocert: renameat2(RENAME_EXCHANGE \"%s\" <-> \"%s\") "
+                  "failed", staging, dir);
+    return NGX_ERROR;
+#else
+    return NGX_DECLINED;
+#endif
 }
 
 
