@@ -249,10 +249,12 @@ jobs:
             --with-cc-opt="-Wall -Wextra -Werror" \
             --add-dynamic-module="$GITHUB_WORKSPACE" > /tmp/conf.log 2>&1 \
             || { tail -40 /tmp/conf.log; exit 1; }
-          make modules > /tmp/make.log 2>&1 || { tail -40 /tmp/make.log; exit 1; }
+          # Full build: `nginx -t` below needs the server binary, not just the .so.
+          make > /tmp/make.log 2>&1 || { tail -40 /tmp/make.log; exit 1; }
           test -f objs/ngx_http_autocert_module.so
           test -f objs/ngx_autocert_process_module.so
           BIN=objs/nginx
+          test -x "$BIN"
           PREFIX=/tmp/guard; mkdir -p "$PREFIX/conf" "$PREFIX/logs"
           for dir in autocert_test_challenge autocert_test_alpn; do
             cat > "$PREFIX/conf/nginx.conf" <<EOF
