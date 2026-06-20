@@ -978,7 +978,8 @@ ngx_autocert_timegm(const struct tm *tm)
     int64_t  y = tm->tm_year + 1900;
     int64_t  m = tm->tm_mon + 1;       /* 1..12 */
     int64_t  d = tm->tm_mday;          /* 1..31 */
-    int64_t  era, yoe, doy, doe, days;
+    int64_t  era, yoe, doy, doe, days, secs;
+    time_t   t;
 
     if (y < 1970 || y > 9999) {
         return (time_t) -1;
@@ -992,8 +993,25 @@ ngx_autocert_timegm(const struct tm *tm)
     doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;          /* 0..146096 */
     days = era * 146097 + doe - 719468;
 
-    return (time_t) (days * 86400
-                     + tm->tm_hour * 3600 + tm->tm_min * 60 + tm->tm_sec);
+    secs = days * 86400 + tm->tm_hour * 3600 + tm->tm_min * 60 + tm->tm_sec;
+
+    /*
+     * On a 64-bit time_t the int64_t result always fits. On a 32-bit time_t
+     * (EOL but still possible cross-compiling) a notAfter past 2038 would wrap
+     * silently to a negative/small value and corrupt the renewal arithmetic.
+     * Detect that by round-tripping through time_t: if casting to time_t and
+     * back does not reproduce the value, it didn't fit — return (time_t) -1,
+     * which the caller treats as an unreadable expiry (same as a parse error).
+     * This is correct for signed OR unsigned, 32- OR 64-bit time_t without any
+     * width/signedness macro (a UINT64_MAX-based bound mis-casts on unsigned
+     * 64-bit time_t and would reject every timestamp).
+     */
+    t = (time_t) secs;
+    if ((int64_t) t != secs) {
+        return (time_t) -1;
+    }
+
+    return t;
 }
 
 
