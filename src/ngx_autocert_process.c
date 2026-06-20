@@ -29,8 +29,8 @@
  * the helper does its own minimal process init below.
  *
  * The ACME event loop / outbound client lands from M4b onward; M4a only proves
- * the process exists with a real event loop, logs a heartbeat, survives reloads
- * and crashes, and tears down cleanly.
+ * the process exists with a real event loop, survives reloads and crashes, and
+ * tears down cleanly.
  */
 
 #include <ngx_config.h>
@@ -48,7 +48,6 @@
 
 
 #define NGX_AUTOCERT_PROC_NAME    "autocert helper"
-#define NGX_AUTOCERT_HEARTBEAT    60000   /* ms; placeholder until M4b */
 #define NGX_AUTOCERT_WATCH        1000    /* ms; master-liveness poll */
 #define NGX_AUTOCERT_STARTUP_BUDGET 30000 /* ms; give up if master never seen */
 #define NGX_AUTOCERT_KICK         500     /* ms; defer first ACME fetch */
@@ -62,7 +61,6 @@
 static ngx_int_t ngx_autocert_process_init_module(ngx_cycle_t *cycle);
 static void ngx_autocert_process_cycle(ngx_cycle_t *cycle, void *data);
 static void ngx_autocert_channel_handler(ngx_event_t *ev);
-static void ngx_autocert_heartbeat_handler(ngx_event_t *ev);
 static void ngx_autocert_watch_handler(ngx_event_t *ev);
 static ngx_uint_t ngx_autocert_master_gone(ngx_cycle_t *cycle);
 static void ngx_autocert_mark_reused_listening(ngx_cycle_t *cycle,
@@ -338,7 +336,6 @@ ngx_autocert_process_cycle(ngx_cycle_t *cycle, void *data)
     ngx_int_t    n;
     ngx_uint_t   i;
     sigset_t     set;
-    ngx_event_t  heartbeat;
     ngx_event_t  watch;
 
     ngx_process = NGX_PROCESS_HELPER;
@@ -458,13 +455,6 @@ ngx_autocert_process_cycle(ngx_cycle_t *cycle, void *data)
 
     ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
                   "autocert: helper started, pid %P", ngx_pid);
-
-    /* Placeholder activity until the ACME state machine arrives (M4b+). */
-    ngx_memzero(&heartbeat, sizeof(ngx_event_t));
-    heartbeat.handler = ngx_autocert_heartbeat_handler;
-    heartbeat.data = cycle;
-    heartbeat.log = cycle->log;
-    ngx_add_timer(&heartbeat, NGX_AUTOCERT_HEARTBEAT);
 
     /*
      * Master-liveness watch. The reload/non-orphan helper is the master's child
@@ -595,23 +585,6 @@ ngx_autocert_channel_handler(ngx_event_t *ev)
         default:
             break;
         }
-    }
-}
-
-
-/*
- * Heartbeat: a self-rearming timer so the event loop always has at least one
- * timer pending (a loop with no events/timers would block forever in the
- * engine). Replaced by the ACME scheduling timer from M4b.
- */
-static void
-ngx_autocert_heartbeat_handler(ngx_event_t *ev)
-{
-    ngx_log_debug1(NGX_LOG_DEBUG_CORE, ev->log, 0,
-                   "autocert: helper heartbeat, pid %P", ngx_pid);
-
-    if (!ngx_exiting && !ngx_terminate && !ngx_quit) {
-        ngx_add_timer(ev, NGX_AUTOCERT_HEARTBEAT);
     }
 }
 
