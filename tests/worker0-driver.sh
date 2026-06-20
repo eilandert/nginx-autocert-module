@@ -29,7 +29,7 @@ cleanup() {
     "$N/objs/$SRV" -p "$P" -c "$P/conf/nginx.conf" -s stop 2>/dev/null || true
     local pid
     pid=$(ss -ltnp 2>/dev/null | grep ":$PORT " | grep -oP 'pid=\K[0-9]+') || true
-    [ -n "${pid:-}" ] && kill -9 "$pid" 2>/dev/null || true
+    if [ -n "${pid:-}" ]; then kill -9 "$pid" 2>/dev/null || true; fi
     rm -rf "$P"
 }
 trap cleanup EXIT
@@ -116,9 +116,9 @@ for r in 1 2; do
     [ "$(released_count)" -gt "$rel_before" ] || fail "reload $r: old worker 0 never released the lock"
     # singleton snapshot: only one armed worker may be alive right now
     live=0
-    for pid in $(grep -oE 'armed on worker 0, pid [0-9]+' "$LOG" | grep -oE '[0-9]+$' | sort -u); do
-        alive "$pid" && live=$((live+1)) || true
-    done
+    while read -r pid; do
+        if [ -n "$pid" ] && alive "$pid"; then live=$((live+1)); fi
+    done < <(grep -oE 'armed on worker 0, pid [0-9]+' "$LOG" | grep -oE '[0-9]+$' | sort -u)
     [ "$live" -le 1 ] || fail "reload $r: $live drivers live at once (lock failed)"
     [ "$PREV" != "$AN" ] || fail "reload $r: worker 0 pid did not change"
     assert_log_clean "RELOAD $r"
