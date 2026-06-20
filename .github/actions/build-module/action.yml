@@ -161,7 +161,6 @@ runs:
         run_neg "invalid email"        'server { listen 8080; autocert on x@; }'                          'invalid email'
         run_neg "bad key_type"         'autocert_key_type rsa2048;'                                       'invalid key type'
         run_neg "bad store"            'autocert_store vault;'                                            'invalid store'
-        run_neg "certbot store"        'autocert_store certbot;'                                          'not implemented yet'
         run_neg "bad challenge"        'autocert_challenge dns-01;'                                       'invalid challenge'
         run_neg "duplicate key"        'autocert_key_type secp384r1; autocert_key_type secp256r1;'        'is duplicate'
         run_neg "knob in server{}"     'server { listen 8080; autocert_ca http://x/; }'                   'directive is not allowed'
@@ -181,6 +180,7 @@ runs:
         }
 
         run_pos "autocert_staging on"  'autocert_staging on; autocert_path /tmp/ac-stage;'
+        run_pos "store certbot"        'autocert_store certbot; autocert_path /tmp/ac-cb;'
         echo "✓ all positive cases accepted"
 
     - name: Helper process lifecycle (M4a)

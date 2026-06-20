@@ -493,7 +493,7 @@ ngx_http_autocert_cache_reload(ngx_autocert_cert_t *c, ngx_str_t *host,
     u_char             chain_path[NGX_MAX_PATH], key_path[NGX_MAX_PATH];
     u_char            *p;
     size_t             base;
-    ngx_str_t          chain_pem, key_pem;
+    ngx_str_t          chain_pem, key_pem, seg;
     ngx_file_info_t    fi;
     time_t             now;
     BIO               *bio = NULL;
@@ -528,9 +528,21 @@ ngx_http_autocert_cache_reload(ngx_autocert_cert_t *c, ngx_str_t *host,
     }
     c->checked = now;
 
-    /* <path>/<host>/fullchain.pem  and  /privkey.pem — paths bounded by the
-     * configured name set, but cap to NGX_MAX_PATH defensively. */
-    base = sctx->path.len + 1 + host->len;
+    /*
+     * secure:  <path>/<host>/{fullchain,privkey}.pem
+     * certbot: <path>/live/<host>/{fullchain,privkey}.pem
+     * (serving needs only fullchain + privkey; certbot's extra cert.pem /
+     * chain.pem are written for tool compat but not read here.) Paths are
+     * bounded by the configured name set; cap to NGX_MAX_PATH defensively.
+     */
+    if (sctx->store == NGX_HTTP_AUTOCERT_STORE_CERTBOT) {
+        seg.data = (u_char *) "/live";
+        seg.len = sizeof("/live") - 1;
+    } else {
+        ngx_str_null(&seg);
+    }
+
+    base = sctx->path.len + seg.len + 1 + host->len;
     if (base + sizeof("/fullchain.pem") > NGX_MAX_PATH) {
         ngx_log_error(NGX_LOG_ERR, log, 0,
                       "autocert: store path too long for \"%V\"", host);
@@ -538,11 +550,17 @@ ngx_http_autocert_cache_reload(ngx_autocert_cert_t *c, ngx_str_t *host,
     }
 
     p = ngx_cpymem(chain_path, sctx->path.data, sctx->path.len);
+    if (seg.len) {
+        p = ngx_cpymem(p, seg.data, seg.len);
+    }
     *p++ = '/';
     p = ngx_cpymem(p, host->data, host->len);
     ngx_memcpy(p, "/fullchain.pem", sizeof("/fullchain.pem"));
 
     p = ngx_cpymem(key_path, sctx->path.data, sctx->path.len);
+    if (seg.len) {
+        p = ngx_cpymem(p, seg.data, seg.len);
+    }
     *p++ = '/';
     p = ngx_cpymem(p, host->data, host->len);
     ngx_memcpy(p, "/privkey.pem", sizeof("/privkey.pem"));

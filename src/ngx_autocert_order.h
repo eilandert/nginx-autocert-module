@@ -56,6 +56,7 @@ struct ngx_autocert_order_s {
     ngx_shm_zone_t                  *challenge_zone; /* M5 token store */
     ngx_uint_t                       key_type;       /* cert key curve (M6b) */
     ngx_str_t                        store_path;     /* cert store dir (M6b) */
+    ngx_uint_t                       store;          /* ngx_http_autocert_store_e */
 
     /* M10c challenge selection: NGX_AUTOCERT_CHALLENGE_* (0 = http-01 default).
      * tls-alpn-01 publishes a challenge cert into alpn_zone instead of a token

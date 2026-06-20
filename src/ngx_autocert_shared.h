@@ -22,6 +22,7 @@ typedef struct {
     time_t           resolver_timeout;
     ngx_str_t        ca_certificate; /* PEM trust bundle path, "" => system */
     ngx_uint_t       key_type;       /* ngx_http_autocert_key_type_e (acct key) */
+    ngx_uint_t       store;          /* ngx_http_autocert_store_e (disk layout) */
     ngx_str_t        path;           /* cert store dir (holds the account key) */
     time_t           renew_before;   /* M8: seconds before notAfter to renew */
     ngx_uint_t       challenge;      /* M10c: ngx_http_autocert_challenge_e */

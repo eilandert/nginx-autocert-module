@@ -1331,13 +1331,62 @@ ngx_autocert_order_domain_safe(ngx_str_t *domain)
  * sequential two-file rename (key then chain), which keeps a small mismatch
  * window only there. fsync of the parent dir makes the rename itself durable.
  */
+/*
+ * Split a fullchain PEM into the leaf (first certificate) and the rest of the
+ * chain (intermediates), for the certbot cert.pem / chain.pem files. The leaf
+ * is everything up to and including the first END-CERTIFICATE line + its
+ * newline; the chain is whatever follows. Returns NGX_ERROR if no certificate
+ * boundary is found. A single-cert fullchain yields an empty chain (valid:
+ * certbot's chain.pem can be empty for a self-issued/0-intermediate leaf).
+ */
+static ngx_int_t
+ngx_autocert_order_split_chain(ngx_str_t *full, ngx_str_t *leaf, ngx_str_t *rest)
+{
+    static const u_char  marker[] = "-----END CERTIFICATE-----";
+    size_t               mlen = sizeof(marker) - 1;
+    size_t               i, off;
+    ngx_uint_t           found = 0;
+
+    /* find the first END-CERTIFICATE marker (no cross-TU helper: acme's
+     * ngx_autocert_memmem is static to that .so). */
+    off = 0;
+    if (full->len >= mlen) {
+        for (i = 0; i <= full->len - mlen; i++) {   /* len>=mlen: no wrap */
+            if (ngx_memcmp(full->data + i, marker, mlen) == 0) {
+                off = i + mlen;
+                found = 1;
+                break;
+            }
+        }
+    }
+    if (!found) {
+        return NGX_ERROR;
+    }
+
+    /* include the trailing newline(s) after the marker in the leaf */
+    while (off < full->len
+           && (full->data[off] == '\r' || full->data[off] == '\n'))
+    {
+        off++;
+    }
+
+    leaf->data = full->data;
+    leaf->len = off;
+    rest->data = full->data + off;
+    rest->len = full->len - off;
+    return NGX_OK;
+}
+
+
 static ngx_int_t
 ngx_autocert_order_store(ngx_autocert_order_t *order)
 {
     u_char       *dir, *staging, *store_dir, *skey, *schain, *p;
+    u_char       *scert, *schn;
     size_t        base, slen;
     struct stat   st;
     ngx_int_t     swap;
+    ngx_uint_t    certbot;
 
     if (order->store_path.len == 0) {
         ngx_log_error(NGX_LOG_ERR, order->log, 0,
@@ -1352,13 +1401,53 @@ ngx_autocert_order_store(ngx_autocert_order_t *order)
         return NGX_ERROR;
     }
 
-    /* live dir: store_path "/" domain "\0" */
-    base = order->store_path.len + 1 + order->domain.len + 1;
+    /*
+     * Per-domain dir. secure: <store_path>/<domain>. certbot: a flat
+     * <store_path>/live/<domain> (real files, no archive/ + symlinks); the
+     * intermediate <store_path>/live must exist first. Either way the atomic
+     * staging-dir swap below operates on this dir + its "<dir>.tmp" sibling.
+     */
+    certbot = (order->store == NGX_HTTP_AUTOCERT_STORE_CERTBOT);
+
+    if (certbot) {
+        u_char  *live;
+
+        /* <store_path>/live\0 — created 0755 if absent (the parent of all the
+         * per-domain live dirs). EEXIST is fine; anything else is fatal. */
+        live = ngx_pnalloc(order->pool,
+                           order->store_path.len + sizeof("/live"));
+        if (live == NULL) {
+            return NGX_ERROR;
+        }
+        p = ngx_cpymem(live, order->store_path.data, order->store_path.len);
+        ngx_memcpy(p, "/live", sizeof("/live"));
+        if (mkdir((char *) live, 0755) == -1) {
+            if (ngx_errno != NGX_EEXIST) {
+                ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
+                              "autocert: mkdir(\"%s\") failed", live);
+                return NGX_ERROR;
+            }
+            /* Already there: it must be a real directory, not a symlink an
+             * attacker planted to redirect all per-domain writes under live/. */
+            if (lstat((char *) live, &st) == -1 || !S_ISDIR(st.st_mode)) {
+                ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
+                              "autocert: \"%s\" is not a directory", live);
+                return NGX_ERROR;
+            }
+        }
+    }
+
+    /* live dir: store_path ["/live"] "/" domain "\0" */
+    base = order->store_path.len + (certbot ? sizeof("/live") - 1 : 0)
+           + 1 + order->domain.len + 1;
     dir = ngx_pnalloc(order->pool, base);
     if (dir == NULL) {
         return NGX_ERROR;
     }
     p = ngx_cpymem(dir, order->store_path.data, order->store_path.len);
+    if (certbot) {
+        p = ngx_cpymem(p, "/live", sizeof("/live") - 1);
+    }
     *p++ = '/';
     p = ngx_cpymem(p, order->domain.data, order->domain.len);
     *p = '\0';
@@ -1383,13 +1472,20 @@ ngx_autocert_order_store(ngx_autocert_order_t *order)
     p = ngx_cpymem(schain, staging, slen - 1);
     ngx_memcpy(p, "/fullchain.pem", sizeof("/fullchain.pem"));
 
-    /* NUL-terminated copy of store_path for the parent-dir fsync (ngx_str_t
-     * data is not guaranteed NUL-terminated). */
-    store_dir = ngx_pnalloc(order->pool, order->store_path.len + 1);
+    /* NUL-terminated parent dir for the post-rename fsync: the directory that
+     * actually holds the renamed <domain> entry. secure: <store_path>;
+     * certbot: <store_path>/live (the commit renames into live/, so fsyncing
+     * <store_path> wouldn't make the new entry durable). */
+    store_dir = ngx_pnalloc(order->pool,
+                            order->store_path.len
+                            + (certbot ? sizeof("/live") - 1 : 0) + 1);
     if (store_dir == NULL) {
         return NGX_ERROR;
     }
     p = ngx_cpymem(store_dir, order->store_path.data, order->store_path.len);
+    if (certbot) {
+        p = ngx_cpymem(p, "/live", sizeof("/live") - 1);
+    }
     *p = '\0';
 
     /* Clear any staging dir a previous crash left behind, then create a fresh
@@ -1422,6 +1518,46 @@ ngx_autocert_order_store(ngx_autocert_order_t *order)
     {
         ngx_autocert_order_rm_staging(staging);
         return NGX_ERROR;
+    }
+
+    /*
+     * certbot layout also ships cert.pem (the leaf alone) and chain.pem (the
+     * intermediates alone) beside privkey.pem + fullchain.pem. Split the
+     * downloaded fullchain at the end of the first certificate: everything up
+     * to and including the first "-----END CERTIFICATE-----" line is the leaf,
+     * the remainder is the chain. (We only SERVE fullchain+privkey, so this is
+     * purely for certbot-tool compatibility.)
+     */
+    if (certbot) {
+        ngx_str_t  leaf, rest;
+
+        if (ngx_autocert_order_split_chain(&order->cert_chain, &leaf, &rest)
+            != NGX_OK)
+        {
+            ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                          "autocert: cannot split fullchain for \"%V\"",
+                          &order->domain);
+            ngx_autocert_order_rm_staging(staging);
+            return NGX_ERROR;
+        }
+
+        scert = ngx_pnalloc(order->pool, slen - 1 + sizeof("/cert.pem"));
+        schn  = ngx_pnalloc(order->pool, slen - 1 + sizeof("/chain.pem"));
+        if (scert == NULL || schn == NULL) {
+            ngx_autocert_order_rm_staging(staging);
+            return NGX_ERROR;
+        }
+        p = ngx_cpymem(scert, staging, slen - 1);
+        ngx_memcpy(p, "/cert.pem", sizeof("/cert.pem"));
+        p = ngx_cpymem(schn, staging, slen - 1);
+        ngx_memcpy(p, "/chain.pem", sizeof("/chain.pem"));
+
+        if (ngx_autocert_order_write_tmp(order, scert, &leaf, 0644) != NGX_OK
+            || ngx_autocert_order_write_tmp(order, schn, &rest, 0644) != NGX_OK)
+        {
+            ngx_autocert_order_rm_staging(staging);
+            return NGX_ERROR;
+        }
     }
 
     /* fsync the staging dir so its new entries are durable before the swap. */
@@ -1542,8 +1678,14 @@ ngx_autocert_order_rm_staging(u_char *staging)
         return;
     }
 
+    /* Remove every file either layout can leave here: secure has privkey +
+     * fullchain; certbot adds cert + chain. unlinkat on an absent name is a
+     * harmless ENOENT, so always try all four (else a leftover cert.pem/
+     * chain.pem keeps rmdir failing and blocks the next renewal's mkdir). */
     (void) unlinkat(fd, "privkey.pem", 0);
     (void) unlinkat(fd, "fullchain.pem", 0);
+    (void) unlinkat(fd, "cert.pem", 0);
+    (void) unlinkat(fd, "chain.pem", 0);
     (void) close(fd);
     (void) rmdir((char *) staging);
 }
