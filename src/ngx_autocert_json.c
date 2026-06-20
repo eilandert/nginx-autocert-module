@@ -540,6 +540,13 @@ ngx_autocert_json_literal(ngx_autocert_json_ctx_t *c)
 }
 
 
+/*
+ * Look up a member by key. Members are kept in document order, so on a
+ * duplicate key (RFC 8259 allows but does not define them) this returns the
+ * FIRST occurrence — "first wins". ACME responses never legitimately repeat a
+ * key; a hostile/buggy CA cannot use a trailing duplicate to override a value
+ * the parser already read.
+ */
 ngx_autocert_json_value_t *
 ngx_autocert_json_object_get(ngx_autocert_json_value_t *v, const char *key)
 {
@@ -564,6 +571,12 @@ ngx_autocert_json_object_get(ngx_autocert_json_value_t *v, const char *key)
 }
 
 
+/*
+ * Fetch a STRING member as an ngx_str_t (length-counted, NOT NUL-terminated).
+ * A JSON string value may contain interior NUL bytes (a " " escape), so
+ * callers must treat *out as len-bounded and never strlen() it. NGX_DECLINED =
+ * key absent, NGX_ERROR = present but not a string.
+ */
 ngx_int_t
 ngx_autocert_json_object_str(ngx_autocert_json_value_t *v, const char *key,
     ngx_str_t *out)

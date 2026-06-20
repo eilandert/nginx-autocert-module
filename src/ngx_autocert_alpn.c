@@ -4,6 +4,12 @@
  * in a slab zone, keyed by crc32(domain) with the full domain compared on
  * collision. Structurally a sibling of ngx_autocert_challenge with a two-part
  * value instead of one.
+ *
+ * Key contract: the domain is matched byte-exact and case-SENSITIVELY (set /
+ * remove / get all crc32 + ngx_memcmp the raw bytes). Callers must pass an
+ * already-normalised name — the serve path lower-cases the SNI before lookup
+ * and issuance lower-cases the configured names, so a stored lower-case key is
+ * always found. A caller that keyed on a mixed-case name would silently miss.
  */
 
 #include "ngx_autocert_alpn.h"
