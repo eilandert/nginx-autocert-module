@@ -503,6 +503,18 @@ test_acme_tls_cert(ngx_uint_t curve, const char *domain, const char *keyauth)
 }
 
 
+static void
+test_dns01_txt(void)
+{
+    ngx_str_t  keyauth, txt;
+
+    keyauth = S("test-keyauth-value");
+    CHECK(ngx_http_autocert_dns01_txt(pool, &keyauth, &txt) == NGX_OK
+          && streq(&txt, "_i591TnU3kzbh5rN8Dh7XorQu7fzERBX59qhEnpZT6s"),
+          "dns01_txt = base64url(SHA256(keyauth))");
+}
+
+
 int
 main(void)
 {
@@ -520,6 +532,7 @@ main(void)
 
     test_base64url();
     test_hmac_sha256();
+    test_dns01_txt();
     test_jwk_and_thumbprint();
     test_jws_sign_verify(NGX_HTTP_AUTOCERT_CRYPTO_P256, "ES256");
     test_jws_sign_verify(NGX_HTTP_AUTOCERT_CRYPTO_P384, "ES384");
