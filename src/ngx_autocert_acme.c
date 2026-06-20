@@ -783,14 +783,19 @@ ngx_autocert_acme_read_handler(ngx_event_t *ev)
         avail = b->end - b->last;
 
         if (avail == 0) {
-            /* grow the buffer (bounded) */
+            /*
+             * Grow the buffer. The common ACME response (order/authz JSON, a
+             * cert chain) fits the RECV_INIT buffer in one read; growth is the
+             * rare case. Geometric doubling would copy-and-abandon every
+             * intermediate buffer (16K+32K+64K+128K) into the request pool,
+             * which has no per-alloc free — dead memory until the request ends.
+             * Instead jump straight to the RECV_MAX ceiling on the first grow,
+             * so at most ONE buffer (the RECV_INIT one) is ever abandoned.
+             */
             size_t      used = b->last - b->start;
-            size_t      cap = (b->end - b->start) * 2;
+            size_t      cap = NGX_AUTOCERT_RECV_MAX;
             u_char     *nb;
 
-            if (cap > NGX_AUTOCERT_RECV_MAX) {
-                cap = NGX_AUTOCERT_RECV_MAX;
-            }
             if (cap <= (size_t) (b->end - b->start)) {
                 ngx_log_error(NGX_LOG_ERR, r->log, 0,
                               "autocert: response from \"%V\" too large",
