@@ -736,12 +736,29 @@ ngx_autocert_order_respond_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
 
     /* The CA accepts the challenge with 200 and status "pending"/"processing". */
     if (rc != NGX_OK || (req->status != 200 && req->status != 202)) {
-        ngx_log_error(NGX_LOG_ERR, order->log, 0,
-                      "autocert: challenge respond failed, status %ui",
-                      req->status);
-        ngx_destroy_pool(req->pool);
-        ngx_autocert_order_finish(order, NGX_ERROR);
-        return;
+        /*
+         * A 400 here is recoverable: on a reorder (a renewal sweep, or just
+         * ordering the same name twice) the CA reuses a recently-valid
+         * authorization (RFC 8555 §7.5.1), so its challenge is no longer
+         * "pending" and POSTing it "ready" is rejected. The authz itself may
+         * already be valid -- poll it instead of failing the order: poll_done
+         * routes valid->finalize, still-pending->keep polling, invalid->fail.
+         * Any other outcome (transport error, 5xx, ...) stays terminal.
+         */
+        if (rc == NGX_OK && req->status == 400) {
+            ngx_log_error(NGX_LOG_WARN, order->log, 0,
+                          "autocert: challenge respond got 400 for \"%V\"; "
+                          "re-polling authorization (likely already valid)",
+                          &order->domain);
+
+        } else {
+            ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                          "autocert: challenge respond failed, status %ui",
+                          req->status);
+            ngx_destroy_pool(req->pool);
+            ngx_autocert_order_finish(order, NGX_ERROR);
+            return;
+        }
     }
 
     ngx_destroy_pool(req->pool);
