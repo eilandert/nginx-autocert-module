@@ -150,7 +150,7 @@ One ACME policy per instance. All optional.
 | `autocert_staging on\|off;` | `off` | use Let's Encrypt **staging** CA instead — see note |
 | `autocert_renew_before <time>;` | `7d` | renew this long before expiry |
 | `autocert_key_type secp384r1\|secp256r1;` | `secp384r1` | ECDSA curve (no RSA) |
-| `autocert_store secure;` | `secure` | on-disk layout (`certbot` is rejected until implemented) |
+| `autocert_store secure\|certbot;` | `secure` | on-disk layout. `secure`: `<path>/<domain>/{privkey,fullchain}.pem`. `certbot`: `<path>/live/<domain>/{privkey,cert,chain,fullchain}.pem` (flat live/, real files — no archive/ + symlinks) |
 | `autocert_path <dir>;` | `autocert` | store location (relative to the nginx prefix) |
 | `autocert_challenge http-01\|tls-alpn-01;` | `http-01` | challenge type |
 | `autocert_resolver <addr>...;` | the `http{}` `resolver` | DNS used to reach the CA |
@@ -205,9 +205,10 @@ TLS-ALPN-01, per-SNI serving with bootstrap + zero-reload hot-swap, ECDSA
 P-384/P-256, secure root-only store, `badNonce` retry, per-name backoff, and
 `429` / `Retry-After` awareness.
 
-**Not yet:** wildcard / DNS-01 certificates, multiple CAs / EAB, the `certbot`
-store layout, and a packaged Debian sub-package. Angie is compile-checked only —
-on Angie, use its native `acme` directive instead.
+**Not yet:** wildcard / DNS-01 certificates, multiple CAs / EAB, and a packaged
+Debian sub-package. Both nginx and Angie are fully supported and run the same
+end-to-end test suite; on Angie the `autocert` directive coexists with Angie's
+own native `acme` (pick whichever you prefer).
 
 ---
 

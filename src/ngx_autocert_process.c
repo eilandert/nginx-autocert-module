@@ -43,6 +43,7 @@
 #include "ngx_autocert_account.h"
 #include "ngx_autocert_challenge.h"
 #include "ngx_autocert_alpn.h"
+#include "ngx_http_autocert_conf.h"    /* store-layout enum */
 #include "ngx_autocert_order.h"
 #include "ngx_http_autocert_crypto.h"
 
@@ -1177,11 +1178,12 @@ static ngx_int_t
 ngx_autocert_name_due(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
     ngx_str_t *name)
 {
-    u_char     path[NGX_MAX_PATH];
-    u_char    *p;
-    size_t     base;
-    time_t     not_after, now;
-    ngx_int_t  rc;
+    u_char      path[NGX_MAX_PATH];
+    u_char     *p;
+    size_t      base;
+    time_t      not_after, now;
+    ngx_int_t   rc;
+    ngx_uint_t  certbot;
 
     if (acf->path.len == 0) {
         ngx_log_debug1(NGX_LOG_DEBUG_CORE, cycle->log, 0,
@@ -1209,8 +1211,18 @@ ngx_autocert_name_due(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
         }
     }
 
-    /* <path>/<name>/fullchain.pem\0 */
-    base = acf->path.len + 1 + name->len + sizeof("/fullchain.pem");
+    /*
+     * fullchain path for the freshness check. Must match where the store
+     * writer + serve path put it, per layout:
+     *   secure:  <path>/<name>/fullchain.pem
+     *   certbot: <path>/live/<name>/fullchain.pem
+     * (a mismatch here would make a certbot-mode name look perpetually
+     * un-issued and reissue every sweep.)
+     */
+    certbot = (acf->store == NGX_HTTP_AUTOCERT_STORE_CERTBOT);
+
+    base = acf->path.len + (certbot ? sizeof("/live") - 1 : 0)
+           + 1 + name->len + sizeof("/fullchain.pem");
     if (base > NGX_MAX_PATH) {
         ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
                       "autocert: store path too long for \"%V\"", name);
@@ -1218,6 +1230,9 @@ ngx_autocert_name_due(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
     }
 
     p = ngx_cpymem(path, acf->path.data, acf->path.len);
+    if (certbot) {
+        p = ngx_cpymem(p, "/live", sizeof("/live") - 1);
+    }
     *p++ = '/';
     p = ngx_cpymem(p, name->data, name->len);
     ngx_memcpy(p, "/fullchain.pem", sizeof("/fullchain.pem"));
@@ -1289,6 +1304,7 @@ ngx_autocert_start_order_for(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
     order->challenge = acf->challenge;          /* M10c: http-01 / tls-alpn-01 */
     order->alpn_zone = acf->alpn_zone;          /* M10b store, used when alpn */
     order->key_type = acf->key_type;
+    order->store = acf->store;
     order->store_path = acf->path;
     order->handler = ngx_autocert_order_complete;
     order->data = cycle;

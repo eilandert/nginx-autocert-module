@@ -846,10 +846,7 @@ ngx_http_autocert_store(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         amcf->store = NGX_HTTP_AUTOCERT_STORE_SECURE;
 
     } else if (ngx_strcmp(value[1].data, "certbot") == 0) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                           "autocert_store certbot is not implemented yet; "
-                           "use \"secure\"");
-        return NGX_CONF_ERROR;
+        amcf->store = NGX_HTTP_AUTOCERT_STORE_CERTBOT;
 
     } else {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
