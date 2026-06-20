@@ -68,11 +68,10 @@ runs:
         # binary too. angie names it objs/angie, nginx names it objs/nginx.
         make > /tmp/make.log 2>&1 || { tail -40 /tmp/make.log; exit 1; }
         test -f objs/ngx_http_autocert_module.so
-        test -f objs/ngx_autocert_process_module.so   # CORE module (M4a helper)
         BIN=objs/nginx; [ -x objs/angie ] && BIN=objs/angie
         test -x "$BIN"
         echo "SERVER_BIN=$PWD/$BIN" >> "$GITHUB_ENV"
-        echo "✓ built autocert .so (http + process) + $BIN"
+        echo "✓ built autocert .so (http) + $BIN"
         # Hit-rate visibility (CACHE-4): confirm ccache is actually warming.
         ccache -s || true
 
@@ -83,11 +82,9 @@ runs:
         cd "${{ inputs.dir }}"
         BIN="$SERVER_BIN"
         MOD="$PWD/objs/ngx_http_autocert_module.so"
-        PROC="$PWD/objs/ngx_autocert_process_module.so"
         PREFIX=/tmp/ngx-test
         mkdir -p "$PREFIX/logs" "$PREFIX/conf"
         cat > "$PREFIX/conf/nginx.conf" <<EOF
-        load_module $PROC;
         load_module $MOD;
         events {}
         http {
@@ -129,6 +126,7 @@ runs:
         # Exactly the 2 concrete names of the enabled vhost must be collected:
         # b.* is off; regex + wildcard are skipped; dedup across vhosts.
         grep -q 'autocert: 2 name(s) enabled for issuance' "$PREFIX/logs/error.log"
+        grep -q 'autocert: ACME driver armed on worker 0' "$PREFIX/logs/error.log"
         echo "✓ ${{ inputs.flavor }} ${{ inputs.version }} parsed autocert_* + collected enabled names"
 
     - name: Reject invalid config (negative tests)
@@ -182,28 +180,6 @@ runs:
         run_pos "autocert_staging on"  'autocert_staging on; autocert_path /tmp/ac-stage;'
         run_pos "store certbot"        'autocert_store certbot; autocert_path /tmp/ac-cb;'
         echo "✓ all positive cases accepted"
-
-    - name: Helper process lifecycle (M4a)
-      shell: bash
-      run: |
-        set -euo pipefail
-        # Channel-managed ACME helper: start spawns one, reload x2 keeps exactly
-        # one (old retired, new respawned), crash auto-respawns, stop tears down
-        # cleanly with no SIGKILL/hang. Runs against this flavor's build.
-        NGX_BUILD_DIR="$GITHUB_WORKSPACE/${{ inputs.dir }}" \
-          AC_TEST_PORT=18177 \
-          bash "$GITHUB_WORKSPACE/tests/helper-lifecycle.sh"
-
-    - name: Helper USR2 hot binary upgrade (M4a)
-      shell: bash
-      run: |
-        set -euo pipefail
-        # `kill -USR2 <master>` starts a 2nd master that re-inits the cycle with
-        # ngx_inherited and brings up its OWN helper; both generations coexist
-        # until the old master is QUIT. Asserts the hot-upgrade helper path.
-        NGX_BUILD_DIR="$GITHUB_WORKSPACE/${{ inputs.dir }}" \
-          AC_TEST_PORT=18181 \
-          bash "$GITHUB_WORKSPACE/tests/helper-usr2.sh"
 
     - name: HTTP-01 challenge serve (M5)
       shell: bash

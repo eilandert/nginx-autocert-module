@@ -16,8 +16,8 @@ domains *is* your existing config.
 - **No certbot, no cron** — a complete ACME client runs inside NGINX itself.
 - **No reload on renewal** — certs load per-SNI at the TLS handshake and
   hot-swap the instant a renewal rewrites the file. Zero downtime.
-- **Privilege-separated** — a dedicated helper process holds every private key;
-  workers never touch key material.
+- **Worker-0 ACME engine** — the ACME state machine runs on a worker-0 timer;
+  certificate private keys never leave the worker process pool.
 - **ECDSA only** (P-384 default, P-256 optional) — no RSA.
 - **HTTP-01 and TLS-ALPN-01** — the latter validates with **no port 80** open.
 - **Builds on nginx and Angie** (Angie is compile-checked only — it has its own
@@ -31,29 +31,27 @@ domains *is* your existing config.
 
 ## Quick start
 
-**1. Build the two modules** against your nginx source:
+**1. Build the module** against your nginx source:
 
 ```sh
 cd nginx-<version>
 ./configure --with-compat --with-http_ssl_module \
     --add-dynamic-module=/path/to/nginx-autocert-module
 make modules
-# -> objs/ngx_autocert_process_module.so   (the helper)
-#    objs/ngx_http_autocert_module.so       (directives + serving)
+# -> objs/ngx_http_autocert_module.so       (directives + serving)
 ```
 
 Requires OpenSSL 3.0.0 or newer.
 
-**2. Load both** (helper first) and turn it on:
+**2. Load it** and turn it on:
 
 ```nginx
-load_module modules/ngx_autocert_process_module.so;
 load_module modules/ngx_http_autocert_module.so;
 
 events {}
 
 http {
-    resolver 1.1.1.1;                    # the helper needs DNS to reach the CA
+    resolver 1.1.1.1;                    # the ACME engine needs DNS to reach the CA
     autocert on admin@example.com;       # ACME account contact
 
     server {
@@ -66,7 +64,7 @@ http {
 ```
 
 That's it. The listener starts behind a self-signed bootstrap certificate, the
-helper provisions the real one in the background, and it gets served per-SNI as
+module provisions the real one in the background, and it gets served per-SNI as
 soon as it's issued — and on every renewal — without a reload.
 
 ---
@@ -76,16 +74,15 @@ soon as it's issued — and on every renewal — without a reload.
 1. **Starts immediately.** A `listen ssl; autocert on;` server with no
    `ssl_certificate` comes up behind a self-signed **bootstrap certificate**, so
    nothing fails while you wait for issuance.
-2. **Provisions in the background.** A single master-spawned **helper process** —
-   the only process that ever holds the account and certificate private keys —
-   runs the full [RFC 8555](https://datatracker.ietf.org/doc/html/rfc8555) order
-   flow for each `server_name`: account → order → challenge → finalize (ECDSA
-   CSR) → download → store.
+2. **Provisions in the background.** A worker-0 timer runs the full
+   [RFC 8555](https://datatracker.ietf.org/doc/html/rfc8555) ACME order flow for
+   each `server_name`: account → order → challenge → finalize (ECDSA CSR) →
+   download → store.
 3. **Serves per-SNI.** Once issued, the real certificate is loaded at the TLS
    handshake and replaces the bootstrap cert. The store is re-read only when the
    file's mtime changes — so a renewal takes effect on the next handshake, **no
    reload, no dropped connections**.
-4. **Renews itself.** The helper sweeps on a timer and reissues each certificate
+4. **Renews itself.** The worker-0 timer sweeps and reissues each certificate
    once it enters the `autocert_renew_before` window (7 days by default). Failed
    names back off (exponential, 60 s → 1 h); a CA `HTTP 429` `Retry-After` is
    honoured.
@@ -182,19 +179,45 @@ can't cover those (wildcards need DNS-01, which isn't supported yet).
 
 ## Architecture
 
-- A single master-spawned **helper process** runs the ACME state machine and
-  holds the account + certificate private keys. Workers never touch keys.
-- The helper reaches the CA over a **verified TLS** connection (its own resolver
-  + HTTP/1.1 client); challenge tokens and cert state pass to workers through a
-  shared-memory zone.
+- A **worker-0 timer** runs the ACME state machine. Certificate and account keys
+  are managed inside the worker process; no separate helper process is needed.
+  (This matches Angie's native `acme` and the official Rust `nginx-acme`, which
+  also drive ACME from a worker rather than a privileged helper.)
+- **Exactly one driver** runs at a time. The engine is armed only on worker 0,
+  and an `flock` on `<autocert_path>/.driver.lock` serializes generations across
+  a reload or `USR2` hot upgrade — the retiring worker 0 holds the lock until it
+  exits, then the fresh worker 0 takes over (within a few seconds) and runs its
+  first renewal sweep. So no two processes ever race the account nonce or submit
+  duplicate orders.
+- The ACME engine reaches the CA over a **verified TLS** connection (its own
+  resolver + HTTP/1.1 client); challenge tokens and cert state are held in a
+  shared-memory zone accessible to all workers.
 - HTTP-01 challenges are served transparently on port 80; TLS-ALPN-01 needs no
   port 80 at all.
 - Certificates are loaded **per-SNI at the TLS handshake**, so renewal needs no
   config reload.
 
-The addon ships **two** dynamic modules: `ngx_autocert_process_module` (CORE —
-the helper) and `ngx_http_autocert_module` (HTTP — directives + serving). Load
-the helper first.
+The addon ships a **single** dynamic module: `ngx_http_autocert_module.so`.
+
+### Permissions — the store must be writable by the worker user
+
+Because the ACME engine now runs in worker 0 (not a privileged helper), the
+**worker user owns the key material**: `account.key`, the per-domain cert store
+under `autocert_path`, and the `.driver.lock` file are all created and written by
+the user NGINX drops to (the `user` directive; default `nobody` when started as
+root). Make sure that directory is writable by that user:
+
+```sh
+mkdir -p /var/lib/autocert
+chown <worker-user>:<worker-group> /var/lib/autocert
+chmod 0700 /var/lib/autocert
+```
+
+If you are **upgrading** from a build that used the old root-owned helper, the
+existing `account.key` and store files are owned by `root` and the worker cannot
+read or rewrite them — `chown -R <worker-user> <autocert_path>` once before
+restarting (the account key is also rejected if it is not owned by the running
+user).
 
 ---
 
@@ -202,8 +225,8 @@ the helper first.
 
 **Works today:** full issuance + renewal on nginx mainline, HTTP-01 and
 TLS-ALPN-01, per-SNI serving with bootstrap + zero-reload hot-swap, ECDSA
-P-384/P-256, secure root-only store, `badNonce` retry, per-name backoff, and
-`429` / `Retry-After` awareness.
+P-384/P-256, worker-owned `secure` and `certbot` store layouts, `badNonce`
+retry, per-name backoff, and `429` / `Retry-After` awareness.
 
 **Not yet:** wildcard / DNS-01 certificates, multiple CAs / EAB, and a packaged
 Debian sub-package. Both nginx and Angie are fully supported and run the same
