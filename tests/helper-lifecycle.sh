@@ -59,6 +59,21 @@ writeconf
 alive()  { kill -0 "$1" 2>/dev/null; }
 fail()   { echo "  $1: FAIL"; sed -n 's/^/    /p' "$P/logs/error.log" | tail -20; exit 1; }
 
+# No [emerg]/[alert] may appear from the helper across reloads. A reused listen
+# fd closed twice (or close(-1) on an already-marked fd) logs
+# `[emerg] ... close() socket ... failed (9: Bad file descriptor)` from the
+# helper on every reload. The CRASH phase's SIGKILL produces an expected
+# 'signal 9' helper-exit line, so exclude that.
+assert_log_clean() {  # $1 = phase label
+    local hits
+    hits=$(grep -E '\[(emerg|alert)\]' "$P/logs/error.log" | grep -v 'signal 9') || true
+    if [ -n "$hits" ]; then
+        echo "  $1: FAIL (helper logged emerg/alert)"
+        printf '%s\n' "$hits" | sed 's/^/    /'
+        exit 1
+    fi
+}
+
 setsid "$N/$SRV" -p "$P" -c "$P/conf/nginx.conf" >/tmp/s.err 2>&1 </dev/null
 sleep 1
 MPID=$(cat "$P/logs/nginx.pid" 2>/dev/null)
@@ -74,7 +89,8 @@ for r in 1 2; do
     "$N/$SRV" -p "$P" -c "$P/conf/nginx.conf" -s reload 2>&1; sleep 2
     C=$(hcount)
     [ "$C" -eq 1 ] || fail "after reload $r helper count=$C (leak/orphan)"
-    echo "RELOAD $r: exactly one helper (pid $(hpid)): OK"
+    assert_log_clean "RELOAD $r"
+    echo "RELOAD $r: exactly one helper (pid $(hpid)), clean log: OK"
 done
 
 # Crash-respawn: kill the helper, master must bring a fresh one back.
