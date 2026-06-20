@@ -549,6 +549,29 @@ jobs:
           dir: ${{ matrix.dir }}
           script: eab-account.sh
 
+  dns01-order:
+    name: dns-01 order plumbing (D2, #16) [${{ matrix.flavor }}]
+    needs: [resolve, build-nginx, build-angie]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: nginx
+            dir: ${{ needs.resolve.outputs.nginx_dir }}
+          - flavor: angie
+            dir: ${{ needs.resolve.outputs.angie_dir }}
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: dns-01 order reaches the publish-TXT step
+        uses: ./.github/actions/run-e2e
+        with:
+          flavor: ${{ matrix.flavor }}
+          dir: ${{ matrix.dir }}
+          script: dns01-order.sh
+
   order-authz:
     name: ACME order + authz reaches valid (M6a) [${{ matrix.flavor }}]
     needs: [resolve, build-nginx, build-angie]

@@ -86,6 +86,9 @@ ngx_autocert_get_conf(ngx_cycle_t *cycle, ngx_autocert_conf_t *out)
     out->ca_certificate = amcf->ca_certificate;
     out->eab_kid = amcf->eab_kid;
     out->eab_hmac_key = amcf->eab_hmac_key;
+    out->dns_hook_add = amcf->dns_hook_add;
+    out->dns_hook_remove = amcf->dns_hook_remove;
+    out->dns_propagation_delay = amcf->dns_propagation_delay;
     out->key_type = amcf->key_type;
     out->store = amcf->store;
     out->path = amcf->path;
