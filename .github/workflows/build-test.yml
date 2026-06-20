@@ -619,3 +619,66 @@ jobs:
           nginx-dir: ${{ needs.resolve.outputs.nginx_dir }}
           script: retry-after.sh
           sudo: "true"
+
+  mock-400-repoll:
+    name: 400-on-respond -> re-poll -> finalize (mock CA, M6/#35)
+    needs: [resolve, build-nginx]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: A 400 on the challenge respond must re-poll, not abort the order
+        uses: ./.github/actions/run-e2e
+        with:
+          nginx-dir: ${{ needs.resolve.outputs.nginx_dir }}
+          script: mock-400-repoll.sh
+          sudo: "true"
+
+  slowloris-read:
+    name: Slow-drip total-read budget (#37)
+    needs: [resolve]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Setup build deps
+        uses: ./.github/actions/setup
+        with:
+          ccache-key: build-slowloris-${{ needs.resolve.outputs.nginx_version }}
+      - name: Restore source tarball cache
+        id: tarball-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/src-tarballs
+          key: src-tarball-nginx-${{ needs.resolve.outputs.nginx_version }}
+      - name: Fetch nginx ${{ needs.resolve.outputs.nginx_version }}
+        if: steps.tarball-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.cache/src-tarballs
+          curl -fsSL -o ~/.cache/src-tarballs/nginx-${{ needs.resolve.outputs.nginx_version }}.tar.gz \
+            "${{ needs.resolve.outputs.nginx_url }}"
+      - name: Build module with a tiny (2s) total-read budget
+        run: |
+          set -euo pipefail
+          tar -xzf ~/.cache/src-tarballs/nginx-${{ needs.resolve.outputs.nginx_version }}.tar.gz
+          cd "${{ needs.resolve.outputs.nginx_dir }}"
+          # -DNGX_AUTOCERT_READ_TOTAL=2000 shrinks the 60s budget to 2s so the
+          # slow-drip abort is observable in a few seconds, not a minute.
+          ./configure --with-compat --with-http_ssl_module \
+            --with-cc="ccache cc" \
+            --with-cc-opt="-Wall -Wextra -Werror -DNGX_AUTOCERT_READ_TOTAL=2000" \
+            --add-dynamic-module="$GITHUB_WORKSPACE" > /tmp/conf.log 2>&1 \
+            || { tail -40 /tmp/conf.log; exit 1; }
+          make > /tmp/make.log 2>&1 || { tail -40 /tmp/make.log; exit 1; }
+          test -f objs/ngx_http_autocert_module.so
+          test -f objs/ngx_autocert_process_module.so
+          test -x objs/nginx
+      - name: A byte-dripping CA must be cut off by the total-read budget
+        run: |
+          set -euo pipefail
+          NGX="$GITHUB_WORKSPACE/${{ needs.resolve.outputs.nginx_dir }}"
+          SERVER_BIN="$NGX/objs/nginx" NGX_BUILD_DIR="$NGX" \
+            bash "$GITHUB_WORKSPACE/tests/slowloris-read.sh"
