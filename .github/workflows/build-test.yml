@@ -671,6 +671,30 @@ jobs:
           script: mock-400-repoll.sh
           sudo: "true"
 
+  mock-finalize-ready:
+    name: finalize-before-ready -> poll -> re-finalize (mock CA) [${{ matrix.flavor }}]
+    needs: [resolve, build-nginx, build-angie]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: nginx
+            dir: ${{ needs.resolve.outputs.nginx_dir }}
+          - flavor: angie
+            dir: ${{ needs.resolve.outputs.angie_dir }}
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: A finalize 400 (order not ready) must poll then re-finalize
+        uses: ./.github/actions/run-e2e
+        with:
+          flavor: ${{ matrix.flavor }}
+          dir: ${{ matrix.dir }}
+          script: mock-finalize-ready.sh
+          sudo: "true"
+
   slowloris-read:
     name: Slow-drip total-read budget (#37) [${{ matrix.flavor }}]
     needs: [resolve]

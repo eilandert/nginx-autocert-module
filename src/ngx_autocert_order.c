@@ -215,6 +215,7 @@ ngx_autocert_order_start(ngx_autocert_order_t *order)
     order->alpn_set = 0;
     order->poll_tries = 0;
     order->order_poll_tries = 0;
+    order->finalize_retried = 0;
     order->retry_after = 0;
     ngx_str_null(&order->order_url);
     ngx_str_null(&order->finalize_url);
@@ -1001,6 +1002,38 @@ ngx_autocert_order_finalize_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
     /* Finalize returns the order object (200). The order may already be
      * "valid" with a certificate URL, or still "processing" -> poll. */
     if (rc != NGX_OK || req->status != 200) {
+        /*
+         * A 400/403 here is recoverable: the CA flips the authorization to
+         * valid asynchronously and the ORDER only transitions pending->ready a
+         * moment later (RFC 8555 §7.4). Finalizing before the order is "ready"
+         * is rejected, but the order is not dead -- poll it and re-finalize
+         * once it reaches "ready" (poll_order_done routes ready->re-finalize,
+         * valid->download). Bound it to one such recovery so a CA that keeps
+         * 400ing finalize can't loop forever. Any other outcome stays terminal.
+         *
+         * We recover on any 400/403 rather than only the orderNotReady problem
+         * type (avoids parsing the body after its pool is gone): a genuinely
+         * terminal 400 (e.g. a bad CSR) is self-correcting here -- the order
+         * poll will report "invalid"/never reach "ready", so poll_order_done
+         * fails it after at most the bounded poll window, one wasted retry.
+         */
+        if (rc == NGX_OK && (req->status == 400 || req->status == 403)
+            && !order->finalize_retried)
+        {
+            ngx_log_error(NGX_LOG_WARN, order->log, 0,
+                          "autocert: finalize got %ui for \"%V\"; polling order "
+                          "until ready, then retrying", req->status,
+                          &order->domain);
+            ngx_destroy_pool(req->pool);
+
+            ngx_memzero(&order->order_timer, sizeof(ngx_event_t));
+            order->order_timer.handler = ngx_autocert_order_poll_order_timer;
+            order->order_timer.data = order;
+            order->order_timer.log = order->log;
+            ngx_add_timer(&order->order_timer, NGX_AUTOCERT_ORDER_FIN_DELAY);
+            return;
+        }
+
         ngx_log_error(NGX_LOG_ERR, order->log, 0,
                       "autocert: finalize failed, status %ui", req->status);
         ngx_destroy_pool(req->pool);
@@ -1056,7 +1089,7 @@ ngx_autocert_order_poll_order_done(ngx_autocert_acme_request_t *req,
     ngx_autocert_order_t       *order;
     ngx_autocert_json_value_t  *root;
     ngx_str_t                   status, cert_url;
-    ngx_uint_t                  valid, pending;
+    ngx_uint_t                  valid, pending, ready;
 
     if (req == NULL) {
         return;
@@ -1066,6 +1099,7 @@ ngx_autocert_order_poll_order_done(ngx_autocert_acme_request_t *req,
     ngx_autocert_order_note_retry_after(order, req);
     valid = 0;
     pending = 0;
+    ready = 0;
     ngx_str_null(&cert_url);
 
     ngx_log_debug2(NGX_LOG_DEBUG_CORE, order->log, 0,
@@ -1090,14 +1124,21 @@ ngx_autocert_order_poll_order_done(ngx_autocert_acme_request_t *req,
                     valid = 1;
                 }
 
+            } else if (status.len == sizeof("ready") - 1
+                       && ngx_strncmp(status.data, "ready", status.len) == 0)
+            {
+                /* The order is ready to be finalized. This is the state a
+                 * recovered finalize-400 was waiting for: re-finalize once.
+                 * (A first-time finalize never lands here -- finalize moves a
+                 * ready order straight to processing/valid -- so "ready" on a
+                 * poll means our earlier finalize was too early.) */
+                ready = 1;
+
             } else if ((status.len == sizeof("pending") - 1
                         && ngx_strncmp(status.data, "pending", status.len)
                            == 0)
                        || (status.len == sizeof("processing") - 1
                            && ngx_strncmp(status.data, "processing",
-                                          status.len) == 0)
-                       || (status.len == sizeof("ready") - 1
-                           && ngx_strncmp(status.data, "ready",
                                           status.len) == 0))
             {
                 pending = 1;
@@ -1113,6 +1154,27 @@ ngx_autocert_order_poll_order_done(ngx_autocert_acme_request_t *req,
                        "autocert: order valid, certificate URL \"%V\"",
                        &order->cert_url);
         if (ngx_autocert_order_download(order) != NGX_OK) {
+            ngx_autocert_order_finish(order, NGX_ERROR);
+        }
+        return;
+    }
+
+    if (ready) {
+        /* The order reached "ready" after an early finalize was rejected.
+         * Re-finalize exactly once (the flag also gates finalize_done's
+         * recovery, so a second rejection is terminal -- no infinite loop). */
+        if (order->finalize_retried) {
+            ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                          "autocert: order \"%V\" still 'ready' after a finalize "
+                          "retry", &order->domain);
+            ngx_autocert_order_finish(order, NGX_ERROR);
+            return;
+        }
+        order->finalize_retried = 1;
+        ngx_log_error(NGX_LOG_NOTICE, order->log, 0,
+                      "autocert: order \"%V\" now ready, re-finalizing",
+                      &order->domain);
+        if (ngx_autocert_order_finalize(order) != NGX_OK) {
             ngx_autocert_order_finish(order, NGX_ERROR);
         }
         return;
