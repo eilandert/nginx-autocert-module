@@ -165,8 +165,10 @@ for d in "$DOMAIN_A" "$DOMAIN_B"; do
     cpub=$(openssl x509 -in "$chain" -noout -pubkey 2>/dev/null | openssl md5)
     kpub=$(openssl pkey -in "$key" -pubout 2>/dev/null | openssl md5)
     [ "$cpub" = "$kpub" ] || { echo "::error::renewed cert pubkey != stored key for $d"; exit 1; }
+    # The atomic-swap commit (renameat2 RENAME_EXCHANGE) must leave no staging dir.
+    [ ! -e "$PREFIX/store/$d.tmp" ] || { echo "::error::staging $d.tmp left after renewal swap"; ls -la "$PREFIX/store/$d.tmp"; exit 1; }
 done
-echo "✓ renewed key/chain pairs are consistent and certify their domains"
+echo "✓ renewed key/chain pairs are consistent, no staging leftover (atomic swap)"
 
 # --- Negative cases (M9): staleness detection -------------------------------
 # Switch to a SMALL renew_before so a healthy stored cert is NOT due — that lets

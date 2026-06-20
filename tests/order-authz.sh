@@ -208,4 +208,10 @@ KEY_PUB=$(openssl pkey -in "$KEY" -pubout 2>/dev/null | openssl md5)
 [ "$CERT_PUB" = "$KEY_PUB" ] || { echo "::error::cert pubkey != stored privkey"; exit 1; }
 echo "✓ certificate public key matches the stored private key"
 
+# Atomic store: the per-domain staging dir "<domain>.tmp" used to commit the
+# key+chain pair must be cleaned up after a successful issuance (no leftovers).
+STAGING="$PREFIX/store/${ORDER_DOMAIN}.tmp"
+[ ! -e "$STAGING" ] || { echo "::error::staging dir $STAGING left behind after issuance"; ls -la "$STAGING"; exit 1; }
+echo "✓ no staging dir left behind (atomic commit cleaned up)"
+
 echo "✓✓ full ACME issuance verified end-to-end"
