@@ -1194,12 +1194,25 @@ ngx_autocert_acme_dechunk(ngx_autocert_acme_request_t *r)
     u_char     *p, *end, *eol, *out, *o;
     size_t      total, size;
 
-    p = b->start + r->body_offset;
     end = b->last;
-    total = 0;
 
-    /* First pass: validate framing and sum the decoded size. Bail NGX_AGAIN if
-     * we hit the end of what we have mid-chunk. */
+    /*
+     * First pass: validate framing and sum the decoded size, resuming from the
+     * cursor so already-validated chunks are not re-walked on every read (which
+     * would be O(N^2) across incremental reads). dechunk_pos == 0 means we have
+     * not started — body_offset is always > 0 (headers precede the body). The
+     * cursor is an OFFSET, so it survives a recv-buffer reallocation (b->start
+     * moves but the offset stays valid).
+     */
+    if (r->dechunk_pos == 0) {
+        r->dechunk_pos = r->body_offset;
+        r->dechunk_total = 0;
+    }
+    p = b->start + r->dechunk_pos;
+    total = r->dechunk_total;
+
+    /* Bail NGX_AGAIN if we hit the end mid-chunk; the cursor stays at the last
+     * fully-validated chunk boundary, so the next read resumes there. */
     for ( ;; ) {
         eol = ngx_autocert_memmem(p, end - p, CRLF, sizeof(CRLF) - 1);
         if (eol == NULL) {
@@ -1237,6 +1250,10 @@ ngx_autocert_acme_dechunk(ngx_autocert_acme_request_t *r)
             return NGX_ERROR;               /* chunk not CRLF-terminated */
         }
         p += sizeof(CRLF) - 1;
+
+        /* whole chunk validated; advance the resume cursor past it. */
+        r->dechunk_pos = p - b->start;
+        r->dechunk_total = total;
     }
 
     /* Second pass: copy chunk data into a fresh contiguous buffer. */
