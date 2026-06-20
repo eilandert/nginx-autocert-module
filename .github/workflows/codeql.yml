@@ -71,7 +71,6 @@ jobs:
             --add-dynamic-module="$GITHUB_WORKSPACE"
           make -j"$(nproc)" modules
           test -f objs/ngx_http_autocert_module.so
-          test -f objs/ngx_autocert_process_module.so
 
       - name: Analyze
         uses: github/codeql-action/analyze@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4

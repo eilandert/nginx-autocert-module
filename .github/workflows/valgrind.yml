@@ -85,7 +85,6 @@ jobs:
           make -j"$(nproc)" > /tmp/make.log 2>&1 || { tail -40 /tmp/make.log; exit 1; }
           test -x objs/nginx
           test -f objs/ngx_http_autocert_module.so
-          test -f objs/ngx_autocert_process_module.so
           ccache -s || true
 
       - name: Build unit tests
@@ -123,7 +122,6 @@ jobs:
           PREFIX="$(mktemp -d)"
           mkdir -p "$PREFIX/logs" "$PREFIX/conf"
           cat > "$PREFIX/conf/nginx.conf" <<EOF
-          load_module $NGX/objs/ngx_autocert_process_module.so;
           load_module $NGX/objs/ngx_http_autocert_module.so;
           error_log $PREFIX/logs/error.log notice;
           events {}

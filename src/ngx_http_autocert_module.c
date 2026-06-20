@@ -23,6 +23,7 @@
 #include "ngx_autocert_challenge.h"
 #include "ngx_autocert_alpn.h"
 #include "ngx_autocert_serve.h"
+#include "ngx_autocert_driver.h"
 
 
 #define NGX_HTTP_AUTOCERT_DEFAULT_CA \
@@ -201,6 +202,40 @@ static ngx_command_t  ngx_http_autocert_commands[] = {
 };
 
 
+/*
+ * Worker-0 ACME driver gate. The ACME engine must run in exactly ONE process,
+ * so arm it only on worker 0 of a normal (master+workers) run, or in the single
+ * process of `master_process off`. ngx_worker is the 0-based worker index; the
+ * NGX_PROCESS_SINGLE case (single-process mode) has ngx_worker == 0 too, so the
+ * single gate covers both. Other workers (and the master / cache procs / signaller)
+ * return without arming — they only serve challenges from the shared zone.
+ */
+static ngx_int_t
+ngx_http_autocert_init_process(ngx_cycle_t *cycle)
+{
+    if ((ngx_process == NGX_PROCESS_WORKER
+         || ngx_process == NGX_PROCESS_SINGLE)
+        && ngx_worker == 0)
+    {
+        ngx_autocert_driver_init_process(cycle);
+    }
+
+    return NGX_OK;
+}
+
+
+static void
+ngx_http_autocert_exit_process(ngx_cycle_t *cycle)
+{
+    if ((ngx_process == NGX_PROCESS_WORKER
+         || ngx_process == NGX_PROCESS_SINGLE)
+        && ngx_worker == 0)
+    {
+        ngx_autocert_driver_exit_process(cycle);
+    }
+}
+
+
 static ngx_http_module_t  ngx_http_autocert_module_ctx = {
     NULL,                                  /* preconfiguration */
     ngx_http_autocert_postconfig,          /* postconfiguration */
@@ -223,10 +258,10 @@ ngx_module_t  ngx_http_autocert_module = {
     NGX_HTTP_MODULE,                   /* module type */
     NULL,                              /* init master */
     NULL,                              /* init module */
-    NULL,                              /* init process */
+    ngx_http_autocert_init_process,    /* init process (arms ACME on worker 0) */
     NULL,                              /* init thread */
     NULL,                              /* exit thread */
-    NULL,                              /* exit process */
+    ngx_http_autocert_exit_process,    /* exit process (tears ACME down) */
     NULL,                              /* exit master */
     NGX_MODULE_V1_PADDING
 };
@@ -297,6 +332,19 @@ ngx_http_autocert_init_main_conf(ngx_conf_t *cf, void *conf)
      * residual.)
      */
     if (ngx_conf_full_name(cf->cycle, &amcf->path, 1) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+    /*
+     * Resolve the CA trust bundle path the same way, at config time. The ACME
+     * client now loads it with a plain OpenSSL call from the worker-0 driver
+     * (NOT ngx_ssl_trusted_certificate, which is a config-time API that derefs
+     * the cycle's SSL cache via cf->cycle->old_cycle and faults in a worker), so
+     * the path must already be absolute by the time the worker uses it.
+     */
+    if (amcf->ca_certificate.len != 0
+        && ngx_conf_full_name(cf->cycle, &amcf->ca_certificate, 1) != NGX_OK)
+    {
         return NGX_CONF_ERROR;
     }
 

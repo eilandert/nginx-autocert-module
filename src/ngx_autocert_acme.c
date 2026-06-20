@@ -67,24 +67,22 @@ ngx_autocert_acme_client_create(ngx_autocert_acme_client_t *client,
      * fall back to OpenSSL's default CA store (correct for Let's Encrypt prod);
      * CI passes Pebble's self-signed CA bundle here.
      *
-     * ngx_ssl_trusted_certificate() wants an ngx_conf_t (for conf_full_name on
-     * the cert path); the helper has none post-config, so build a minimal one
-     * over the cycle. It only reads cf->pool / cf->cycle / cf->log.
+     * Load the custom trust bundle directly with OpenSSL rather than
+     * ngx_ssl_trusted_certificate(): that nginx helper is a CONFIG-TIME API that
+     * resolves the path through the SSL object cache via cf->cycle->old_cycle,
+     * which is a dangling/uninitialised pointer in a worker process and faults.
+     * The driver now runs on worker 0, so we must avoid config-time SSL APIs.
+     * The path is already made absolute at config time (init_main_conf), and is
+     * NUL-terminated (it came from a config directive argument).
      */
-    {
-        ngx_conf_t  cf;
-
-        ngx_memzero(&cf, sizeof(ngx_conf_t));
-        cf.cycle = cycle;
-        cf.pool = cycle->pool;
-        cf.temp_pool = cycle->pool;
-        cf.log = cycle->log;
-
-        if (ngx_ssl_trusted_certificate(&cf, &client->ssl, trusted_cert, 2)
-            != NGX_OK)
+    if (trusted_cert->len != 0) {
+        if (SSL_CTX_load_verify_locations(client->ssl.ctx,
+                                          (char *) trusted_cert->data, NULL)
+            == 0)
         {
-            ngx_log_error(NGX_LOG_EMERG, cycle->log, 0,
-                          "autocert: ngx_ssl_trusted_certificate() failed");
+            ngx_ssl_error(NGX_LOG_EMERG, cycle->log, 0,
+                          "autocert: SSL_CTX_load_verify_locations(\"%V\") failed",
+                          trusted_cert);
             ngx_ssl_cleanup_ctx(&client->ssl);
             return NGX_ERROR;
         }

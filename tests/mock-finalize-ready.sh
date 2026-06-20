@@ -32,9 +32,7 @@ set -euo pipefail
 SERVER_BIN="${SERVER_BIN:?set SERVER_BIN to the built nginx/angie binary}"
 NGX_BUILD_DIR="${NGX_BUILD_DIR:-$(cd "$(dirname "$SERVER_BIN")/.." && pwd)}"
 
-PROC_SO="$NGX_BUILD_DIR/objs/ngx_autocert_process_module.so"
 HTTP_SO="$NGX_BUILD_DIR/objs/ngx_http_autocert_module.so"
-[ -f "$PROC_SO" ] || { echo "missing $PROC_SO"; exit 1; }
 [ -f "$HTTP_SO" ] || { echo "missing $HTTP_SO"; exit 1; }
 
 PREFIX="${PREFIX:-/tmp/ac-fin-ready}"
@@ -200,8 +198,8 @@ for i in $(seq 1 30); do
 done
 
 cat > "$PREFIX/conf/nginx.conf" <<EOF
-load_module $PROC_SO;
 load_module $HTTP_SO;
+user root;   # worker-0 ACME driver writes the store; keep worker uid able to
 error_log $PREFIX/logs/error.log notice;
 events {}
 http {

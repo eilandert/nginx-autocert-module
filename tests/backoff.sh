@@ -24,9 +24,7 @@ set -euo pipefail
 SERVER_BIN="${SERVER_BIN:?set SERVER_BIN to the built nginx/angie binary}"
 NGX_BUILD_DIR="${NGX_BUILD_DIR:-$(cd "$(dirname "$SERVER_BIN")/.." && pwd)}"
 
-PROC_SO="$NGX_BUILD_DIR/objs/ngx_autocert_process_module.so"
 HTTP_SO="$NGX_BUILD_DIR/objs/ngx_http_autocert_module.so"
-[ -f "$PROC_SO" ] || { echo "missing $PROC_SO"; exit 1; }
 [ -f "$HTTP_SO" ] || { echo "missing $HTTP_SO"; exit 1; }
 
 PREFIX="${PREFIX:-/tmp/ac-backoff}"
@@ -98,8 +96,8 @@ docker cp "$PEBBLE_NAME:/test/certs/pebble.minica.pem" "$PREFIX/ca.pem"
 # renew_before 130s => sweep period = renew_before/2 = 65s, just over the 60s
 # first backoff, so the failing name becomes eligible again on the next sweep.
 cat > "$PREFIX/conf/nginx.conf" <<EOF
-load_module $PROC_SO;
 load_module $HTTP_SO;
+user root;   # worker-0 ACME driver writes the store; keep worker uid able to
 error_log $PREFIX/logs/error.log notice;
 events {}
 http {
