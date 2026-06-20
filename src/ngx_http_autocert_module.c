@@ -64,10 +64,12 @@ static ngx_int_t ngx_http_autocert_postconfig(ngx_conf_t *cf);
 static ngx_int_t ngx_http_autocert_init_zone(ngx_shm_zone_t *shm_zone,
     void *data);
 static ngx_int_t ngx_http_autocert_challenge_handler(ngx_http_request_t *r);
+#if (NGX_AUTOCERT_TEST)
 static char *ngx_http_autocert_test_challenge(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
 static char *ngx_http_autocert_test_alpn(ngx_conf_t *cf,
     ngx_command_t *cmd, void *conf);
+#endif
 
 static char *ngx_http_autocert(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static char *ngx_http_autocert_key_type(ngx_conf_t *cf, ngx_command_t *cmd,
@@ -172,9 +174,11 @@ static ngx_command_t  ngx_http_autocert_commands[] = {
       offsetof(ngx_http_autocert_main_conf_t, ca_certificate),
       NULL },
 
+#if (NGX_AUTOCERT_TEST)
     /* TEST-ONLY: seed one token->keyauth into the challenge store at startup so
      * the HTTP-01 serve path can be tested before the order flow (M6) exists.
-     * Not for production use. */
+     * Compiled in ONLY under -DNGX_AUTOCERT_TEST (CI); never in a production
+     * build, so a stray directive cannot seed a forged key authorization. */
     { ngx_string("autocert_test_challenge"),
       NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE2,
       ngx_http_autocert_test_challenge,
@@ -184,13 +188,14 @@ static ngx_command_t  ngx_http_autocert_commands[] = {
 
     /* TEST-ONLY: seed one domain's tls-alpn-01 challenge cert into the ALPN
      * store at startup (M10b) so the ALPN serve path can be tested before the
-     * order wiring (M10c) exists. Not for production use. */
+     * order wiring (M10c) exists. Compiled in ONLY under -DNGX_AUTOCERT_TEST. */
     { ngx_string("autocert_test_alpn"),
       NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE2,
       ngx_http_autocert_test_alpn,
       NGX_HTTP_MAIN_CONF_OFFSET,
       0,
       NULL },
+#endif
 
       ngx_null_command
 };
@@ -886,6 +891,8 @@ ngx_http_autocert_challenge(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 }
 
 
+#if (NGX_AUTOCERT_TEST)
+
 /*
  * autocert_test_challenge <token> <keyauth>;  (TEST-ONLY)
  *
@@ -979,3 +986,5 @@ ngx_http_autocert_test_alpn(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     return NGX_CONF_OK;
 }
+
+#endif /* NGX_AUTOCERT_TEST */
