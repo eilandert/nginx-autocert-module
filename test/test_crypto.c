@@ -427,6 +427,16 @@ test_acme_tls_cert(ngx_uint_t curve, const char *domain, const char *keyauth)
     CHECK(crit, "acme-tls: acmeIdentifier extension is critical");
     CHECK(found, "acme-tls: acmeIdentifier == SHA256(keyauth)");
 
+    /* The signing digest is curve-matched, not bits-guessed: P-256 must be
+     * ecdsa-with-SHA256 and P-384 ecdsa-with-SHA384 (regression for the
+     * EVP_PKEY_bits>256 heuristic that would mis-size other curves). */
+    {
+        int  want_nid = (curve == NGX_HTTP_AUTOCERT_CRYPTO_P256)
+                        ? NID_ecdsa_with_SHA256 : NID_ecdsa_with_SHA384;
+        int  got_nid  = X509_get_signature_nid(x);
+        CHECK(got_nid == want_nid, "acme-tls: signature digest matches curve");
+    }
+
     X509_free(x);
     ngx_http_autocert_key_free(pkey);
 }

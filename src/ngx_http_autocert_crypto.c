@@ -92,6 +92,28 @@ ngx_http_autocert_curve_of(EVP_PKEY *pkey)
 }
 
 
+/*
+ * Signing digest for a key. We only ever sign with our own P-256/P-384 keys, so
+ * derive the digest from the curve table (P-256 -> SHA-256, P-384 -> SHA-384)
+ * rather than guessing from EVP_PKEY_bits: the bits heuristic mis-sizes
+ * SHA-2 for any other curve (e.g. P-521's 521 bits would still pick SHA-384).
+ * The bits fallback only covers a non-EC / unknown-curve key (the arbitrary
+ * dummy-cert path), where no curve fact exists.
+ */
+static const EVP_MD *
+ngx_http_autocert_sign_md(EVP_PKEY *pkey)
+{
+    const ngx_http_autocert_curve_t  *c;
+
+    c = ngx_http_autocert_curve_of(pkey);
+    if (c != NULL) {
+        return c->md();
+    }
+
+    return (EVP_PKEY_bits(pkey) > 256) ? EVP_sha384() : EVP_sha256();
+}
+
+
 EVP_PKEY *
 ngx_http_autocert_key_generate(ngx_uint_t curve)
 {
@@ -781,12 +803,8 @@ ngx_http_autocert_dummy_cert(EVP_PKEY *pkey)
         goto failed;
     }
 
-    /*
-     * Curve-matched digest, picked from the key strength via the portable
-     * EVP_PKEY_bits API (P-384 -> 384) — avoids the OpenSSL 3 deprecated
-     * EC_KEY accessors (CI builds -Werror).
-     */
-    md = (EVP_PKEY_bits(pkey) > 256) ? EVP_sha384() : EVP_sha256();
+    /* Curve-matched signing digest (P-256 -> SHA-256, P-384 -> SHA-384). */
+    md = ngx_http_autocert_sign_md(pkey);
 
     if (X509_sign(x, pkey, md) == 0) {
         goto failed;
@@ -916,7 +934,7 @@ ngx_http_autocert_acme_tls_cert(EVP_PKEY *pkey, ngx_str_t *domain,
         goto failed;
     }
 
-    md = (EVP_PKEY_bits(pkey) > 256) ? EVP_sha384() : EVP_sha256();
+    md = ngx_http_autocert_sign_md(pkey);             /* curve-matched digest */
     if (X509_sign(x, pkey, md) == 0) {
         goto failed;
     }
