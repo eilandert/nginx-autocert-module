@@ -72,7 +72,9 @@ test_timegm_vectors(void)
         { 2001,  9,  9,  1, 46, 40, 1000000000, "timegm 2001-09-09 == 1e9" },
         /* leap day 2024-02-29 (2024 IS a leap year) */
         { 2024,  2, 29, 12,  0,  0, 1709208000, "timegm leap day 2024-02-29" },
-        /* a year past 2038 (exercises 64-bit time_t): 2099-12-31T23:59:59Z */
+        /* A year past 2038: on a 64-bit time_t this must compute exactly (and
+         * NOT be clamped to -1 by the 32-bit overflow guard); on a 32-bit
+         * time_t the guard would return -1 instead of wrapping. 2099-12-31. */
         { 2099, 12, 31, 23, 59, 59, 4102444799, "timegm 2099 (> 2038)" },
     };
     size_t  i;
