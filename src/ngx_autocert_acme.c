@@ -17,6 +17,14 @@
 #define NGX_AUTOCERT_RECV_MAX   (256 * 1024)   /* cap a CA response */
 #define NGX_AUTOCERT_RECV_INIT  (16 * 1024)
 
+/* Total wall-clock budget for reading one response body, independent of the
+ * per-IO read timer (which resets on every NGX_AGAIN). Bounds a slow/dripping
+ * peer; an ACME response is small, so 60 s is very generous. Overridable at
+ * compile time (a test build can shrink it to exercise the slowloris abort). */
+#ifndef NGX_AUTOCERT_READ_TOTAL
+#define NGX_AUTOCERT_READ_TOTAL  (60 * 1000)   /* ms */
+#endif
+
 
 static ngx_int_t ngx_autocert_acme_parse_url(ngx_autocert_acme_request_t *r);
 static ngx_int_t ngx_autocert_acme_url_part_safe(ngx_str_t *s);
@@ -732,7 +740,14 @@ ngx_autocert_acme_write_handler(ngx_event_t *ev)
         return;
     }
 
-    ngx_add_timer(c->read, r->client->timeout);
+    /* Start the total-read deadline now (the response read begins here). Arm
+     * the first read timer at the smaller of the per-IO timeout and the total
+     * budget so a tiny (test) budget is honoured even if no byte ever arrives. */
+    r->read_deadline = ngx_current_msec + NGX_AUTOCERT_READ_TOTAL;
+
+    ngx_add_timer(c->read,
+                  ngx_min((ngx_msec_t) NGX_AUTOCERT_READ_TOTAL,
+                          r->client->timeout));
 
     if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
         ngx_autocert_acme_finalize(r, NGX_ERROR);
@@ -753,8 +768,14 @@ ngx_autocert_acme_read_handler(ngx_event_t *ev)
     ngx_buf_t                    *b = r->recv;
 
     if (ev->timedout) {
-        ngx_log_error(NGX_LOG_ERR, r->log, 0,
-                      "autocert: read from \"%V\" timed out", &r->host);
+        if ((ngx_msec_int_t) (r->read_deadline - ngx_current_msec) <= 0) {
+            ngx_log_error(NGX_LOG_ERR, r->log, 0,
+                          "autocert: read from \"%V\" exceeded the total time "
+                          "budget", &r->host);
+        } else {
+            ngx_log_error(NGX_LOG_ERR, r->log, 0,
+                          "autocert: read from \"%V\" timed out", &r->host);
+        }
         ngx_autocert_acme_finalize(r, NGX_ERROR);
         return;
     }
@@ -796,7 +817,24 @@ ngx_autocert_acme_read_handler(ngx_event_t *ev)
         n = c->recv(c, b->last, avail);
 
         if (n == NGX_AGAIN) {
-            ngx_add_timer(c->read, r->client->timeout);
+            ngx_msec_int_t  remaining;
+
+            /* Bound the TOTAL read time: re-arming the per-IO timer on every
+             * NGX_AGAIN turns it into an inactivity timeout a dripping peer can
+             * hold open up to the recv cap. Abort once the deadline passes, and
+             * cap the next timer at the remaining budget so a peer that goes
+             * silent right before the deadline is still cut at it (not one full
+             * per-IO timeout later). Signed diff is wraparound-safe. */
+            remaining = (ngx_msec_int_t) (r->read_deadline - ngx_current_msec);
+            if (remaining <= 0) {
+                ngx_log_error(NGX_LOG_ERR, r->log, 0,
+                              "autocert: read from \"%V\" exceeded the total "
+                              "time budget", &r->host);
+                ngx_autocert_acme_finalize(r, NGX_ERROR);
+                return;
+            }
+            ngx_add_timer(c->read,
+                          ngx_min((ngx_msec_t) remaining, r->client->timeout));
             if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
                 ngx_autocert_acme_finalize(r, NGX_ERROR);
             }

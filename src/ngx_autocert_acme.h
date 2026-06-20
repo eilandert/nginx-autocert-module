@@ -106,6 +106,12 @@ struct ngx_autocert_acme_request_s {
     ngx_uint_t                    chunked;         /* Transfer-Encoding: chunked */
     off_t                         content_length;  /* -1 if unknown */
     size_t                        body_offset;     /* start of body in recv */
+
+    /* Absolute deadline (ngx_current_msec scale) for the WHOLE response read.
+     * The per-IO read timer resets on every NGX_AGAIN, so on its own it is an
+     * inactivity timeout a byte-dripping peer can hold open up to the recv cap;
+     * this bounds the total read time. Set when the read phase starts. */
+    ngx_msec_t                    read_deadline;
 };
 
 
