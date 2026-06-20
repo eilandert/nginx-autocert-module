@@ -16,13 +16,14 @@ name: Build & Test
 
 # Neither nginx nor angie is pinned: the `resolve` job scrapes the current
 # mainline nginx and the latest angie release at run time.
-#   - build-nginx fully builds nginx + the module, runs the no-network
-#     load/serve tests, and uploads the tree; the unit + Pebble e2e jobs all
-#     download build-nginx instead of recompiling.
-#   - build-angie is COMPILE-ONLY: angie ships its own native `acme` directive,
-#     so this module is not meant to run there. We only prove it still compiles
-#     against angie's API (upstream-drift guard) and deliberately do not load it
-#     or run the issuance suite, to stay out of angie's native ACME.
+#   - build-nginx and build-angie both fully build the flavor + the module, run
+#     the no-network load/serve/lifecycle/USR2 tests, and upload the tree as
+#     build-<flavor>. The unit jobs download build-nginx (the C they test is
+#     flavor-independent); the Pebble e2e suite runs against BOTH flavors via a
+#     matrix. angie ships its own native `acme` directive, but this module's
+#     `autocert` directive is independent and coexists with it — so the module
+#     is fully supported + tested on angie, not just compiled. (Reverses the
+#     earlier compile-only stance, PR #26 — see history.md 2026-06-20.)
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -145,60 +146,26 @@ jobs:
           url: ${{ needs.resolve.outputs.nginx_url }}
           dir: ${{ needs.resolve.outputs.nginx_dir }}
 
-  # angie ships its own native `acme` directive, so this module is not intended
-  # to run on the angie stack — we only assert it still COMPILES against angie's
-  # API (catch upstream drift), and deliberately do NOT load it or run the
-  # issuance suite, to stay out of the way of angie's native ACME.
+  # angie ships its own native `acme` directive, but this module's `autocert`
+  # directive is independent and coexists with it (the operator chooses), so we
+  # build + run the FULL no-network suite on angie just like nginx and publish a
+  # build-angie artifact for the Pebble e2e matrix. (Reverses PR #26's
+  # compile-only stance — see history.md 2026-06-20.)
   build-angie:
-    name: Compile-only (angie ${{ needs.resolve.outputs.angie_version }})
+    name: Build & load (angie ${{ needs.resolve.outputs.angie_version }})
     needs: resolve
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-
-      - name: Setup build deps
-        uses: ./.github/actions/setup
+      - name: Build module + load/serve tests
+        uses: ./.github/actions/build-module
         with:
-          ccache-key: build-angie-${{ needs.resolve.outputs.angie_version }}
-
-      - name: Restore angie tarball cache
-        id: angie-tarball
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: ~/.cache/src-tarballs
-          key: src-tarball-angie-${{ needs.resolve.outputs.angie_version }}
-
-      - name: Fetch angie ${{ needs.resolve.outputs.angie_version }}
-        if: steps.angie-tarball.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          mkdir -p ~/.cache/src-tarballs
-          curl -fsSL \
-            -o ~/.cache/src-tarballs/angie-${{ needs.resolve.outputs.angie_version }}.tar.gz \
-            "${{ needs.resolve.outputs.angie_url }}"
-
-      - name: Extract angie ${{ needs.resolve.outputs.angie_version }}
-        run: |
-          set -euo pipefail
-          tar -xzf ~/.cache/src-tarballs/angie-${{ needs.resolve.outputs.angie_version }}.tar.gz
-
-      - name: Configure + compile module against angie
-        run: |
-          set -euo pipefail
-          cd "${{ needs.resolve.outputs.angie_dir }}"
-          ./configure --with-compat --with-http_ssl_module \
-            --with-cc="ccache cc" \
-            --with-cc-opt="-Wall -Wextra -Werror" \
-            --add-dynamic-module="$GITHUB_WORKSPACE" > /tmp/conf.log 2>&1 \
-            || { tail -40 /tmp/conf.log; exit 1; }
-          # `make modules`: we only need the .so to compile+link, not a server.
-          make modules > /tmp/make.log 2>&1 || { tail -40 /tmp/make.log; exit 1; }
-          test -f objs/ngx_http_autocert_module.so
-          test -f objs/ngx_autocert_process_module.so
-          ccache -s || true
-          echo "✓ autocert modules compile against angie ${{ needs.resolve.outputs.angie_version }}"
+          flavor: angie
+          version: ${{ needs.resolve.outputs.angie_version }}
+          url: ${{ needs.resolve.outputs.angie_url }}
+          dir: ${{ needs.resolve.outputs.angie_dir }}
 
   # Prove a PRODUCTION build (no AUTOCERT_TEST) omits the test-only seed
   # directives entirely, so a stray/templated autocert_test_challenge cannot
@@ -528,143 +495,224 @@ jobs:
             "$GITHUB_WORKSPACE/test/test_account_jsonsafe.c"
           ./test_account_jsonsafe
 
-  # ------------------------------------------------------------------ nginx e2e
-  # The full Pebble issuance/renewal suite against the nginx build. Gates on
-  # build-nginx only (a slow angie build never blocks these).
+  # ------------------------------------------------------------ nginx+angie e2e
+  # The full Pebble issuance/renewal suite, run against BOTH flavors via a
+  # per-job matrix (needs build-nginx AND build-angie). fail-fast:false so an
+  # nginx-leg failure doesn't cancel the angie leg and vice versa.
+
+  # The full Pebble issuance/renewal suite runs against BOTH flavors via a
+  # matrix: nginx uses build-nginx + nginx_dir, angie uses build-angie +
+  # angie_dir. The dir is paired to the flavor through matrix.include so each
+  # leg downloads the right build-<flavor> artifact.
 
   acme-directory:
-    name: ACME account register over TLS (M4b/M4c/M4d)
-    needs: [resolve, build-nginx]
+    name: ACME account register over TLS (M4b/M4c/M4d) [${{ matrix.flavor }}]
+    needs: [resolve, build-nginx, build-angie]
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: nginx
+            dir: ${{ needs.resolve.outputs.nginx_dir }}
+          - flavor: angie
+            dir: ${{ needs.resolve.outputs.angie_dir }}
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Helper registers an ACME account over verified TLS
         uses: ./.github/actions/run-e2e
         with:
-          nginx-dir: ${{ needs.resolve.outputs.nginx_dir }}
+          flavor: ${{ matrix.flavor }}
+          dir: ${{ matrix.dir }}
           script: acme-directory.sh
 
   order-authz:
-    name: ACME order + authz reaches valid (M6a)
-    needs: [resolve, build-nginx]
+    name: ACME order + authz reaches valid (M6a) [${{ matrix.flavor }}]
+    needs: [resolve, build-nginx, build-angie]
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: nginx
+            dir: ${{ needs.resolve.outputs.nginx_dir }}
+          - flavor: angie
+            dir: ${{ needs.resolve.outputs.angie_dir }}
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Full order -> authz -> http-01 -> valid against Pebble
         uses: ./.github/actions/run-e2e
         with:
-          nginx-dir: ${{ needs.resolve.outputs.nginx_dir }}
+          flavor: ${{ matrix.flavor }}
+          dir: ${{ matrix.dir }}
           script: order-authz.sh
           sudo: "true"
 
   tls-alpn-issue:
-    name: tls-alpn-01 full issuance, no port 80 (M10c)
-    needs: [resolve, build-nginx]
+    name: tls-alpn-01 full issuance, no port 80 (M10c) [${{ matrix.flavor }}]
+    needs: [resolve, build-nginx, build-angie]
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: nginx
+            dir: ${{ needs.resolve.outputs.nginx_dir }}
+          - flavor: angie
+            dir: ${{ needs.resolve.outputs.angie_dir }}
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Full tls-alpn-01 issuance against Pebble (port 80 never used)
         uses: ./.github/actions/run-e2e
         with:
-          nginx-dir: ${{ needs.resolve.outputs.nginx_dir }}
+          flavor: ${{ matrix.flavor }}
+          dir: ${{ matrix.dir }}
           script: tls-alpn-issue.sh
 
   renewal:
-    name: ACME renewal + multi-name issuance (M8)
-    needs: [resolve, build-nginx]
+    name: ACME renewal + multi-name issuance (M8) [${{ matrix.flavor }}]
+    needs: [resolve, build-nginx, build-angie]
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: nginx
+            dir: ${{ needs.resolve.outputs.nginx_dir }}
+          - flavor: angie
+            dir: ${{ needs.resolve.outputs.angie_dir }}
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Provision two domains, then force a renewal reissue
         uses: ./.github/actions/run-e2e
         with:
-          nginx-dir: ${{ needs.resolve.outputs.nginx_dir }}
+          flavor: ${{ matrix.flavor }}
+          dir: ${{ matrix.dir }}
           script: renewal.sh
           sudo: "true"
 
   backoff:
-    name: Per-name failure backoff (M9b)
-    needs: [resolve, build-nginx]
+    name: Per-name failure backoff (M9b) [${{ matrix.flavor }}]
+    needs: [resolve, build-nginx, build-angie]
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: nginx
+            dir: ${{ needs.resolve.outputs.nginx_dir }}
+          - flavor: angie
+            dir: ${{ needs.resolve.outputs.angie_dir }}
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: A failing name must back off, a good name issues once
         uses: ./.github/actions/run-e2e
         with:
-          nginx-dir: ${{ needs.resolve.outputs.nginx_dir }}
+          flavor: ${{ matrix.flavor }}
+          dir: ${{ matrix.dir }}
           script: backoff.sh
           sudo: "true"
 
   retry-after:
-    name: 429 / Retry-After rate-limit awareness (M9c)
-    needs: [resolve, build-nginx]
+    name: 429 / Retry-After rate-limit awareness (M9c) [${{ matrix.flavor }}]
+    needs: [resolve, build-nginx, build-angie]
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: nginx
+            dir: ${{ needs.resolve.outputs.nginx_dir }}
+          - flavor: angie
+            dir: ${{ needs.resolve.outputs.angie_dir }}
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: A 429 must honour Retry-After over the exponential backoff
         uses: ./.github/actions/run-e2e
         with:
-          nginx-dir: ${{ needs.resolve.outputs.nginx_dir }}
+          flavor: ${{ matrix.flavor }}
+          dir: ${{ matrix.dir }}
           script: retry-after.sh
           sudo: "true"
 
   mock-400-repoll:
-    name: 400-on-respond -> re-poll -> finalize (mock CA, M6/#35)
-    needs: [resolve, build-nginx]
+    name: 400-on-respond -> re-poll -> finalize (mock CA, M6/#35) [${{ matrix.flavor }}]
+    needs: [resolve, build-nginx, build-angie]
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: nginx
+            dir: ${{ needs.resolve.outputs.nginx_dir }}
+          - flavor: angie
+            dir: ${{ needs.resolve.outputs.angie_dir }}
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: A 400 on the challenge respond must re-poll, not abort the order
         uses: ./.github/actions/run-e2e
         with:
-          nginx-dir: ${{ needs.resolve.outputs.nginx_dir }}
+          flavor: ${{ matrix.flavor }}
+          dir: ${{ matrix.dir }}
           script: mock-400-repoll.sh
           sudo: "true"
 
   slowloris-read:
-    name: Slow-drip total-read budget (#37)
+    name: Slow-drip total-read budget (#37) [${{ matrix.flavor }}]
     needs: [resolve]
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: nginx
+            version: ${{ needs.resolve.outputs.nginx_version }}
+            url: ${{ needs.resolve.outputs.nginx_url }}
+            dir: ${{ needs.resolve.outputs.nginx_dir }}
+          - flavor: angie
+            version: ${{ needs.resolve.outputs.angie_version }}
+            url: ${{ needs.resolve.outputs.angie_url }}
+            dir: ${{ needs.resolve.outputs.angie_dir }}
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
       - name: Setup build deps
         uses: ./.github/actions/setup
         with:
-          ccache-key: build-slowloris-${{ needs.resolve.outputs.nginx_version }}
+          ccache-key: build-slowloris-${{ matrix.flavor }}-${{ matrix.version }}
       - name: Restore source tarball cache
         id: tarball-cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.cache/src-tarballs
-          key: src-tarball-nginx-${{ needs.resolve.outputs.nginx_version }}
-      - name: Fetch nginx ${{ needs.resolve.outputs.nginx_version }}
+          key: src-tarball-${{ matrix.flavor }}-${{ matrix.version }}
+      - name: Fetch ${{ matrix.flavor }} ${{ matrix.version }}
         if: steps.tarball-cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           mkdir -p ~/.cache/src-tarballs
-          curl -fsSL -o ~/.cache/src-tarballs/nginx-${{ needs.resolve.outputs.nginx_version }}.tar.gz \
-            "${{ needs.resolve.outputs.nginx_url }}"
-      - name: Build module with a tiny (2s) total-read budget
+          curl -fsSL -o ~/.cache/src-tarballs/${{ matrix.flavor }}-${{ matrix.version }}.tar.gz \
+            "${{ matrix.url }}"
+      - name: Build ${{ matrix.flavor }} module with a tiny (2s) total-read budget
         run: |
           set -euo pipefail
-          tar -xzf ~/.cache/src-tarballs/nginx-${{ needs.resolve.outputs.nginx_version }}.tar.gz
-          cd "${{ needs.resolve.outputs.nginx_dir }}"
+          tar -xzf ~/.cache/src-tarballs/${{ matrix.flavor }}-${{ matrix.version }}.tar.gz
+          cd "${{ matrix.dir }}"
           # -DNGX_AUTOCERT_READ_TOTAL=2000 shrinks the 60s budget to 2s so the
           # slow-drip abort is observable in a few seconds, not a minute.
           ./configure --with-compat --with-http_ssl_module \
@@ -675,10 +723,12 @@ jobs:
           make > /tmp/make.log 2>&1 || { tail -40 /tmp/make.log; exit 1; }
           test -f objs/ngx_http_autocert_module.so
           test -f objs/ngx_autocert_process_module.so
-          test -x objs/nginx
+          BIN=objs/${{ matrix.flavor }}; [ -x "$BIN" ] || BIN=objs/nginx
+          test -x "$BIN"
       - name: A byte-dripping CA must be cut off by the total-read budget
         run: |
           set -euo pipefail
-          NGX="$GITHUB_WORKSPACE/${{ needs.resolve.outputs.nginx_dir }}"
-          SERVER_BIN="$NGX/objs/nginx" NGX_BUILD_DIR="$NGX" \
+          NGX="$GITHUB_WORKSPACE/${{ matrix.dir }}"
+          BIN="$NGX/objs/${{ matrix.flavor }}"; [ -x "$BIN" ] || BIN="$NGX/objs/nginx"
+          SERVER_BIN="$BIN" NGX_BUILD_DIR="$NGX" \
             bash "$GITHUB_WORKSPACE/tests/slowloris-read.sh"
