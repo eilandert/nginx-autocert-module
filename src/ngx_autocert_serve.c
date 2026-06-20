@@ -83,6 +83,20 @@ static ngx_rbtree_t         ngx_autocert_cache_rbtree;
 static ngx_rbtree_node_t    ngx_autocert_cache_sentinel;
 static ngx_pool_t          *ngx_autocert_cache_pool;     /* NULL until first use */
 
+/*
+ * Per-worker lookup index of the configured issuance names, built once from
+ * sctx->names on the first handshake. Replaces the former O(n) linear scan of
+ * the name array on every handshake with an O(log n) rbtree lookup — the gate
+ * runs on every TLS handshake (including an SNI flood), so it must not be
+ * linear in the configured-name count. Nodes live in the cache pool; the set
+ * is config-fixed for the worker's life. ngx_autocert_names_built guards the
+ * one-time build (and the "no gate" case when sctx->names is NULL/empty).
+ */
+static ngx_rbtree_t         ngx_autocert_names_rbtree;
+static ngx_rbtree_node_t    ngx_autocert_names_sentinel;
+static ngx_uint_t           ngx_autocert_names_built;     /* 0 until first build */
+static ngx_uint_t           ngx_autocert_names_failed;    /* give up building */
+
 
 static int ngx_http_autocert_cert_cb(SSL *ssl_conn, void *arg);
 static ngx_int_t ngx_http_autocert_cache_reload(ngx_autocert_cert_t *c,
@@ -377,36 +391,10 @@ ngx_http_autocert_cert_cb(SSL *ssl_conn, void *arg)
     host.data = host_buf;
 
     /*
-     * Only serve names this instance is configured to issue for. This bounds
-     * the per-worker cache to the (config-sized) name set — an attacker cannot
-     * grow worker memory with a flood of random SNI values, and a name with no
-     * issued cert is simply left on the bootstrap cert. O(n) over a small set.
-     */
-    if (sctx->names != NULL) {
-        ngx_str_t   *nm = sctx->names->elts;
-        ngx_uint_t   i, found = 0;
-
-        for (i = 0; i < sctx->names->nelts; i++) {
-            if (nm[i].len == host.len
-                && ngx_strncmp(nm[i].data, host.data, host.len) == 0)
-            {
-                found = 1;
-                break;
-            }
-        }
-
-        if (!found) {
-            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
-                           "autocert: SNI \"%V\" not configured, keeping "
-                           "bootstrap cert", &host);
-            return 1;                     /* unconfigured SNI -> bootstrap */
-        }
-    }
-
-    /*
      * Lazily create the per-worker cache pool on first handshake. Done here
      * (not init_process) so it lands in the worker, and only when an autocert
-     * server actually receives a connection.
+     * server actually receives a connection. The configured-name lookup index
+     * (gate, below) is built into the same pool on the same first pass.
      */
     if (ngx_autocert_cache_pool == NULL) {
         ngx_autocert_cache_pool = ngx_create_pool(4096, c->log);
@@ -420,7 +408,88 @@ ngx_http_autocert_cert_cb(SSL *ssl_conn, void *arg)
                        "autocert: initialized worker cert cache");
     }
 
+    /*
+     * Build the configured-name lookup index once. Each node is an
+     * ngx_str_node_t keyed by crc32(name); the gate below does an O(log n)
+     * lookup instead of an O(n) scan of sctx->names on every handshake. If a
+     * node alloc fails we leave the index unbuilt and fall back to the linear
+     * scan for safety. ngx_autocert_names_built marks completion (and the
+     * "no gate configured" case where sctx->names is NULL/empty);
+     * ngx_autocert_names_failed makes an alloc failure permanent so we don't
+     * re-attempt (and re-leak a partial tree) on every later handshake.
+     */
+    if (!ngx_autocert_names_built && !ngx_autocert_names_failed) {
+        ngx_rbtree_init(&ngx_autocert_names_rbtree,
+                        &ngx_autocert_names_sentinel,
+                        ngx_str_rbtree_insert_value);
+
+        if (sctx->names != NULL) {
+            ngx_str_t       *nm = sctx->names->elts;
+            ngx_uint_t       i;
+            ngx_str_node_t  *sn;
+
+            for (i = 0; i < sctx->names->nelts; i++) {
+                sn = ngx_palloc(ngx_autocert_cache_pool,
+                                sizeof(ngx_str_node_t) + nm[i].len);
+                if (sn == NULL) {
+                    /* Partially-built nodes are unreachable but harmless (they
+                     * stay in the cache pool for the worker's life). Mark the
+                     * build permanently failed so we use the linear-scan gate
+                     * from now on instead of rebuilding + re-leaking. */
+                    ngx_autocert_names_failed = 1;
+                    break;
+                }
+                sn->str.data = (u_char *) sn + sizeof(ngx_str_node_t);
+                ngx_memcpy(sn->str.data, nm[i].data, nm[i].len);
+                sn->str.len = nm[i].len;
+                sn->node.key = ngx_crc32_short(nm[i].data, nm[i].len);
+                ngx_rbtree_insert(&ngx_autocert_names_rbtree, &sn->node);
+            }
+
+            if (i == sctx->names->nelts) {
+                ngx_autocert_names_built = 1;
+            }
+        } else {
+            ngx_autocert_names_built = 1;    /* no gate: serve any SNI */
+        }
+    }
+
     hash = ngx_crc32_short(host.data, host.len);
+
+    /*
+     * Gate: only serve names this instance is configured to issue for. Bounds
+     * the per-worker cache to the config-sized name set, so an SNI flood cannot
+     * grow worker memory or create cache entries. O(log n) via the index when
+     * built; the rare alloc-failure path falls back to the original O(n) scan.
+     */
+    if (sctx->names != NULL) {
+        ngx_int_t  found;
+
+        if (ngx_autocert_names_built) {
+            found = ngx_str_rbtree_lookup(&ngx_autocert_names_rbtree, &host,
+                                          hash) != NULL;
+        } else {
+            ngx_str_t   *nm = sctx->names->elts;
+            ngx_uint_t   i;
+
+            found = 0;
+            for (i = 0; i < sctx->names->nelts; i++) {
+                if (nm[i].len == host.len
+                    && ngx_strncmp(nm[i].data, host.data, host.len) == 0)
+                {
+                    found = 1;
+                    break;
+                }
+            }
+        }
+
+        if (!found) {
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                           "autocert: SNI \"%V\" not configured, keeping "
+                           "bootstrap cert", &host);
+            return 1;                     /* unconfigured SNI -> bootstrap */
+        }
+    }
 
     cert = (ngx_autocert_cert_t *)
                ngx_str_rbtree_lookup(&ngx_autocert_cache_rbtree, &host, hash);
