@@ -194,6 +194,17 @@ runs:
           AC_TEST_PORT=18177 \
           bash "$GITHUB_WORKSPACE/tests/helper-lifecycle.sh"
 
+    - name: Helper USR2 hot binary upgrade (M4a)
+      shell: bash
+      run: |
+        set -euo pipefail
+        # `kill -USR2 <master>` starts a 2nd master that re-inits the cycle with
+        # ngx_inherited and brings up its OWN helper; both generations coexist
+        # until the old master is QUIT. Asserts the hot-upgrade helper path.
+        NGX_BUILD_DIR="$GITHUB_WORKSPACE/${{ inputs.dir }}" \
+          AC_TEST_PORT=18181 \
+          bash "$GITHUB_WORKSPACE/tests/helper-usr2.sh"
+
     - name: HTTP-01 challenge serve (M5)
       shell: bash
       run: |
