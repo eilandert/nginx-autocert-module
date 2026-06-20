@@ -55,7 +55,11 @@ runs:
       run: |
         set -euo pipefail
         cd "${{ inputs.dir }}"
-        ./configure --with-compat --with-http_ssl_module \
+        # AUTOCERT_TEST=1 compiles in the test-only seed directives
+        # (autocert_test_challenge / autocert_test_alpn) the e2e suite needs.
+        # Production builds omit them; the "test-directives rejected" job proves
+        # a no-flag build rejects them.
+        AUTOCERT_TEST=1 ./configure --with-compat --with-http_ssl_module \
           --with-cc="ccache cc" \
           --with-cc-opt="-Wall -Wextra -Werror" \
           --add-dynamic-module="$GITHUB_WORKSPACE" > /tmp/conf.log 2>&1 \

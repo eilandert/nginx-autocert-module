@@ -1,5 +1,14 @@
 ngx_addon_name=ngx_http_autocert_module
 
+# Test-only seed directives (autocert_test_challenge / autocert_test_alpn) are
+# compiled in ONLY when AUTOCERT_TEST=1 is exported at configure time (CI e2e
+# that needs to seed a challenge before the order flow runs). Production builds
+# omit them entirely, so a stray/templated directive cannot inject a forged key
+# authorization the :80 handler would serve.
+if [ "${AUTOCERT_TEST:-}" = "1" ]; then
+    CFLAGS="$CFLAGS -DNGX_AUTOCERT_TEST=1"
+fi
+
 # Two modules ship from this addon:
 #   - ngx_autocert_process_module : CORE module; spawns the privileged ACME
 #                                   helper process from the master.

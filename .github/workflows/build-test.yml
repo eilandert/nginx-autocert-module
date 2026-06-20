@@ -200,6 +200,80 @@ jobs:
           ccache -s || true
           echo "✓ autocert modules compile against angie ${{ needs.resolve.outputs.angie_version }}"
 
+  # Prove a PRODUCTION build (no AUTOCERT_TEST) omits the test-only seed
+  # directives entirely, so a stray/templated autocert_test_challenge cannot
+  # inject a forged key authorization. Builds the module withOUT the flag and
+  # asserts `nginx -t` rejects the directive as unknown.
+  test-directives-guard:
+    name: Test-only directives rejected in prod build
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Setup build deps
+        uses: ./.github/actions/setup
+        with:
+          ccache-key: build-nginx-${{ needs.resolve.outputs.nginx_version }}
+
+      - name: Restore nginx tarball cache
+        id: nginx-tarball
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/src-tarballs
+          key: src-tarball-nginx-${{ needs.resolve.outputs.nginx_version }}
+
+      - name: Fetch nginx ${{ needs.resolve.outputs.nginx_version }}
+        if: steps.nginx-tarball.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.cache/src-tarballs
+          curl -fsSL \
+            -o ~/.cache/src-tarballs/nginx-${{ needs.resolve.outputs.nginx_version }}.tar.gz \
+            "${{ needs.resolve.outputs.nginx_url }}"
+
+      - name: Extract nginx ${{ needs.resolve.outputs.nginx_version }}
+        run: |
+          set -euo pipefail
+          tar -xzf ~/.cache/src-tarballs/nginx-${{ needs.resolve.outputs.nginx_version }}.tar.gz
+
+      - name: Build prod (no AUTOCERT_TEST) + assert directive rejected
+        run: |
+          set -euo pipefail
+          cd "${{ needs.resolve.outputs.nginx_dir }}"
+          # No AUTOCERT_TEST in the env: the test-only directives must be absent.
+          ./configure --with-compat --with-http_ssl_module \
+            --with-cc="ccache cc" \
+            --with-cc-opt="-Wall -Wextra -Werror" \
+            --add-dynamic-module="$GITHUB_WORKSPACE" > /tmp/conf.log 2>&1 \
+            || { tail -40 /tmp/conf.log; exit 1; }
+          # Full build: `nginx -t` below needs the server binary, not just the .so.
+          make > /tmp/make.log 2>&1 || { tail -40 /tmp/make.log; exit 1; }
+          test -f objs/ngx_http_autocert_module.so
+          test -f objs/ngx_autocert_process_module.so
+          BIN=objs/nginx
+          test -x "$BIN"
+          PREFIX=/tmp/guard; mkdir -p "$PREFIX/conf" "$PREFIX/logs"
+          for dir in autocert_test_challenge autocert_test_alpn; do
+            cat > "$PREFIX/conf/nginx.conf" <<EOF
+          load_module $PWD/objs/ngx_autocert_process_module.so;
+          load_module $PWD/objs/ngx_http_autocert_module.so;
+          events {}
+          http { $dir a b; server { listen 8099; autocert on; } }
+          EOF
+            out="$("$BIN" -t -p "$PREFIX" -c "$PREFIX/conf/nginx.conf" 2>&1 || true)"
+            if printf '%s\n' "$out" | grep -q "unknown directive \"$dir\""; then
+              echo "✓ prod build rejects $dir"
+            else
+              echo "::error::$dir was NOT rejected by a no-flag prod build"
+              printf '%s\n' "$out" | sed 's/^/    /'
+              exit 1
+            fi
+          done
+          ccache -s || true
+
   crypto-unit:
     name: Crypto unit tests (M3)
     needs: [resolve, build-nginx]
