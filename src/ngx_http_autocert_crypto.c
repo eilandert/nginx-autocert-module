@@ -15,6 +15,7 @@
 #include <openssl/ec.h>
 #include <openssl/bn.h>
 #include <openssl/sha.h>
+#include <openssl/hmac.h>
 #include <openssl/pem.h>
 #include <openssl/ecdsa.h>
 #include <openssl/x509.h>
@@ -467,6 +468,41 @@ ngx_http_autocert_jwk_thumbprint(ngx_pool_t *pool, EVP_PKEY *pkey,
     digest.len = SHA256_DIGEST_LENGTH;
 
     return ngx_http_autocert_base64url_encode(pool, &digest, out);
+}
+
+
+ngx_int_t
+ngx_http_autocert_hmac_sha256(ngx_pool_t *pool, ngx_str_t *key, ngx_str_t *msg,
+    ngx_str_t *out)
+{
+    u_char        *mac;
+    unsigned int   maclen = 0;
+
+    /* HMAC() takes the key length as int; a key beyond INT_MAX would wrap. The
+     * EAB key is a few dozen bytes in practice, but guard the cast anyway. */
+    if (key->len > INT_MAX) {
+        return NGX_ERROR;
+    }
+
+    mac = ngx_pnalloc(pool, SHA256_DIGEST_LENGTH);
+    if (mac == NULL) {
+        return NGX_ERROR;
+    }
+
+    /* HMAC() tolerates a NULL data pointer only for a zero-length message; the
+     * EAB key is always non-empty (caller rejects a zero-length decode). */
+    if (HMAC(EVP_sha256(), key->data, (int) key->len, msg->data, msg->len,
+             mac, &maclen)
+        == NULL
+        || maclen != SHA256_DIGEST_LENGTH)
+    {
+        return NGX_ERROR;
+    }
+
+    out->data = mac;
+    out->len = SHA256_DIGEST_LENGTH;
+
+    return NGX_OK;
 }
 
 

@@ -46,6 +46,8 @@ struct ngx_autocert_account_s {
     ngx_str_t                        directory_url;  /* ACME directory */
     ngx_str_t                        key_path;       /* <path>/account.key */
     ngx_uint_t                       key_type;       /* crypto curve enum */
+    ngx_str_t                        eab_kid;        /* EAB key id, "" if none */
+    ngx_str_t                        eab_hmac_key;   /* base64url EAB key, "" */
 
     ngx_autocert_account_handler_pt  handler;
     void                            *data;

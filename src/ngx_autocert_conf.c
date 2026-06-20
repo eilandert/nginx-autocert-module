@@ -84,6 +84,8 @@ ngx_autocert_get_conf(ngx_cycle_t *cycle, ngx_autocert_conf_t *out)
     out->resolver = amcf->resolver;
     out->resolver_timeout = amcf->resolver_timeout;
     out->ca_certificate = amcf->ca_certificate;
+    out->eab_kid = amcf->eab_kid;
+    out->eab_hmac_key = amcf->eab_hmac_key;
     out->key_type = amcf->key_type;
     out->store = amcf->store;
     out->path = amcf->path;

@@ -89,6 +89,16 @@ ngx_int_t ngx_http_autocert_jwk_thumbprint(ngx_pool_t *pool, EVP_PKEY *pkey,
 
 
 /*
+ * HMAC-SHA256 over `msg` with raw key `key`, emitting the 32-byte MAC into
+ * *out (pool-allocated). Used to build the EAB (External Account Binding) outer
+ * JWS signature (RFC 8555 §7.3.4 / RFC 7515 §3.5, "HS256"). Returns NGX_OK /
+ * NGX_ERROR. No nginx HTTP dependency — unit-testable against RFC 4231 vectors.
+ */
+ngx_int_t ngx_http_autocert_hmac_sha256(ngx_pool_t *pool, ngx_str_t *key,
+    ngx_str_t *msg, ngx_str_t *out);
+
+
+/*
  * Produce a flattened-JSON JWS (RFC 7515 §7.2.2) over the given payload,
  * signed with the account key:
  *   {"protected":"…","payload":"…","signature":"…"}

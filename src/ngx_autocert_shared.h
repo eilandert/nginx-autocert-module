@@ -21,6 +21,8 @@ typedef struct {
     ngx_resolver_t  *resolver;       /* may be NULL if autocert_resolver unset */
     time_t           resolver_timeout;
     ngx_str_t        ca_certificate; /* PEM trust bundle path, "" => system */
+    ngx_str_t        eab_kid;        /* EAB key id (RFC 8555 §7.3.4), "" */
+    ngx_str_t        eab_hmac_key;   /* base64url EAB HMAC key, "" */
     ngx_uint_t       key_type;       /* ngx_http_autocert_key_type_e (acct key) */
     ngx_uint_t       store;          /* ngx_http_autocert_store_e (disk layout) */
     ngx_str_t        path;           /* cert store dir (holds the account key) */

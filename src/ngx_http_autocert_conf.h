@@ -62,6 +62,12 @@ typedef struct {
     time_t       resolver_timeout;  /* seconds */
     ngx_str_t    ca_certificate;    /* PEM trust bundle to verify the CA, "" */
 
+    /* M15: External Account Binding (RFC 8555 §7.3.4). Both-or-neither; "" if
+     * unset. eab_hmac_key is the base64url-encoded HMAC key as handed out by
+     * the CA (decoded to raw bytes at registration time). */
+    ngx_str_t    eab_kid;           /* CA-issued key identifier, "" if unset */
+    ngx_str_t    eab_hmac_key;      /* base64url HMAC key, "" if unset */
+
     ngx_shm_zone_t  *shm_zone;      /* published enabled-name set (for M4) */
     ngx_array_t     *names;         /* ngx_str_t, collected at postconfig */
 

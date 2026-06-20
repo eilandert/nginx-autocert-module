@@ -38,6 +38,8 @@ static ngx_uint_t ngx_autocert_account_is_bad_nonce(
 static ngx_int_t ngx_autocert_account_set_nonce(ngx_autocert_account_t *acct,
     ngx_str_t *nonce);
 static ngx_uint_t ngx_autocert_account_json_safe(ngx_str_t *s);
+static ngx_int_t ngx_autocert_account_build_eab(ngx_autocert_account_t *acct,
+    ngx_str_t *jwk, ngx_str_t *out);
 static void ngx_autocert_account_finish(ngx_autocert_account_t *acct,
     ngx_int_t rc);
 
@@ -508,6 +510,118 @@ ngx_autocert_account_nonce_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
 
 
 /*
+ * Build the External Account Binding object (RFC 8555 §7.3.4): a flattened-JSON
+ * JWS whose protected header is {"alg":"HS256","kid":<eab_kid>,"url":<newAccount
+ * URL>}, whose payload is the account-key public JWK (the SAME `jwk` string the
+ * outer newAccount request embeds), and whose signature is HMAC-SHA256 over
+ * "<b64(protected)>.<b64(payload)>" keyed by the base64url-decoded CA HMAC key.
+ * Emits the JWS JSON into *out (acct->pool). Caller splices it into the
+ * newAccount payload as "externalAccountBinding".
+ */
+static ngx_int_t
+ngx_autocert_account_build_eab(ngx_autocert_account_t *acct, ngx_str_t *jwk,
+    ngx_str_t *out)
+{
+    ngx_str_t   protected, hmac_key, b64_protected, b64_payload, signing_input;
+    ngx_str_t   mac, b64_sig;
+    u_char     *p;
+    size_t      size;
+
+    /* eab_kid is operator-supplied but lands inside the signed protected JSON;
+     * new_account_url is server-supplied and already json_safe-checked by the
+     * caller. Reject quote/backslash/control in the kid the same way. */
+    if (!ngx_autocert_account_json_safe(&acct->eab_kid)) {
+        ngx_log_error(NGX_LOG_ERR, acct->log, 0,
+                      "autocert: unsafe character in autocert_eab_kid");
+        return NGX_ERROR;
+    }
+
+    /* decode the base64url HMAC key handed out by the CA. */
+    if (ngx_http_autocert_base64url_decode(acct->pool, &acct->eab_hmac_key,
+                                           &hmac_key)
+        != NGX_OK)
+    {
+        ngx_log_error(NGX_LOG_ERR, acct->log, 0,
+                      "autocert: autocert_eab_hmac_key is not valid base64url");
+        return NGX_ERROR;
+    }
+    if (hmac_key.len == 0) {
+        ngx_log_error(NGX_LOG_ERR, acct->log, 0,
+                      "autocert: autocert_eab_hmac_key decodes to zero bytes");
+        return NGX_ERROR;
+    }
+
+    /* protected = {"alg":"HS256","kid":"<kid>","url":"<newAccount url>"} */
+    size = sizeof("{\"alg\":\"HS256\",\"kid\":\"\",\"url\":\"\"}") - 1
+           + acct->eab_kid.len + acct->new_account_url.len;
+    protected.data = ngx_pnalloc(acct->pool, size);
+    if (protected.data == NULL) {
+        return NGX_ERROR;
+    }
+    p = ngx_cpymem(protected.data, "{\"alg\":\"HS256\",\"kid\":\"",
+                   sizeof("{\"alg\":\"HS256\",\"kid\":\"") - 1);
+    p = ngx_cpymem(p, acct->eab_kid.data, acct->eab_kid.len);
+    p = ngx_cpymem(p, "\",\"url\":\"", sizeof("\",\"url\":\"") - 1);
+    p = ngx_cpymem(p, acct->new_account_url.data, acct->new_account_url.len);
+    p = ngx_cpymem(p, "\"}", sizeof("\"}") - 1);
+    protected.len = p - protected.data;
+
+    if (ngx_http_autocert_base64url_encode(acct->pool, &protected,
+                                           &b64_protected)
+        != NGX_OK
+        || ngx_http_autocert_base64url_encode(acct->pool, jwk, &b64_payload)
+           != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+
+    /* signing input = b64(protected) "." b64(payload) */
+    signing_input.len = b64_protected.len + 1 + b64_payload.len;
+    signing_input.data = ngx_pnalloc(acct->pool, signing_input.len);
+    if (signing_input.data == NULL) {
+        return NGX_ERROR;
+    }
+    p = ngx_cpymem(signing_input.data, b64_protected.data, b64_protected.len);
+    *p++ = '.';
+    p = ngx_cpymem(p, b64_payload.data, b64_payload.len);
+
+    if (ngx_http_autocert_hmac_sha256(acct->pool, &hmac_key, &signing_input,
+                                      &mac)
+        != NGX_OK)
+    {
+        ngx_log_error(NGX_LOG_ERR, acct->log, 0,
+                      "autocert: EAB HMAC-SHA256 failed");
+        return NGX_ERROR;
+    }
+
+    if (ngx_http_autocert_base64url_encode(acct->pool, &mac, &b64_sig)
+        != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+
+    /* {"protected":"<>","payload":"<>","signature":"<>"} */
+    size = sizeof("{\"protected\":\"\",\"payload\":\"\",\"signature\":\"\"}") - 1
+           + b64_protected.len + b64_payload.len + b64_sig.len;
+    out->data = ngx_pnalloc(acct->pool, size);
+    if (out->data == NULL) {
+        return NGX_ERROR;
+    }
+    p = ngx_cpymem(out->data, "{\"protected\":\"",
+                   sizeof("{\"protected\":\"") - 1);
+    p = ngx_cpymem(p, b64_protected.data, b64_protected.len);
+    p = ngx_cpymem(p, "\",\"payload\":\"", sizeof("\",\"payload\":\"") - 1);
+    p = ngx_cpymem(p, b64_payload.data, b64_payload.len);
+    p = ngx_cpymem(p, "\",\"signature\":\"", sizeof("\",\"signature\":\"") - 1);
+    p = ngx_cpymem(p, b64_sig.data, b64_sig.len);
+    p = ngx_cpymem(p, "\"}", sizeof("\"}") - 1);
+    out->len = p - out->data;
+
+    return NGX_OK;
+}
+
+
+/*
  * Build and send the newAccount JWS POST. The protected header carries the
  * public JWK (newAccount is a JWK-signed request, not kid-signed), the alg, the
  * nonce and the target URL; the payload agrees to the ToS.
@@ -518,6 +632,7 @@ ngx_autocert_account_post_account(ngx_autocert_account_t *acct)
     ngx_str_t    jwk, protected, jws;
     ngx_str_t    payload = ngx_string("{\"termsOfServiceAgreed\":true}");
     ngx_str_t    ctype = ngx_string("application/jose+json");
+    ngx_str_t    eab;
     ngx_str_t    post = ngx_string("POST");
     const char  *alg;
     u_char      *p;
@@ -546,6 +661,35 @@ ngx_autocert_account_post_account(ngx_autocert_account_t *acct)
                       "autocert: unsafe character in ACME nonce or directory "
                       "newAccount URL");
         return NGX_ERROR;
+    }
+
+    /* M15: if EAB is configured, build the externalAccountBinding JWS and fold
+     * it into the newAccount payload (RFC 8555 §7.3.4). EAB is sent ONLY on
+     * newAccount — kid-signed POSTs (newOrder etc.) never carry it. The
+     * new_account_url must already be json_safe (checked above) since it goes
+     * into the EAB protected header too. */
+    if (acct->eab_kid.len != 0) {
+        u_char  *p;
+        size_t   size;
+
+        if (ngx_autocert_account_build_eab(acct, &jwk, &eab) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        size = sizeof("{\"termsOfServiceAgreed\":true,"
+                      "\"externalAccountBinding\":}") - 1 + eab.len;
+        payload.data = ngx_pnalloc(acct->pool, size);
+        if (payload.data == NULL) {
+            return NGX_ERROR;
+        }
+        p = ngx_cpymem(payload.data,
+                       "{\"termsOfServiceAgreed\":true,"
+                       "\"externalAccountBinding\":",
+                       sizeof("{\"termsOfServiceAgreed\":true,"
+                              "\"externalAccountBinding\":") - 1);
+        p = ngx_cpymem(p, eab.data, eab.len);
+        *p++ = '}';
+        payload.len = p - payload.data;
     }
 
     /* protected = {"alg":"<alg>","jwk":<jwk>,"nonce":"<nonce>","url":"<url>"} */

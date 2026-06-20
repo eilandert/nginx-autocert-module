@@ -153,6 +153,8 @@ One ACME policy per instance. All optional.
 | `autocert_resolver <addr>...;` | the `http{}` `resolver` | DNS used to reach the CA |
 | `autocert_resolver_timeout <time>;` | `30s` | DNS query timeout |
 | `autocert_ca_certificate <file>;` | system trust store | PEM bundle to verify the CA |
+| `autocert_eab_kid <key-id>;` | *(none)* | EAB key identifier — see below |
+| `autocert_eab_hmac_key <base64url>;` | *(none)* | EAB HMAC key (base64url) — see below |
 
 > `autocert_key_type` takes the OpenSSL curve names `secp384r1` / `secp256r1`,
 > not `p384` / `p256`. The ACME server's certificate is **always** verified
@@ -167,6 +169,27 @@ One ACME policy per instance. All optional.
 > signed by the *Fake LE* intermediate and are **not trusted by browsers**.
 > They consume no production rate-limit quota, making them suitable for
 > CI/CD pipelines that exercise the full issuance path before go-live.
+
+### External Account Binding (commercial CAs)
+
+Some CAs (ZeroSSL, Sectigo, Google Trust Services) require **External Account
+Binding** (RFC 8555 §7.3.4): the ACME account must be tied to an account you
+already hold with the CA, proven by a key-id + HMAC key the CA hands you from
+its dashboard.
+
+```nginx
+http {
+    autocert_ca         https://acme.zerossl.com/v2/DV90;
+    autocert_eab_kid     "your-eab-key-id";
+    autocert_eab_hmac_key "base64url-hmac-key-from-the-CA-dashboard";
+}
+```
+
+The HMAC key is the value as the CA gives it — base64url-encoded (no padding).
+`autocert_eab_kid` and `autocert_eab_hmac_key` are **both-or-neither**: setting
+only one fails config. The binding is computed and sent **only** on account
+registration (`newAccount`); ordinary order/renewal requests are unaffected.
+Let's Encrypt does not use EAB — leave both unset for it.
 
 ### Which names get provisioned
 
