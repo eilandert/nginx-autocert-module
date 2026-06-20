@@ -113,6 +113,67 @@ test_base64url(void)
 }
 
 
+/* Compare a byte buffer against a lowercase hex string. */
+static int
+eq_hex(ngx_str_t *got, const char *hex)
+{
+    size_t  i;
+
+    if (got->len * 2 != ngx_strlen(hex)) {
+        return 0;
+    }
+    for (i = 0; i < got->len; i++) {
+        char  b[3];
+        snprintf(b, sizeof(b), "%02x", (unsigned) got->data[i]);
+        if (b[0] != hex[2 * i] || b[1] != hex[2 * i + 1]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+
+/* HMAC-SHA256 (the EAB outer-JWS MAC) against RFC 4231 known-answer vectors,
+ * plus the EAB-shaped flow: base64url key -> decode -> HMAC. */
+static void
+test_hmac_sha256(void)
+{
+    ngx_str_t  key, msg, mac, b64key, rawkey;
+    u_char     k1[20];
+
+    /* RFC 4231 Test Case 2: key="Jefe", data="what do ya want for nothing?" */
+    key = S("Jefe");
+    msg = S("what do ya want for nothing?");
+    CHECK(ngx_http_autocert_hmac_sha256(pool, &key, &msg, &mac) == NGX_OK
+          && eq_hex(&mac,
+              "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"),
+          "HMAC-SHA256 RFC 4231 TC2");
+
+    /* RFC 4231 Test Case 1: key = 20 * 0x0b, data="Hi There". */
+    ngx_memset(k1, 0x0b, sizeof(k1));
+    key.data = k1; key.len = sizeof(k1);
+    msg = S("Hi There");
+    CHECK(ngx_http_autocert_hmac_sha256(pool, &key, &msg, &mac) == NGX_OK
+          && eq_hex(&mac,
+              "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"),
+          "HMAC-SHA256 RFC 4231 TC1");
+
+    /* EAB-shaped: the directive carries a base64url key; build_eab decodes it to
+     * raw bytes before HMAC. Feed base64url("Jefe")="SmVmZQ" through that path
+     * and confirm it reproduces TC2. */
+    b64key = S("SmVmZQ");
+    CHECK(ngx_http_autocert_base64url_decode(pool, &b64key, &rawkey) == NGX_OK
+          && rawkey.len == 4
+          && ngx_strncmp(rawkey.data, "Jefe", 4) == 0,
+          "base64url EAB key decodes to raw");
+    msg = S("what do ya want for nothing?");
+    CHECK(ngx_http_autocert_hmac_sha256(pool, &rawkey, &msg, &mac) == NGX_OK
+          && eq_hex(&mac,
+              "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"),
+          "HMAC over base64url-decoded EAB key matches TC2");
+}
+
+
 static void
 test_jwk_and_thumbprint(void)
 {
@@ -458,6 +519,7 @@ main(void)
     pool = p;
 
     test_base64url();
+    test_hmac_sha256();
     test_jwk_and_thumbprint();
     test_jws_sign_verify(NGX_HTTP_AUTOCERT_CRYPTO_P256, "ES256");
     test_jws_sign_verify(NGX_HTTP_AUTOCERT_CRYPTO_P384, "ES384");
