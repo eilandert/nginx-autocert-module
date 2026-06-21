@@ -212,4 +212,15 @@ STAGING="$PREFIX/store/${ORDER_DOMAIN}.tmp"
 [ ! -e "$STAGING" ] || { echo "::error::staging dir $STAGING left behind after issuance"; ls -la "$STAGING"; exit 1; }
 echo "✓ no staging dir left behind (atomic commit cleaned up)"
 
+# Per-CA account dir is keyed by SHA-256(CA URL)[:8] = 16 lowercase hex (was a
+# too-short crc32/hex8 that let two CA URLs alias onto one account.key). Assert
+# the on-disk dir name matches the 16-hex shape so a regression to crc32 fails.
+acct_dir=$(find "$PREFIX/store/accounts" -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null)
+acct_hash=$(basename "${acct_dir:-none}")
+if printf '%s' "$acct_hash" | grep -Eq '^[0-9a-f]{16}$'; then
+    echo "✓ account dir keyed by 16-hex SHA-256 prefix ($acct_hash)"
+else
+    echo "::error::account dir is not 16 lowercase hex (got '$acct_hash') — crc32 regression?"; exit 1
+fi
+
 echo "✓✓ full ACME issuance verified end-to-end"

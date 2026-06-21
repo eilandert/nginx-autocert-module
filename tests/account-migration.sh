@@ -35,6 +35,11 @@ chmod 600 "$PREFIX/store/account.key"
 cat > "$PREFIX/conf/nginx.conf" <<EOF
 load_module $HTTP_SO;
 error_log $PREFIX/logs/error.log notice;
+# Keep worker 0 (the ACME driver) as root when this runs under the documented
+# root command, so it can write the root-owned legacy store and perform the
+# migration. nginx ignores this with a warning when the master is unprivileged
+# (CI), where the store is already worker-owned — so it is correct either way.
+user root;
 events {}
 http {
     autocert on admin@example.com;

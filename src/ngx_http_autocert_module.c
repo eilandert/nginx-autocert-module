@@ -18,6 +18,7 @@
 #include <ngx_http.h>
 
 #include <ngx_http_ssl_module.h>
+#include <openssl/sha.h>           /* SHA256() for the per-CA account-dir hash */
 
 #include "ngx_http_autocert_conf.h"
 #include "ngx_autocert_challenge.h"
@@ -622,7 +623,7 @@ ngx_http_autocert_effective_ca(ngx_http_autocert_main_conf_t *amcf,
 
 /*
  * M2: find (or create) the ca_list entry for a CA, keyed by its canonical
- * directory URL. ca_hash = crc32(url) as 8 lowercase hex, used by M3 for the
+ * directory URL. ca_hash = SHA-256(url)[:8] as 16 lowercase hex, used by M3 for the
  * per-CA account dir. Returns NULL on alloc failure.
  */
 static ngx_autocert_ca_entry_t *
@@ -632,7 +633,7 @@ ngx_http_autocert_ca_entry(ngx_conf_t *cf,
     static const u_char       hex[] = "0123456789abcdef";
     ngx_autocert_ca_entry_t  *e;
     ngx_uint_t                i;
-    uint32_t                  h;
+    u_char                    md[SHA256_DIGEST_LENGTH];
 
     e = amcf->ca_list->elts;
     for (i = 0; i < amcf->ca_list->nelts; i++) {
@@ -650,17 +651,26 @@ ngx_http_autocert_ca_entry(ngx_conf_t *cf,
          * different ca_certificate or different EAB would silently collapse and
          * the second config would be ignored (Codex M4 #3). Reject instead.
          */
+        /*
+         * Compare lengths first, and only ngx_strncmp() when the shared length
+         * is non-zero: an absent trust bundle / EAB field has data == NULL, and
+         * ngx_strncmp(NULL, NULL, 0) is undefined C (memcmp with NULL args),
+         * even though glibc happens to tolerate it.
+         */
         if (e[i].ca_conf.ca_certificate.len != cac->ca_certificate.len
-            || ngx_strncmp(e[i].ca_conf.ca_certificate.data,
-                           cac->ca_certificate.data,
-                           cac->ca_certificate.len) != 0
+            || (cac->ca_certificate.len != 0
+                && ngx_strncmp(e[i].ca_conf.ca_certificate.data,
+                               cac->ca_certificate.data,
+                               cac->ca_certificate.len) != 0)
             || e[i].ca_conf.eab_kid.len != cac->eab_kid.len
-            || ngx_strncmp(e[i].ca_conf.eab_kid.data, cac->eab_kid.data,
-                           cac->eab_kid.len) != 0
+            || (cac->eab_kid.len != 0
+                && ngx_strncmp(e[i].ca_conf.eab_kid.data, cac->eab_kid.data,
+                               cac->eab_kid.len) != 0)
             || e[i].ca_conf.eab_hmac_key.len != cac->eab_hmac_key.len
-            || ngx_strncmp(e[i].ca_conf.eab_hmac_key.data,
-                           cac->eab_hmac_key.data,
-                           cac->eab_hmac_key.len) != 0)
+            || (cac->eab_hmac_key.len != 0
+                && ngx_strncmp(e[i].ca_conf.eab_hmac_key.data,
+                               cac->eab_hmac_key.data,
+                               cac->eab_hmac_key.len) != 0))
         {
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                 "autocert: CA \"%V\" is configured with conflicting "
@@ -684,11 +694,23 @@ ngx_http_autocert_ca_entry(ngx_conf_t *cf,
         return NULL;
     }
 
-    h = ngx_crc32_long(cac->ca.data, cac->ca.len);
-    for (i = 0; i < 8; i++) {
-        e->ca_hash[i] = hex[(h >> ((7 - i) * 4)) & 0xf];
+    /*
+     * Per-CA account-dir key: leading 64 bits of SHA-256(canonical CA URL),
+     * 16 lowercase hex. crc32/hex8 was too short — two distinct CA URLs could
+     * collide and then share one accounts/<hash>/account.key, breaking the
+     * promised per-CA key isolation. 64 bits makes that collision infeasible.
+     */
+    if (SHA256(cac->ca.data, cac->ca.len, md) == NULL) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "autocert: SHA256() failed hashing CA URL \"%V\"",
+                           &cac->ca);
+        return NULL;
     }
-    e->ca_hash[8] = '\0';
+    for (i = 0; i < NGX_AUTOCERT_CA_HASH_HEX / 2; i++) {
+        e->ca_hash[2 * i]     = hex[md[i] >> 4];
+        e->ca_hash[2 * i + 1] = hex[md[i] & 0xf];
+    }
+    e->ca_hash[NGX_AUTOCERT_CA_HASH_HEX] = '\0';
 
     /*
      * M3: per-CA account key path = <path>/accounts/<ca_hash>/account.key.
@@ -699,8 +721,8 @@ ngx_http_autocert_ca_entry(ngx_conf_t *cf,
         u_char  *p;
         size_t   len;
 
-        len = amcf->path.len + sizeof("/accounts/") - 1 + 8
-              + sizeof("/account.key") - 1;
+        len = amcf->path.len + sizeof("/accounts/") - 1
+              + NGX_AUTOCERT_CA_HASH_HEX + sizeof("/account.key") - 1;
         p = ngx_pnalloc(cf->pool, len + 1);
         if (p == NULL) {
             return NULL;
@@ -709,7 +731,7 @@ ngx_http_autocert_ca_entry(ngx_conf_t *cf,
         e->account_key_path.len = len;
         p = ngx_cpymem(p, amcf->path.data, amcf->path.len);
         p = ngx_cpymem(p, "/accounts/", sizeof("/accounts/") - 1);
-        p = ngx_cpymem(p, e->ca_hash, 8);
+        p = ngx_cpymem(p, e->ca_hash, NGX_AUTOCERT_CA_HASH_HEX);
         p = ngx_cpymem(p, "/account.key", sizeof("/account.key") - 1);
         *p = '\0';
     }

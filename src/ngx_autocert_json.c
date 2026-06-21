@@ -573,7 +573,7 @@ ngx_autocert_json_object_get(ngx_autocert_json_value_t *v, const char *key)
 
 /*
  * Fetch a STRING member as an ngx_str_t (length-counted, NOT NUL-terminated).
- * A JSON string value may contain interior NUL bytes (a " " escape), so
+ * A JSON string value may contain interior NUL bytes (a "\u0000" escape), so
  * callers must treat *out as len-bounded and never strlen() it. NGX_DECLINED =
  * key absent, NGX_ERROR = present but not a string.
  */

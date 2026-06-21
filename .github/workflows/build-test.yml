@@ -63,6 +63,11 @@ jobs:
         run: |
           bash -n tests/*.sh fuzz/*.sh test/*.sh
           shellcheck tests/*.sh fuzz/*.sh test/*.sh
+          # Reject literal NUL bytes in tracked C sources: they make git/rg treat
+          # the file as binary and silently drop it from source search / review.
+          if LC_ALL=C grep -laP '\x00' src/*.c src/*.h; then
+            echo "::error::NUL byte in tracked C source (listed above)"; exit 1
+          fi
           # Tell cppcheck the OpenSSL version so it takes the satisfied branch
           # of the >= 3.0.0 floor guard instead of evaluating the intentional
           # `#error` with the macro undefined (cppcheck doesn't parse the system
