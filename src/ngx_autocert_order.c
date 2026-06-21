@@ -21,6 +21,11 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <openssl/bio.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+#include <openssl/err.h>
+
 /*
  * Atomic two-file commit uses renameat2(RENAME_EXCHANGE) to swap the freshly
  * written per-domain dir with the live one in a single syscall (Linux 3.15+).
@@ -1627,6 +1632,87 @@ ngx_autocert_order_download(ngx_autocert_order_t *order)
 }
 
 
+/*
+ * Sanity-check the freshly-downloaded pair before it can overwrite the live
+ * cert: the fullchain must parse to at least a leaf X509, any further certs
+ * must be well-formed (no truncated/garbage intermediate), and the leaf's
+ * public key must match the private key we generated for this order. This is
+ * the same contract the serve path enforces at load time (serve.c), pulled
+ * forward so a bad CA response is rejected before order_store() commits it.
+ * Returns NGX_OK if usable, NGX_ERROR otherwise.
+ */
+static ngx_int_t
+ngx_autocert_order_validate_cert(ngx_autocert_order_t *order)
+{
+    BIO       *bio;
+    X509      *leaf, *x;
+    EVP_PKEY  *key;
+    ngx_int_t  rc = NGX_ERROR;
+
+    leaf = NULL;
+    key = NULL;
+
+    bio = BIO_new_mem_buf(order->cert_chain.data, (int) order->cert_chain.len);
+    if (bio == NULL) {
+        return NGX_ERROR;
+    }
+
+    leaf = PEM_read_bio_X509(bio, NULL, NULL, NULL);
+    if (leaf == NULL) {
+        ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                      "autocert: downloaded chain has no leaf certificate");
+        goto done;
+    }
+
+    /* Drain the rest of the chain; only a clean end-of-data is acceptable, a
+     * malformed intermediate must fail validation (mirrors serve.c). */
+    while ((x = PEM_read_bio_X509(bio, NULL, NULL, NULL)) != NULL) {
+        X509_free(x);
+    }
+    if (ERR_GET_REASON(ERR_peek_last_error()) != PEM_R_NO_START_LINE) {
+        ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                      "autocert: downloaded chain has a malformed certificate");
+        ERR_clear_error();
+        goto done;
+    }
+    ERR_clear_error();
+
+    /* Leaf public key must match the private key minted for this order. */
+    BIO_free(bio);
+    bio = BIO_new_mem_buf(order->cert_key_pem.data,
+                          (int) order->cert_key_pem.len);
+    if (bio == NULL) {
+        bio = NULL;
+        goto done;
+    }
+    key = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL);
+    if (key == NULL) {
+        ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                      "autocert: order private key did not parse");
+        goto done;
+    }
+    if (X509_check_private_key(leaf, key) != 1) {
+        ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                      "autocert: downloaded leaf does not match the order key");
+        goto done;
+    }
+
+    rc = NGX_OK;
+
+done:
+    if (key) {
+        EVP_PKEY_free(key);
+    }
+    if (leaf) {
+        X509_free(leaf);
+    }
+    if (bio) {
+        BIO_free(bio);
+    }
+    return rc;
+}
+
+
 static void
 ngx_autocert_order_download_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
 {
@@ -1662,6 +1748,23 @@ ngx_autocert_order_download_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
     }
 
     ngx_destroy_pool(req->pool);
+
+    /*
+     * Validate the downloaded pair BEFORE it can replace a good on-disk cert.
+     * A buggy/malicious ACME server can return a 200 with a body that is not a
+     * usable certificate; without this check order_store() would atomically
+     * overwrite the live cert with garbage and order_finish(NGX_OK) would clear
+     * the renewal backoff, so workers would fail to load on the next reload/
+     * restart. Reject here instead: the live cert stays, renewal retries.
+     */
+    if (ngx_autocert_order_validate_cert(order) != NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                      "autocert: downloaded certificate for \"%V\" is not usable; "
+                      "keeping the existing cert and deferring renewal",
+                      &order->domain);
+        ngx_autocert_order_finish(order, NGX_ERROR);
+        return;
+    }
 
     /* M6b step 10: persist to disk. */
     if (ngx_autocert_order_store(order) != NGX_OK) {

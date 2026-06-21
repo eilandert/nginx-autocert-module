@@ -64,13 +64,41 @@ docker run -d --name "$DNS_NAME" \
     -k --address=/${CA_HOST}/127.0.0.1 >/dev/null
 
 cat > "$PREFIX/mockca.py" <<PYEOF
-import json, ssl, itertools
+import json, ssl, itertools, base64, datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.x509.oid import NameOID
 
 BASE = "https://${CA_HOST}:${CA_PORT}"
-CHAIN = open("${PREFIX}/chain.pem", "rb").read()
+# A real CA signs the leaf over the CSR public key, so the issued leaf matches
+# the order's private key (the driver now validates leaf<->key before storing).
+# Load the mock intermediate as the signer; build leaf+intermediate per order.
+INTER = open("${PREFIX}/inter.pem", "rb").read()
+INTER_KEY = serialization.load_pem_private_key(
+    open("${PREFIX}/inter-key.pem", "rb").read(), password=None)
+INTER_CERT = x509.load_pem_x509_certificate(INTER)
+NAME = "${NAME}"
 nonces = ("nonce-%d" % i for i in itertools.count())
-state = {"chal_done": False}
+state = {"chal_done": False, "chain": None}
+
+def b64url_dec(s):
+    s += "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s)
+
+def make_chain(csr_der):
+    csr = x509.load_der_x509_csr(csr_der)
+    now = datetime.datetime.utcnow()
+    leaf = (x509.CertificateBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, NAME)]))
+            .issuer_name(INTER_CERT.subject)
+            .public_key(csr.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(minutes=1))
+            .not_valid_after(now + datetime.timedelta(days=2))
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName(NAME)]), False)
+            .sign(INTER_KEY, hashes.SHA256()))
+    return leaf.public_bytes(serialization.Encoding.PEM) + INTER
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
@@ -102,8 +130,7 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0) or 0)
-        if n:
-            self.rfile.read(n)
+        raw = self.rfile.read(n) if n else b""
         if self.path == "/nonce":
             self._send(204)
         elif self.path == "/acct":
@@ -130,13 +157,17 @@ class H(BaseHTTPRequestHandler):
             state["chal_done"] = True
             self._send(200, json.dumps({"status": "valid"}).encode())
         elif self.path == "/finalize":
+            payload = json.loads(raw.decode())["payload"]
+            csr_der = b64url_dec(json.loads(b64url_dec(payload).decode())["csr"])
+            state["chain"] = make_chain(csr_der)
             self._send(200, json.dumps({
                 "status": "valid", "certificate": BASE + "/cert"}).encode())
         elif self.path == "/order/1":
             self._send(200, json.dumps({
                 "status": "valid", "certificate": BASE + "/cert"}).encode())
         elif self.path == "/cert":
-            self._send(200, CHAIN, ctype="application/pem-certificate-chain")
+            self._send(200, state["chain"],
+                       ctype="application/pem-certificate-chain")
         else:
             self._send(404, b'{"type":"urn:ietf:params:acme:error:malformed"}')
 

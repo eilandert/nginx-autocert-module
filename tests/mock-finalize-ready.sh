@@ -69,16 +69,43 @@ docker run -d --name "$DNS_NAME" \
 
 # ---- mock ACME server -------------------------------------------------------
 cat > "$PREFIX/mockca.py" <<PYEOF
-import json, ssl, itertools
+import json, ssl, itertools, base64, datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.x509.oid import NameOID
 
 BASE = "https://${CA_HOST}:${CA_PORT}"
-LEAF = open("${PREFIX}/leaf.pem", "rb").read()
+# The driver now validates that the issued leaf's public key matches the order's
+# private key before storing, so the mock must sign the leaf over the CSR pubkey
+# (like a real CA) rather than serve a static self-signed cert.
+CA_KEY = serialization.load_pem_private_key(
+    open("${PREFIX}/ca-key.pem", "rb").read(), password=None)
+CA_CERT = x509.load_pem_x509_certificate(open("${PREFIX}/ca.pem", "rb").read())
+NAME = "${NAME}"
 nonces = ("nonce-%d" % i for i in itertools.count())
+
+def b64url_dec(s):
+    s += "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s)
+
+def make_leaf(csr_der):
+    csr = x509.load_der_x509_csr(csr_der)
+    now = datetime.datetime.utcnow()
+    leaf = (x509.CertificateBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, NAME)]))
+            .issuer_name(CA_CERT.subject)
+            .public_key(csr.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(minutes=1))
+            .not_valid_after(now + datetime.timedelta(days=2))
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName(NAME)]), False)
+            .sign(CA_KEY, hashes.SHA256()))
+    return leaf.public_bytes(serialization.Encoding.PEM)
 
 # State machine: count finalize attempts so the first is rejected (order not
 # ready) and the second succeeds (order ready).
-state = {"finalize_calls": 0}
+state = {"finalize_calls": 0, "leaf": None}
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
@@ -110,8 +137,7 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0) or 0)
-        if n:
-            self.rfile.read(n)
+        raw = self.rfile.read(n) if n else b""
 
         if self.path == "/nonce":
             self._send(204)
@@ -155,7 +181,11 @@ class H(BaseHTTPRequestHandler):
                                 b'orderNotReady","detail":"order is not ready"}',
                            ctype="application/problem+json")
             else:
-                # Second attempt accepted; order moves to valid.
+                # Second attempt accepted; sign the leaf over the CSR pubkey and
+                # move the order to valid.
+                payload = json.loads(raw.decode())["payload"]
+                csr = b64url_dec(json.loads(b64url_dec(payload).decode())["csr"])
+                state["leaf"] = make_leaf(csr)
                 self._send(200, json.dumps({
                     "status": "valid",
                     "certificate": BASE + "/cert",
@@ -173,7 +203,8 @@ class H(BaseHTTPRequestHandler):
                 self._send(200, json.dumps({"status": "ready"}).encode())
 
         elif self.path == "/cert":
-            self._send(200, LEAF, ctype="application/pem-certificate-chain")
+            self._send(200, state["leaf"],
+                       ctype="application/pem-certificate-chain")
 
         else:
             self._send(404, b'{"type":"urn:ietf:params:acme:error:malformed"}')

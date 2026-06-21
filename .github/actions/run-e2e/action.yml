@@ -29,6 +29,17 @@ runs:
       with:
         packages: libpcre2-8-0
 
+    # Several mock-CA e2e scripts sign the issued leaf over the order's CSR
+    # public key (the driver validates leaf<->key before storing), which needs
+    # python3 "cryptography". Install it for the system python3 the mocks run
+    # under (also when invoked via sudo). Harmless for scripts that don't use it.
+    - name: Install python cryptography for the mock CAs
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y python3-cryptography
+
     - name: Download ${{ inputs.flavor }} build
       uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
       with:
