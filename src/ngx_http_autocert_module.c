@@ -175,6 +175,24 @@ static ngx_command_t  ngx_http_autocert_commands[] = {
       offsetof(ngx_http_autocert_main_conf_t, ca_certificate),
       NULL },
 
+    /* M15: External Account Binding (RFC 8555 §7.3.4) for commercial CAs
+     * (ZeroSSL, Sectigo, Google) that gate newAccount behind a CA-issued
+     * key-id + HMAC key. Both-or-neither — enforced in init_main_conf. */
+
+    { ngx_string("autocert_eab_kid"),
+      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_MAIN_CONF_OFFSET,
+      offsetof(ngx_http_autocert_main_conf_t, eab_kid),
+      NULL },
+
+    { ngx_string("autocert_eab_hmac_key"),
+      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_MAIN_CONF_OFFSET,
+      offsetof(ngx_http_autocert_main_conf_t, eab_hmac_key),
+      NULL },
+
 #if (NGX_AUTOCERT_TEST)
     /* TEST-ONLY: seed one token->keyauth into the challenge store at startup so
      * the HTTP-01 serve path can be tested before the order flow (M6) exists.
@@ -349,6 +367,21 @@ ngx_http_autocert_init_main_conf(ngx_conf_t *cf, void *conf)
     }
 
     ngx_conf_init_value(amcf->resolver_timeout, 30);
+
+    /* EAB: a key-id without an HMAC key (or vice versa) is meaningless and
+     * would silently fall back to an unbound newAccount the CA rejects, so
+     * fail config rather than surprise the operator at registration time.
+     * Presence is "directive given" (data != NULL after str_slot); an explicit
+     * empty value ("") is given-but-useless and must also fail. */
+    if ((amcf->eab_kid.data != NULL) != (amcf->eab_hmac_key.data != NULL)
+        || (amcf->eab_kid.data != NULL
+            && (amcf->eab_kid.len == 0 || amcf->eab_hmac_key.len == 0)))
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "\"autocert_eab_kid\" and \"autocert_eab_hmac_key\" must both be "
+            "set (non-empty) or both absent");
+        return NGX_CONF_ERROR;
+    }
 
     return NGX_CONF_OK;
 }
