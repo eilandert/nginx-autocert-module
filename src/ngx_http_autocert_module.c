@@ -98,23 +98,31 @@ static ngx_command_t  ngx_http_autocert_commands[] = {
       0,
       NULL },
 
-    /* The tuning knobs below are http{}-global only (one ACME policy). */
+    /*
+     * M4 (per-vhost multi-CA, #15): the CA-identifying knobs are MAIN+SRV
+     * scope. The http{} occurrence sets the instance-wide default (written into
+     * the main-level srv_conf via SRV_CONF_OFFSET); a server{} occurrence
+     * overrides it for that vhost. merge_srv_conf folds default->server, then
+     * postconfig resolves+validates each server's effective ca_conf and groups
+     * names by CA into ca_list. (Other tuning knobs below stay http{}-global —
+     * one ACME policy.)
+     */
 
     { ngx_string("autocert_ca"),
-      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_str_slot,
-      NGX_HTTP_MAIN_CONF_OFFSET,
-      offsetof(ngx_http_autocert_main_conf_t, ca_conf.ca),
+      NGX_HTTP_SRV_CONF_OFFSET,
+      offsetof(ngx_http_autocert_srv_conf_t, ca_conf.ca),
       NULL },
 
     /* Shorthand for the LE staging directory URL; mutually exclusive with
      * autocert_ca. Use in CI/CD to exercise the full issuance flow without
      * consuming production rate limits. */
     { ngx_string("autocert_staging"),
-      NGX_HTTP_MAIN_CONF|NGX_CONF_FLAG,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_FLAG,
       ngx_conf_set_flag_slot,
-      NGX_HTTP_MAIN_CONF_OFFSET,
-      offsetof(ngx_http_autocert_main_conf_t, ca_conf.staging),
+      NGX_HTTP_SRV_CONF_OFFSET,
+      offsetof(ngx_http_autocert_srv_conf_t, ca_conf.staging),
       NULL },
 
     { ngx_string("autocert_renew_before"),
@@ -169,10 +177,10 @@ static ngx_command_t  ngx_http_autocert_commands[] = {
       NULL },
 
     { ngx_string("autocert_ca_certificate"),
-      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_str_slot,
-      NGX_HTTP_MAIN_CONF_OFFSET,
-      offsetof(ngx_http_autocert_main_conf_t, ca_conf.ca_certificate),
+      NGX_HTTP_SRV_CONF_OFFSET,
+      offsetof(ngx_http_autocert_srv_conf_t, ca_conf.ca_certificate),
       NULL },
 
     /* M15: External Account Binding (RFC 8555 §7.3.4) for commercial CAs
@@ -180,17 +188,17 @@ static ngx_command_t  ngx_http_autocert_commands[] = {
      * key-id + HMAC key. Both-or-neither — enforced in init_main_conf. */
 
     { ngx_string("autocert_eab_kid"),
-      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_str_slot,
-      NGX_HTTP_MAIN_CONF_OFFSET,
-      offsetof(ngx_http_autocert_main_conf_t, ca_conf.eab_kid),
+      NGX_HTTP_SRV_CONF_OFFSET,
+      offsetof(ngx_http_autocert_srv_conf_t, ca_conf.eab_kid),
       NULL },
 
     { ngx_string("autocert_eab_hmac_key"),
-      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_str_slot,
-      NGX_HTTP_MAIN_CONF_OFFSET,
-      offsetof(ngx_http_autocert_main_conf_t, ca_conf.eab_hmac_key),
+      NGX_HTTP_SRV_CONF_OFFSET,
+      offsetof(ngx_http_autocert_srv_conf_t, ca_conf.eab_hmac_key),
       NULL },
 
     /* M16: dns-01 operator exec hooks (D3). Both required when
@@ -328,8 +336,9 @@ ngx_http_autocert_create_main_conf(ngx_conf_t *cf)
         return NULL;
     }
 
-    /* ca, path zeroed by pcalloc; set in init_main_conf. */
-    amcf->ca_conf.staging = NGX_CONF_UNSET;
+    /* path zeroed by pcalloc; set in init_main_conf. M4: the CA knobs are SRV
+     * scope now (srv_conf.ca_conf); amcf->ca_conf is unused (kept for the M2/M3
+     * flat-accessor bridge, which reads ca_list[0] instead). */
     amcf->renew_before = NGX_CONF_UNSET;
     amcf->key_type = NGX_CONF_UNSET_UINT;
     amcf->store = NGX_CONF_UNSET_UINT;
@@ -351,20 +360,14 @@ ngx_http_autocert_init_main_conf(ngx_conf_t *cf, void *conf)
 {
     ngx_http_autocert_main_conf_t  *amcf = conf;
 
-    ngx_conf_init_value(amcf->ca_conf.staging, 0);
-
-    if (amcf->ca_conf.staging) {
-        if (amcf->ca_conf.ca.data != NULL) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                "\"autocert_staging\" and \"autocert_ca\" are mutually "
-                "exclusive");
-            return NGX_CONF_ERROR;
-        }
-        ngx_str_set(&amcf->ca_conf.ca, NGX_HTTP_AUTOCERT_STAGING_CA);
-
-    } else if (amcf->ca_conf.ca.data == NULL) {
-        ngx_str_set(&amcf->ca_conf.ca, NGX_HTTP_AUTOCERT_DEFAULT_CA);
-    }
+    /*
+     * M4: the CA knobs (ca/staging/ca_certificate/eab_*) are now MAIN+SRV
+     * scope and live in srv_conf.ca_conf. Their defaulting + validation
+     * (staging<->ca exclusion, default CA, ca_certificate abspath, EAB
+     * both-or-neither) moved to ngx_http_autocert_resolve_ca_conf(), run
+     * per effective server ca_conf in postconfig. init_main_conf keeps only
+     * the genuinely instance-wide knobs below.
+     */
 
     /* User spec: 7d default (industry-safer 30d noted but honoring request). */
     ngx_conf_init_value(amcf->renew_before, 7 * 24 * 60 * 60);
@@ -390,37 +393,9 @@ ngx_http_autocert_init_main_conf(ngx_conf_t *cf, void *conf)
         return NGX_CONF_ERROR;
     }
 
-    /*
-     * Resolve the CA trust bundle path the same way, at config time. The ACME
-     * client now loads it with a plain OpenSSL call from the worker-0 driver
-     * (NOT ngx_ssl_trusted_certificate, which is a config-time API that derefs
-     * the cycle's SSL cache via cf->cycle->old_cycle and faults in a worker), so
-     * the path must already be absolute by the time the worker uses it.
-     */
-    if (amcf->ca_conf.ca_certificate.len != 0
-        && ngx_conf_full_name(cf->cycle, &amcf->ca_conf.ca_certificate, 1) != NGX_OK)
-    {
-        return NGX_CONF_ERROR;
-    }
-
     ngx_conf_init_value(amcf->resolver_timeout, 30);
     ngx_conf_init_value(amcf->dns_propagation_delay, 10);   /* M16 dns-01 */
     ngx_conf_init_value(amcf->dns_hook_timeout, 30);        /* M16 hook exec */
-
-    /* EAB: a key-id without an HMAC key (or vice versa) is meaningless and
-     * would silently fall back to an unbound newAccount the CA rejects, so
-     * fail config rather than surprise the operator at registration time.
-     * Presence is "directive given" (data != NULL after str_slot); an explicit
-     * empty value ("") is given-but-useless and must also fail. */
-    if ((amcf->ca_conf.eab_kid.data != NULL) != (amcf->ca_conf.eab_hmac_key.data != NULL)
-        || (amcf->ca_conf.eab_kid.data != NULL
-            && (amcf->ca_conf.eab_kid.len == 0 || amcf->ca_conf.eab_hmac_key.len == 0)))
-    {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-            "\"autocert_eab_kid\" and \"autocert_eab_hmac_key\" must both be "
-            "set (non-empty) or both absent");
-        return NGX_CONF_ERROR;
-    }
 
     /*
      * M16 dns-01: the publish/remove hooks are exec'd by the driver. A hook
@@ -496,22 +471,119 @@ ngx_http_autocert_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_conf_merge_value(conf->enable, prev->enable, 0);
     ngx_conf_merge_str_value(conf->email, prev->email, "");
 
+    /*
+     * M4 CA-config inheritance. The CA selector is the pair {autocert_ca,
+     * autocert_staging}; the ancillary knobs (ca_certificate trust bundle, EAB
+     * key-id + HMAC) are CA-BOUND credentials/roots.
+     *
+     * Rule 1 (selector is a unit): a server that explicitly sets EITHER ca or
+     * staging fully owns the selector and inherits NEITHER from the http{}
+     * default — so `server { autocert_staging on; }` overrides a global
+     * `autocert_ca` cleanly instead of inheriting it and then tripping the
+     * staging<->ca mutual-exclusion check (Codex M4 #1).
+     *
+     * Rule 2 (don't leak CA-bound creds across CAs): the trust bundle + EAB
+     * credentials inherit from the global ONLY when the server did NOT switch
+     * CAs. A server that overrides the CA but leaves EAB/trust unset gets none —
+     * inheriting CA-A's EAB key or pinned root for CA-B would send the wrong
+     * credentials / pin the wrong root (Codex M4 #2). Such a server must set
+     * them explicitly.
+     *
+     * Strings use a raw data==NULL inherit (NOT ngx_conf_merge_str_value) so the
+     * "unset" signal survives into postconfig's resolve step.
+     */
+    {
+        ngx_flag_t  inherit_selector;
+
+        /* staging starts NGX_CONF_UNSET (create_srv_conf); ca starts NULL. */
+        inherit_selector = (conf->ca_conf.ca.data == NULL
+                            && conf->ca_conf.staging == NGX_CONF_UNSET);
+
+        if (inherit_selector) {
+            conf->ca_conf.ca = prev->ca_conf.ca;
+            conf->ca_conf.staging = prev->ca_conf.staging;
+        }
+        ngx_conf_init_value(conf->ca_conf.staging, 0);
+
+        if (inherit_selector) {
+            if (conf->ca_conf.ca_certificate.data == NULL) {
+                conf->ca_conf.ca_certificate = prev->ca_conf.ca_certificate;
+            }
+            if (conf->ca_conf.eab_kid.data == NULL) {
+                conf->ca_conf.eab_kid = prev->ca_conf.eab_kid;
+            }
+            if (conf->ca_conf.eab_hmac_key.data == NULL) {
+                conf->ca_conf.eab_hmac_key = prev->ca_conf.eab_hmac_key;
+            }
+        }
+    }
+
     return NGX_CONF_OK;
 }
 
 
 /*
- * M2: the CA a given server issues against. In M1/M2 the CA directives are
- * http{}-global, so every server resolves to the one global ca_conf. M4
- * (SRV-scope directives + merge) returns the per-server merged ca_conf here
- * instead — that's the single seam that turns one CA group into many.
+ * M4: default + validate one server's effective CA config, in place. Mirrors
+ * the logic that lived in init_main_conf when the CA knobs were http{}-global:
+ * staging<->ca mutual exclusion, default/staging CA URL, ca_certificate made
+ * absolute (the worker-0 driver loads it with a plain OpenSSL call from an
+ * undefined CWD), and EAB key-id<->HMAC both-or-neither. Run per distinct
+ * effective server ca_conf in postconfig, before grouping names by CA URL.
+ */
+static ngx_int_t
+ngx_http_autocert_resolve_ca_conf(ngx_conf_t *cf, ngx_autocert_ca_conf_t *cac)
+{
+    if (cac->staging) {
+        if (cac->ca.data != NULL) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "\"autocert_staging\" and \"autocert_ca\" are mutually "
+                "exclusive");
+            return NGX_ERROR;
+        }
+        ngx_str_set(&cac->ca, NGX_HTTP_AUTOCERT_STAGING_CA);
+
+    } else if (cac->ca.data == NULL) {
+        ngx_str_set(&cac->ca, NGX_HTTP_AUTOCERT_DEFAULT_CA);
+    }
+
+    if (cac->ca_certificate.len != 0
+        && ngx_conf_full_name(cf->cycle, &cac->ca_certificate, 1) != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
+
+    /* EAB: a key-id without an HMAC key (or vice versa) is meaningless and
+     * would silently fall back to an unbound newAccount the CA rejects, so
+     * fail config rather than surprise the operator at registration time.
+     * Presence is "directive given" (data != NULL after str_slot); an explicit
+     * empty value ("") is given-but-useless and must also fail. */
+    if ((cac->eab_kid.data != NULL) != (cac->eab_hmac_key.data != NULL)
+        || (cac->eab_kid.data != NULL
+            && (cac->eab_kid.len == 0 || cac->eab_hmac_key.len == 0)))
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "\"autocert_eab_kid\" and \"autocert_eab_hmac_key\" must both be "
+            "set (non-empty) or both absent");
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+
+/*
+ * M4: the CA a given server issues against — its own merged ca_conf. Each
+ * server's ca_conf was folded from the http{} default in merge_srv_conf and
+ * resolved (defaulted + validated) by the caller before this is used to key the
+ * ca_list group. This is the single seam that turns one CA group into many:
+ * servers with distinct effective CA URLs now land in distinct ca_list entries.
  */
 static ngx_autocert_ca_conf_t *
 ngx_http_autocert_effective_ca(ngx_http_autocert_main_conf_t *amcf,
     ngx_http_autocert_srv_conf_t *ascf)
 {
-    (void) ascf;
-    return &amcf->ca_conf;
+    (void) amcf;
+    return &ascf->ca_conf;
 }
 
 
@@ -531,11 +603,41 @@ ngx_http_autocert_ca_entry(ngx_conf_t *cf,
 
     e = amcf->ca_list->elts;
     for (i = 0; i < amcf->ca_list->nelts; i++) {
-        if (e[i].ca_conf.ca.len == cac->ca.len
-            && ngx_strncmp(e[i].ca_conf.ca.data, cac->ca.data, cac->ca.len) == 0)
+        if (e[i].ca_conf.ca.len != cac->ca.len
+            || ngx_strncmp(e[i].ca_conf.ca.data, cac->ca.data, cac->ca.len) != 0)
         {
-            return &e[i];
+            continue;
         }
+
+        /*
+         * Same CA URL => same ACME account (account dir is keyed on the URL
+         * hash). The CA-bound ancillary knobs must therefore agree too: the
+         * group resolves to ONE trust bundle + ONE EAB credential, and grouping
+         * keys only on the URL, so two vhosts that name the same CA URL with a
+         * different ca_certificate or different EAB would silently collapse and
+         * the second config would be ignored (Codex M4 #3). Reject instead.
+         */
+        if (e[i].ca_conf.ca_certificate.len != cac->ca_certificate.len
+            || ngx_strncmp(e[i].ca_conf.ca_certificate.data,
+                           cac->ca_certificate.data,
+                           cac->ca_certificate.len) != 0
+            || e[i].ca_conf.eab_kid.len != cac->eab_kid.len
+            || ngx_strncmp(e[i].ca_conf.eab_kid.data, cac->eab_kid.data,
+                           cac->eab_kid.len) != 0
+            || e[i].ca_conf.eab_hmac_key.len != cac->eab_hmac_key.len
+            || ngx_strncmp(e[i].ca_conf.eab_hmac_key.data,
+                           cac->eab_hmac_key.data,
+                           cac->eab_hmac_key.len) != 0)
+        {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "autocert: CA \"%V\" is configured with conflicting "
+                "\"autocert_ca_certificate\" / \"autocert_eab_*\" across "
+                "servers; one CA URL must use one trust bundle and one EAB "
+                "credential", &cac->ca);
+            return NULL;
+        }
+
+        return &e[i];
     }
 
     e = ngx_array_push(amcf->ca_list);
@@ -617,6 +719,31 @@ ngx_http_autocert_postconfig(ngx_conf_t *cf)
         return NGX_ERROR;
     }
 
+    /*
+     * M4 (Codex #5): validate the http{}-level CA default even when no enabled
+     * server reaches resolve_ca_conf() below. Before M4 the CA knobs were
+     * http{}-global and init_main_conf validated them unconditionally; now the
+     * per-server resolve is the only validation, so `http { autocert_staging on;
+     * autocert_ca ...; }` with no `autocert on` anywhere would slip through.
+     * Resolve a COPY of the main-level srv default (merge has already run, so
+     * mutating the real one would be harmless, but a copy avoids a needless
+     * second ca_certificate abspath pass on a value a server may also resolve).
+     */
+    {
+        ngx_http_autocert_srv_conf_t  *amain;
+        ngx_autocert_ca_conf_t         dflt;
+
+        amain = ngx_http_conf_get_module_srv_conf(cf, ngx_http_autocert_module);
+        dflt = amain->ca_conf;
+        /* main-level srv_conf is never a merge child, so staging is still
+         * NGX_CONF_UNSET (truthy!) when the directive was absent — default it
+         * before resolve, exactly as merge_srv_conf does for real servers. */
+        ngx_conf_init_value(dflt.staging, 0);
+        if (ngx_http_autocert_resolve_ca_conf(cf, &dflt) != NGX_OK) {
+            return NGX_ERROR;
+        }
+    }
+
     cscfp = cmcf->servers.elts;
 
     for (s = 0; s < cmcf->servers.nelts; s++) {
@@ -639,11 +766,18 @@ ngx_http_autocert_postconfig(ngx_conf_t *cf)
             amcf->email = ascf->email;
         }
 
-        /* M2: this server's effective CA (M1/M2: the global one). The ca_list
-         * entry is created LAZILY below, only when a globally-new name actually
-         * joins it, so a skip-only / duplicate-only server never makes an empty
-         * CA group (the invariant M5 relies on). */
+        /* M4: this server's effective (merged) CA config, resolved + validated
+         * in place — defaults the CA URL, applies staging<->ca exclusion, makes
+         * ca_certificate absolute, enforces EAB both-or-neither. Must run before
+         * the ca_list lookup, which keys on the resolved cac->ca URL. The
+         * ca_list entry itself is created LAZILY below, only when a globally-new
+         * name actually joins it, so a skip-only / duplicate-only server never
+         * makes an empty CA group (the invariant M5 relies on). */
         cac = ngx_http_autocert_effective_ca(amcf, ascf);
+
+        if (ngx_http_autocert_resolve_ca_conf(cf, cac) != NGX_OK) {
+            return NGX_ERROR;
+        }
 
         sn = cscf->server_names.elts;
 
