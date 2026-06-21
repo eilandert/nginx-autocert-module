@@ -89,6 +89,16 @@ ngx_int_t ngx_http_autocert_jwk_thumbprint(ngx_pool_t *pool, EVP_PKEY *pkey,
 
 
 /*
+ * DNS-01 TXT record value (RFC 8555 §8.4): base64url(SHA-256(keyauth)), where
+ * keyauth is the ACME key authorization (token "." base64url(JWK thumbprint)).
+ * This is the string published as the _acme-challenge.<domain> TXT record.
+ * *out is pool-allocated. Returns NGX_OK / NGX_ERROR.
+ */
+ngx_int_t ngx_http_autocert_dns01_txt(ngx_pool_t *pool, ngx_str_t *keyauth,
+    ngx_str_t *out);
+
+
+/*
  * HMAC-SHA256 over `msg` with raw key `key`, emitting the 32-byte MAC into
  * *out (pool-allocated). Used to build the EAB (External Account Binding) outer
  * JWS signature (RFC 8555 §7.3.4 / RFC 7515 §3.5, "HS256"). Returns NGX_OK /

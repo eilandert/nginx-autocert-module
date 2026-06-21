@@ -472,6 +472,24 @@ ngx_http_autocert_jwk_thumbprint(ngx_pool_t *pool, EVP_PKEY *pkey,
 
 
 ngx_int_t
+ngx_http_autocert_dns01_txt(ngx_pool_t *pool, ngx_str_t *keyauth,
+    ngx_str_t *out)
+{
+    ngx_str_t  digest;
+    u_char     md[SHA256_DIGEST_LENGTH];
+
+    if (SHA256(keyauth->data, keyauth->len, md) == NULL) {
+        return NGX_ERROR;
+    }
+
+    digest.data = md;
+    digest.len = SHA256_DIGEST_LENGTH;
+
+    return ngx_http_autocert_base64url_encode(pool, &digest, out);
+}
+
+
+ngx_int_t
 ngx_http_autocert_hmac_sha256(ngx_pool_t *pool, ngx_str_t *key, ngx_str_t *msg,
     ngx_str_t *out)
 {
