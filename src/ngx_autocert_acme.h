@@ -107,6 +107,15 @@ struct ngx_autocert_acme_request_s {
     off_t                         content_length;  /* -1 if unknown */
     size_t                        body_offset;     /* start of body in recv */
 
+    /* Incremental chunked-decode validation cursor (avoids re-walking the whole
+     * accumulated body on every read — that would be O(N^2)). dechunk_pos is the
+     * offset into recv (from b->start) up to which framing is already validated;
+     * dechunk_total is the decoded byte count accumulated so far. Both advance
+     * only over fully-received chunks, so a partial tail is re-examined next
+     * read but already-validated chunks are not. */
+    size_t                        dechunk_pos;
+    size_t                        dechunk_total;
+
     /* Absolute deadline (ngx_current_msec scale) for the WHOLE response read.
      * The per-IO read timer resets on every NGX_AGAIN, so on its own it is an
      * inactivity timeout a byte-dripping peer can hold open up to the recv cap;
