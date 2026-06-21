@@ -54,6 +54,23 @@ typedef struct {
 } ngx_autocert_ca_conf_t;
 
 
+/*
+ * multi-CA M2: one entry per distinct CA the instance issues against. Built at
+ * postconfig by grouping enabled server_names by their effective CA. In the M1/M2
+ * world (directives still http{}-global) there is exactly ONE entry holding every
+ * name; M4 (SRV-scope) makes per-vhost CAs produce several. ca_hash is crc32 of
+ * the canonical CA URL as 8 lowercase hex + NUL, used by M3 for the per-CA
+ * account dir (<path>/accounts/<hash>/account.key). account_key_path is filled
+ * by M3; "" in M2.
+ */
+typedef struct {
+    ngx_autocert_ca_conf_t  ca_conf;          /* resolved CA config */
+    ngx_array_t            *names;             /* ngx_str_t under this CA */
+    u_char                  ca_hash[9];        /* crc32(ca url) hex8 + NUL */
+    ngx_str_t               account_key_path;  /* M3 fills; "" in M2 */
+} ngx_autocert_ca_entry_t;
+
+
 /* Per-server config: the on/off switch + optional contact (M0). */
 typedef struct {
     ngx_flag_t   enable;    /* autocert on|off; NGX_CONF_UNSET until set */
@@ -97,6 +114,11 @@ typedef struct {
 
     ngx_shm_zone_t  *shm_zone;      /* published enabled-name set (for M4) */
     ngx_array_t     *names;         /* ngx_str_t, collected at postconfig */
+
+    /* M2: enabled names grouped by CA. ngx_autocert_ca_entry_t array; one entry
+     * until M4 introduces per-vhost CAs. The flat `names` above stays the serve
+     * gate; ca_list is what the driver (M5) iterates to order per CA. */
+    ngx_array_t     *ca_list;       /* ngx_autocert_ca_entry_t */
 
     /* M5 HTTP-01 challenge token store (token -> keyauth), written by the
      * helper, read by the :80 worker handler. */

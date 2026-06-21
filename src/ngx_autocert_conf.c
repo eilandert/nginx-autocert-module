@@ -98,6 +98,7 @@ ngx_autocert_get_conf(ngx_cycle_t *cycle, ngx_autocert_conf_t *out)
     out->challenge = amcf->challenge;
     out->challenge_zone = amcf->challenge_zone;
     out->names = amcf->names;
+    out->ca_list = amcf->ca_list;
     out->test_token = amcf->test_token;
     out->test_keyauth = amcf->test_keyauth;
     out->alpn_zone = amcf->alpn_zone;

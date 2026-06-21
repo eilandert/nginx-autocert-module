@@ -41,6 +41,9 @@ typedef struct {
      * iteration is later (M6+). Points into the HTTP main-conf pool, which
      * outlives the helper run. */
     ngx_array_t     *names;
+    /* M2: names grouped by CA (ngx_autocert_ca_entry_t array). One entry until
+     * M4 adds per-vhost CAs; the driver (M5) iterates this. NULL/empty = none. */
+    ngx_array_t     *ca_list;
     /* M5 test seed (token.len == 0 when unset). */
     ngx_str_t        test_token;
     ngx_str_t        test_keyauth;
