@@ -119,17 +119,20 @@ if ! grep -q 'ACME account registered, kid "https://pebble:14000/' "$PREFIX/logs
 fi
 echo "✓ account kid (Location header) captured"
 
-# The account key was generated + persisted with 0600 perms.
-if [ ! -s "$PREFIX/store/account.key" ]; then
-    echo "::error::account key was not persisted"
+# The account key was generated + persisted with 0600 perms. M3: per-CA path
+# <store>/accounts/<ca_hash>/account.key (exactly one CA here → one hash dir).
+acct_key=$(echo "$PREFIX"/store/accounts/*/account.key)
+if [ ! -s "$acct_key" ]; then
+    echo "::error::account key was not persisted under accounts/<ca_hash>/"
+    ls -R "$PREFIX/store" || true
     exit 1
 fi
-perms=$(stat -c '%a' "$PREFIX/store/account.key")
+perms=$(stat -c '%a' "$acct_key")
 if [ "$perms" != "600" ]; then
     echo "::error::account key perms are $perms, expected 600"
     exit 1
 fi
-echo "✓ account key persisted at 0600"
+echo "✓ account key persisted at 0600 ($acct_key)"
 
 # --- negative: without Pebble's CA, the self-signed cert must be REJECTED.
 # Proves TLS verification is actually enabled (not verify-none).

@@ -555,6 +555,30 @@ ngx_http_autocert_ca_entry(ngx_conf_t *cf,
     }
     e->ca_hash[8] = '\0';
 
+    /*
+     * M3: per-CA account key path = <path>/accounts/<ca_hash>/account.key.
+     * amcf->path is already absolute here (init_main_conf ran first). The driver
+     * mkdir's the dirs + migrates the old flat <path>/account.key at runtime.
+     */
+    {
+        u_char  *p;
+        size_t   len;
+
+        len = amcf->path.len + sizeof("/accounts/") - 1 + 8
+              + sizeof("/account.key") - 1;
+        p = ngx_pnalloc(cf->pool, len + 1);
+        if (p == NULL) {
+            return NULL;
+        }
+        e->account_key_path.data = p;
+        e->account_key_path.len = len;
+        p = ngx_cpymem(p, amcf->path.data, amcf->path.len);
+        p = ngx_cpymem(p, "/accounts/", sizeof("/accounts/") - 1);
+        p = ngx_cpymem(p, e->ca_hash, 8);
+        p = ngx_cpymem(p, "/account.key", sizeof("/account.key") - 1);
+        *p = '\0';
+    }
+
     return e;
 }
 
