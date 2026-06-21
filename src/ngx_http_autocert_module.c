@@ -193,6 +193,39 @@ static ngx_command_t  ngx_http_autocert_commands[] = {
       offsetof(ngx_http_autocert_main_conf_t, eab_hmac_key),
       NULL },
 
+    /* M16: dns-01 operator exec hooks (D3). Both required when
+     * autocert_challenge dns-01 (enforced in init_main_conf). Each is run
+     * fork+execve with argv {hook, _acme-challenge.<domain>, <txt>} to publish
+     * (add) / remove the TXT record. Paths must be absolute. http{}-global. */
+
+    { ngx_string("autocert_dns_hook_add"),
+      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_MAIN_CONF_OFFSET,
+      offsetof(ngx_http_autocert_main_conf_t, dns_hook_add),
+      NULL },
+
+    { ngx_string("autocert_dns_hook_remove"),
+      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_MAIN_CONF_OFFSET,
+      offsetof(ngx_http_autocert_main_conf_t, dns_hook_remove),
+      NULL },
+
+    { ngx_string("autocert_dns_propagation_delay"),
+      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_sec_slot,
+      NGX_HTTP_MAIN_CONF_OFFSET,
+      offsetof(ngx_http_autocert_main_conf_t, dns_propagation_delay),
+      NULL },
+
+    { ngx_string("autocert_dns_hook_timeout"),
+      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_sec_slot,
+      NGX_HTTP_MAIN_CONF_OFFSET,
+      offsetof(ngx_http_autocert_main_conf_t, dns_hook_timeout),
+      NULL },
+
 #if (NGX_AUTOCERT_TEST)
     /* TEST-ONLY: seed one token->keyauth into the challenge store at startup so
      * the HTTP-01 serve path can be tested before the order flow (M6) exists.
@@ -305,8 +338,9 @@ ngx_http_autocert_create_main_conf(ngx_conf_t *cf)
     /* resolver pointer + ca_certificate zeroed by pcalloc */
     amcf->resolver_timeout = NGX_CONF_UNSET;
 
-    /* dns_hook_add/remove zeroed by pcalloc; delay defaulted in init. */
+    /* dns_hook_add/remove zeroed by pcalloc; delay+timeout defaulted in init. */
     amcf->dns_propagation_delay = NGX_CONF_UNSET;
+    amcf->dns_hook_timeout = NGX_CONF_UNSET;
 
     return amcf;
 }
@@ -371,6 +405,7 @@ ngx_http_autocert_init_main_conf(ngx_conf_t *cf, void *conf)
 
     ngx_conf_init_value(amcf->resolver_timeout, 30);
     ngx_conf_init_value(amcf->dns_propagation_delay, 10);   /* M16 dns-01 */
+    ngx_conf_init_value(amcf->dns_hook_timeout, 30);        /* M16 hook exec */
 
     /* EAB: a key-id without an HMAC key (or vice versa) is meaningless and
      * would silently fall back to an unbound newAccount the CA rejects, so
@@ -384,6 +419,44 @@ ngx_http_autocert_init_main_conf(ngx_conf_t *cf, void *conf)
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
             "\"autocert_eab_kid\" and \"autocert_eab_hmac_key\" must both be "
             "set (non-empty) or both absent");
+        return NGX_CONF_ERROR;
+    }
+
+    /*
+     * M16 dns-01: the publish/remove hooks are exec'd by the driver. A hook
+     * path must be absolute — the driver's CWD is undefined, so a relative path
+     * would resolve unpredictably (mirrors the autocert_path reasoning above).
+     * Reject a given-but-empty value too.
+     */
+    if (amcf->dns_hook_add.data != NULL
+        && (amcf->dns_hook_add.len == 0 || amcf->dns_hook_add.data[0] != '/'))
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "\"autocert_dns_hook_add\" must be a non-empty absolute path");
+        return NGX_CONF_ERROR;
+    }
+    if (amcf->dns_hook_remove.data != NULL
+        && (amcf->dns_hook_remove.len == 0
+            || amcf->dns_hook_remove.data[0] != '/'))
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "\"autocert_dns_hook_remove\" must be a non-empty absolute path");
+        return NGX_CONF_ERROR;
+    }
+
+    /*
+     * When dns-01 is the active challenge, both hooks are mandatory: without
+     * them the driver computes a TXT value it cannot publish, so every order
+     * would stall at the propagation wait and then fail validation. Fail fast
+     * at config rather than at first issuance.
+     */
+    if (amcf->challenge == NGX_HTTP_AUTOCERT_CHALLENGE_DNS_01
+        && (amcf->dns_hook_add.data == NULL
+            || amcf->dns_hook_remove.data == NULL))
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "\"autocert_challenge dns-01\" requires both "
+            "\"autocert_dns_hook_add\" and \"autocert_dns_hook_remove\"");
         return NGX_CONF_ERROR;
     }
 

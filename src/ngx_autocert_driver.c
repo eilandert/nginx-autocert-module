@@ -765,6 +765,7 @@ ngx_autocert_start_order_for(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
     order->dns_hook_add = acf->dns_hook_add;            /* M16 dns-01 */
     order->dns_hook_remove = acf->dns_hook_remove;
     order->dns_propagation_delay = acf->dns_propagation_delay;
+    order->dns_hook_timeout = acf->dns_hook_timeout;
     order->key_type = acf->key_type;
     order->store = acf->store;
     order->store_path = acf->path;

@@ -16,6 +16,9 @@
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <time.h>
 #include <unistd.h>
 
 /*
@@ -79,6 +82,8 @@ static ngx_int_t ngx_autocert_order_swap_dirs(ngx_autocert_order_t *order,
     u_char *staging, u_char *dir);
 static ngx_int_t ngx_autocert_order_publish_alpn(ngx_autocert_order_t *order);
 static ngx_int_t ngx_autocert_order_publish_dns(ngx_autocert_order_t *order);
+static ngx_int_t ngx_autocert_order_dns_hook(ngx_autocert_order_t *order,
+    ngx_str_t *hook, ngx_uint_t is_add);
 static void ngx_autocert_order_dns_delay_timer(ngx_event_t *ev);
 static void ngx_autocert_order_unpublish(ngx_autocert_order_t *order);
 static void ngx_autocert_order_finish(ngx_autocert_order_t *order,
@@ -748,6 +753,267 @@ done:
 }
 
 
+/* Monotonic clock in ms, for the hook wait deadline (immune to wall-clock
+ * jumps and nanosleep oversleep). Returns 0 if the clock read fails. */
+static uint64_t
+ngx_autocert_dns_monotonic(void)
+{
+    struct timespec  ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return (uint64_t) ts.tv_sec * 1000 + (uint64_t) ts.tv_nsec / 1000000;
+}
+
+
+static ngx_msec_int_t
+ngx_autocert_dns_elapsed_ms(uint64_t start)
+{
+    return (ngx_msec_int_t) (ngx_autocert_dns_monotonic() - start);
+}
+
+
+/*
+ * M16 (D3): run a dns-01 operator hook (publish or remove the TXT record) by
+ * fork+execve, argv = { hook, "_acme-challenge.<name>", <txt>, NULL }.
+ *
+ * The hook inherits the worker's environment by design: operators routinely
+ * pass DNS-provider credentials to the hook via environment (certbot-manual
+ * convention), so sanitizing it would break the common case. The hook path is
+ * an absolute, config-validated path the operator controls, not attacker input.
+ *
+ * This blocks worker 0 for up to dns_hook_timeout seconds while the hook runs.
+ * Hooks are expected to be short (e.g. a curl to a DNS-provider API); the long
+ * propagation wait is handled asynchronously by the delay timer, NOT here. Only
+ * one order runs at a time, so the brief block is acceptable.
+ *
+ * Safety: never system()/popen() (no shell, no injection surface); the child
+ * closes every inherited descriptor above stderr (the worker's epoll/listen fds
+ * are not guaranteed FD_CLOEXEC) and _exit()s — never exit() — on execve
+ * failure so no nginx atexit/cleanup handler runs in the half-forked child. The
+ * domain and base64url TXT value are validated before they reach the child argv.
+ */
+static ngx_int_t
+ngx_autocert_order_dns_hook(ngx_autocert_order_t *order, ngx_str_t *hook,
+    ngx_uint_t is_add)
+{
+    pid_t             pid, w;
+    int               status;
+    ngx_int_t         rc;
+    ngx_str_t         name;      /* _acme-challenge.<base> */
+    ngx_str_t         base;      /* domain with any leading "*." stripped */
+    size_t            i;
+    u_char           *hook_cstr, *name_cstr, *txt_cstr;
+    char             *argv[4];
+    ngx_msec_t        timeout_ms;
+    uint64_t          start;
+    struct timespec   step;
+    sigset_t          set, oset;
+
+    extern char     **environ;
+
+    /* A dns-01 identifier may be a wildcard ("*.example.com", D4); the TXT is
+     * published at _acme-challenge.<base>, so strip a leading "*." for the name
+     * the hook must set. */
+    base = order->domain;
+    if (base.len >= 2 && base.data[0] == '*' && base.data[1] == '.') {
+        base.data += 2;
+        base.len -= 2;
+    }
+
+    if (ngx_autocert_order_domain_identifier_safe(&base) != NGX_OK) {
+        ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                      "autocert: dns-01 refusing to exec hook for unsafe "
+                      "domain \"%V\"", &order->domain);
+        return NGX_ERROR;
+    }
+
+    /* TXT value is base64url(SHA-256(...)) = exactly 43 unpadded chars; reject
+     * anything else before it becomes a child argv. */
+    if (is_add) {
+        if (order->dns_txt_value.len != 43) {
+            ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                          "autocert: dns-01 TXT value has bad length for \"%V\"",
+                          &order->domain);
+            return NGX_ERROR;
+        }
+        for (i = 0; i < order->dns_txt_value.len; i++) {
+            u_char  c = order->dns_txt_value.data[i];
+
+            if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+                  || (c >= '0' && c <= '9') || c == '-' || c == '_'))
+            {
+                ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                              "autocert: dns-01 TXT value not base64url for "
+                              "\"%V\"", &order->domain);
+                return NGX_ERROR;
+            }
+        }
+    }
+
+    /* Build "_acme-challenge.<base>" and NUL-terminated argv strings in the
+     * order pool (execve needs C strings; ngx_str_t are not NUL-terminated). */
+    name.len = sizeof("_acme-challenge.") - 1 + base.len;
+    name.data = ngx_pnalloc(order->pool, name.len + 1);
+    if (name.data == NULL) {
+        return NGX_ERROR;
+    }
+    ngx_memcpy(ngx_cpymem(name.data, "_acme-challenge.",
+                          sizeof("_acme-challenge.") - 1),
+               base.data, base.len);
+    name.data[name.len] = '\0';
+    name_cstr = name.data;
+
+    hook_cstr = ngx_pnalloc(order->pool, hook->len + 1);
+    if (hook_cstr == NULL) {
+        return NGX_ERROR;
+    }
+    ngx_memcpy(hook_cstr, hook->data, hook->len);
+    hook_cstr[hook->len] = '\0';
+
+    txt_cstr = ngx_pnalloc(order->pool, order->dns_txt_value.len + 1);
+    if (txt_cstr == NULL) {
+        return NGX_ERROR;
+    }
+    ngx_memcpy(txt_cstr, order->dns_txt_value.data, order->dns_txt_value.len);
+    txt_cstr[order->dns_txt_value.len] = '\0';
+
+    argv[0] = (char *) hook_cstr;
+    argv[1] = (char *) name_cstr;
+    argv[2] = (char *) txt_cstr;
+    argv[3] = NULL;
+
+    ngx_log_error(NGX_LOG_NOTICE, order->log, 0,
+                  "autocert: dns-01 exec %s hook \"%V\" for \"%V\"",
+                  is_add ? "add" : "remove", hook, &name);
+
+    /*
+     * Block SIGCHLD across the fork+wait. nginx installs a SIGCHLD handler
+     * (ngx_signal_handler -> ngx_process_get_status) that reaps ALL children
+     * with waitpid(-1); left unblocked it steals our child before this waitpid
+     * runs (ECHILD). With it blocked we reap the specific child ourselves; the
+     * (now superfluous) signal is delivered harmlessly on restore.
+     */
+    sigemptyset(&set);
+    sigaddset(&set, SIGCHLD);
+    if (sigprocmask(SIG_BLOCK, &set, &oset) != 0) {
+        ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
+                      "autocert: dns-01 sigprocmask() failed");
+        return NGX_ERROR;
+    }
+
+    rc = NGX_OK;
+
+    pid = fork();
+    if (pid < 0) {
+        ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
+                      "autocert: dns-01 fork() failed");
+        rc = NGX_ERROR;
+        goto unblock;
+    }
+
+    if (pid == 0) {
+        /* child */
+        long  maxfd, fd;
+
+        /* restore the inherited signal mask so the hook runs unblocked */
+        (void) sigprocmask(SIG_SETMASK, &oset, NULL);
+
+        /* Own process group so a timeout can kill the whole subtree (the hook
+         * plus any children it spawns), not just the direct process. */
+        (void) setpgid(0, 0);
+
+        maxfd = sysconf(_SC_OPEN_MAX);
+        if (maxfd < 0) {
+            maxfd = 1024;
+        }
+        for (fd = 3; fd < maxfd; fd++) {
+            (void) close((int) fd);
+        }
+
+        (void) execve((char *) hook_cstr, argv, environ);
+        _exit(127);     /* exec failed: _exit, never exit() */
+    }
+
+    /*
+     * Parent: bounded wait. A blocking waitpid() would pin the worker forever
+     * on a wedged hook, so poll with WNOHANG against a CLOCK_MONOTONIC deadline
+     * (immune to oversleep / EINTR drift) and a short pacing sleep. On timeout
+     * SIGKILL the child's whole process group, then reap with a BOUNDED grace
+     * loop — if even that does not collect it (child stuck in D state), give up
+     * and let nginx's SIGCHLD reaper harvest the zombie after the mask restore,
+     * rather than pin the worker on a blocking wait. Clamp the timeout the same
+     * way as the propagation delay.
+     */
+    if (order->dns_hook_timeout <= 0) {
+        timeout_ms = 0;
+    } else if (order->dns_hook_timeout > 3600) {
+        timeout_ms = (ngx_msec_t) 3600 * 1000;
+    } else {
+        timeout_ms = (ngx_msec_t) order->dns_hook_timeout * 1000;
+    }
+
+    step.tv_sec = 0;
+    step.tv_nsec = 20 * 1000 * 1000;    /* 20 ms */
+    start = ngx_autocert_dns_monotonic();
+
+    for ( ;; ) {
+        w = waitpid(pid, &status, WNOHANG);
+
+        if (w == pid) {
+            break;
+        }
+        if (w < 0) {
+            if (ngx_errno == EINTR) {
+                continue;
+            }
+            ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
+                          "autocert: dns-01 waitpid() failed");
+            rc = NGX_ERROR;
+            goto unblock;
+        }
+        /* w == 0: child still running */
+        if (ngx_autocert_dns_elapsed_ms(start) >= (ngx_msec_int_t) timeout_ms) {
+            ngx_int_t  grace;
+
+            ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                          "autocert: dns-01 hook \"%V\" timed out after %T s, "
+                          "killing", hook, order->dns_hook_timeout);
+            (void) kill(-pid, SIGKILL);
+
+            /* bounded grace reap (~1s) so a stuck child can't pin the worker */
+            for (grace = 0; grace < 50; grace++) {
+                w = waitpid(pid, &status, WNOHANG);
+                if (w == pid || (w < 0 && ngx_errno != EINTR)) {
+                    break;
+                }
+                (void) nanosleep(&step, NULL);
+            }
+            rc = NGX_ERROR;
+            goto unblock;
+        }
+        (void) nanosleep(&step, NULL);
+    }
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                      "autocert: dns-01 hook \"%V\" failed (%s %d) for \"%V\"",
+                      hook,
+                      WIFEXITED(status) ? "exit" : "signal",
+                      WIFEXITED(status) ? WEXITSTATUS(status)
+                                        : WTERMSIG(status),
+                      &name);
+        rc = NGX_ERROR;
+    }
+
+unblock:
+
+    (void) sigprocmask(SIG_SETMASK, &oset, NULL);
+    return rc;
+}
+
+
 /*
  * M16: publish the dns-01 challenge. The TXT record value is
  * base64url(SHA-256(keyauth)) (RFC 8555 §8.4), published at
@@ -771,13 +1037,24 @@ ngx_autocert_order_publish_dns(ngx_autocert_order_t *order)
         return NGX_ERROR;
     }
 
-    /* D3 will exec dns_hook_add here; D2 stub just records + logs. */
-    order->dns_set = 1;
-
     ngx_log_error(NGX_LOG_NOTICE, order->log, 0,
                   "autocert: dns-01 challenge for \"%V\": publish TXT "
                   "_acme-challenge.%V = \"%V\"",
                   &order->domain, &order->domain, &order->dns_txt_value);
+
+    /*
+     * D3: publish the TXT via the operator add-hook. Mark dns_set BEFORE the
+     * exec so a later unpublish always runs the remove-hook even if the add
+     * partially applied (a half-published record must still be cleaned up). An
+     * empty hook keeps the D2 stub behaviour (compute + log only) for the
+     * plumbing test; production dns-01 requires the hook (enforced at config).
+     */
+    order->dns_set = 1;
+    if (order->dns_hook_add.len != 0
+        && ngx_autocert_order_dns_hook(order, &order->dns_hook_add, 1) != NGX_OK)
+    {
+        return NGX_ERROR;
+    }
 
     /* Wait for DNS propagation before asking the CA to validate. Clamp the
      * seconds→ms conversion so a negative or absurd configured delay can't wrap
@@ -1919,10 +2196,14 @@ ngx_autocert_order_unpublish(ngx_autocert_order_t *order)
         order->alpn_set = 0;
     }
 
-    /* M16 dns-01: remove the published TXT (D3 execs dns_hook_remove here; D2
-     * stub just clears the flag). Cleanup failure is non-fatal — the record
-     * expires by TTL. */
+    /* M16 dns-01: remove the published TXT via the remove-hook. Cleanup failure
+     * is non-fatal — the record expires by TTL — so the result is ignored. An
+     * empty hook (plumbing/stub path) just clears the flag. */
     if (order->dns_set) {
+        if (order->dns_hook_remove.len != 0) {
+            (void) ngx_autocert_order_dns_hook(order, &order->dns_hook_remove,
+                                               0);
+        }
         order->dns_set = 0;
     }
 }

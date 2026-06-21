@@ -68,6 +68,7 @@ struct ngx_autocert_order_s {
     ngx_str_t                        dns_hook_add;     /* publish-TXT exec, "" */
     ngx_str_t                        dns_hook_remove;  /* remove-TXT exec, "" */
     time_t                           dns_propagation_delay;  /* seconds */
+    time_t                           dns_hook_timeout;  /* hook exec wait, secs */
 
     ngx_autocert_order_handler_pt    handler;
     void                            *data;
