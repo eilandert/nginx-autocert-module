@@ -4,6 +4,7 @@
  */
 
 #include "ngx_http_autocert_crypto.h"
+#include "ngx_autocert_shared.h"
 
 #include <limits.h>
 #include <errno.h>
@@ -1084,9 +1085,9 @@ ngx_http_autocert_cert_not_after(const char *path, time_t *out)
     time_t      t;
     ngx_int_t   rc;
 
-    /* O_NOFOLLOW: never traverse a symlink at the final path component, and
-     * capture errno from open() (BIO_new_file's errno is unreliable). */
-    fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    /* Pin every ancestor and the final leaf; O_NOFOLLOW on open(path) alone
+     * would still traverse a symlink in the store's parent chain. */
+    fd = ngx_autocert_open_file_path(path, O_RDONLY);
     if (fd == -1) {
         if (errno == ENOENT || errno == ENOTDIR) {
             return NGX_DECLINED;            /* no cert stored yet */

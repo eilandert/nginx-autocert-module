@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# Negative test for the pre-store certificate validation (order.c): the driver
-# must NOT persist a downloaded "certificate" whose leaf does not match the
-# order's private key, and must NOT report success (so renewal backoff is kept).
+# Negative test for pre-store certificate validation (order.c). Each CI matrix
+# case returns a leaf that must be refused before it can replace the store:
+# mismatched key, wrong DNS SAN, expired, or not-yet-valid.
 #
 # The mock CA returns, at /cert, a leaf signed over a DIFFERENT key than the one
 # in the order's CSR (simulating a buggy/malicious CA, or a corrupted response).
@@ -26,12 +26,19 @@ CA_HOST="mockca.example.com"
 CA_PORT=14081
 DNS_NAME="ac-val-dns-$$"
 DNS_PORT=15581
-NAME="validate.example.com"
+CERT_CASE="${CERT_CASE:-key-mismatch}"
+case "$CERT_CASE" in
+    key-mismatch|wrong-san|expired|future) ;;
+    *) echo "unknown CERT_CASE: $CERT_CASE"; exit 1 ;;
+esac
+NAME="validate-${CERT_CASE}.example.com"
 
 MOCK_PID=""
 cleanup() {
     "$SERVER_BIN" -p "$PREFIX" -c "$PREFIX/conf/nginx.conf" -s stop 2>/dev/null || true
-    [ -n "$MOCK_PID" ] && kill "$MOCK_PID" 2>/dev/null || true
+    if [ -n "$MOCK_PID" ]; then
+        kill "$MOCK_PID" 2>/dev/null || true
+    fi
     docker rm -f "$DNS_NAME" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -50,7 +57,7 @@ docker run -d --name "$DNS_NAME" \
     -k --address=/${CA_HOST}/127.0.0.1 >/dev/null
 
 cat > "$PREFIX/mockca.py" <<PYEOF
-import json, ssl, itertools, datetime
+import json, ssl, itertools, datetime, base64
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -62,26 +69,40 @@ CA_KEY = serialization.load_pem_private_key(
     open("${PREFIX}/ca-key.pem", "rb").read(), password=None)
 CA_CERT = x509.load_pem_x509_certificate(open("${PREFIX}/ca.pem", "rb").read())
 NAME = "${NAME}"
+CASE = "${CERT_CASE}"
 nonces = ("nonce-%d" % i for i in itertools.count())
-state = {"chal_done": False}
+state = {"chal_done": False, "cert": None}
 
-# A leaf signed over a FRESH random key (NOT the order's CSR key) — the driver
-# must reject it because X509_check_private_key(leaf, order_key) fails.
-def bad_leaf():
-    wrong = ec.generate_private_key(ec.SECP256R1())
+def b64url_dec(s):
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+def bad_leaf(csr_der):
+    csr = x509.load_der_x509_csr(csr_der)
     now = datetime.datetime.utcnow()
+    key = csr.public_key()
+    name = NAME
+    not_before = now - datetime.timedelta(minutes=1)
+    not_after = now + datetime.timedelta(days=2)
+    if CASE == "key-mismatch":
+        key = ec.generate_private_key(ec.SECP256R1()).public_key()
+    elif CASE == "wrong-san":
+        name = "wrong.example.com"
+    elif CASE == "expired":
+        not_before = now - datetime.timedelta(days=2)
+        not_after = now - datetime.timedelta(days=1)
+    elif CASE == "future":
+        not_before = now + datetime.timedelta(days=1)
+        not_after = now + datetime.timedelta(days=2)
     leaf = (x509.CertificateBuilder()
-            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, NAME)]))
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, name)]))
             .issuer_name(CA_CERT.subject)
-            .public_key(wrong.public_key())
+            .public_key(key)
             .serial_number(x509.random_serial_number())
-            .not_valid_before(now - datetime.timedelta(minutes=1))
-            .not_valid_after(now + datetime.timedelta(days=2))
-            .add_extension(x509.SubjectAlternativeName([x509.DNSName(NAME)]), False)
+            .not_valid_before(not_before)
+            .not_valid_after(not_after)
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName(name)]), False)
             .sign(CA_KEY, hashes.SHA256()))
     return leaf.public_bytes(serialization.Encoding.PEM)
-
-BADCERT = bad_leaf()
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
@@ -108,8 +129,7 @@ class H(BaseHTTPRequestHandler):
     do_HEAD = do_GET
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0) or 0)
-        if n:
-            self.rfile.read(n)
+        raw = self.rfile.read(n) if n else b""
         if self.path == "/nonce":
             self._send(204)
         elif self.path == "/acct":
@@ -129,11 +149,17 @@ class H(BaseHTTPRequestHandler):
         elif self.path == "/chal":
             state["chal_done"] = True
             self._send(200, json.dumps({"status": "valid"}).encode())
-        elif self.path in ("/finalize", "/order/1"):
+        elif self.path == "/finalize":
+            payload = json.loads(raw.decode())["payload"]
+            csr_der = b64url_dec(json.loads(b64url_dec(payload).decode())["csr"])
+            state["cert"] = bad_leaf(csr_der)
+            self._send(200, json.dumps({
+                "status": "valid", "certificate": BASE + "/cert"}).encode())
+        elif self.path == "/order/1":
             self._send(200, json.dumps({
                 "status": "valid", "certificate": BASE + "/cert"}).encode())
         elif self.path == "/cert":
-            self._send(200, BADCERT, ctype="application/pem-certificate-chain")
+            self._send(200, state["cert"], ctype="application/pem-certificate-chain")
         else:
             self._send(404, b'{"type":"urn:ietf:params:acme:error:malformed"}')
 
@@ -174,19 +200,19 @@ EOF
 "$SERVER_BIN" -p "$PREFIX" -c "$PREFIX/conf/nginx.conf"
 
 LOG="$PREFIX/logs/error.log"
-echo "== waiting for the validation rejection =="
+echo "== waiting for the ${CERT_CASE} validation rejection =="
 for i in $(seq 1 60); do
     if grep -q "is not usable" "$LOG"; then
         break
     fi
     if grep -q "certificate issued and stored for \"${NAME}\"" "$LOG"; then
-        echo "::error::a key-mismatched cert was STORED — validation did not fire"
+        echo "::error::an invalid cert was STORED — validation did not fire"
         exit 1
     fi
     sleep 0.5
     [ "$i" = 60 ] && { echo "::error::no validation rejection logged"; grep autocert "$LOG" | tail -20; exit 1; }
 done
-echo "✓ key-mismatched cert rejected ('is not usable' logged)"
+echo "✓ ${CERT_CASE} cert rejected ('is not usable' logged)"
 
 # Must not have been stored.
 if [ -e "$PREFIX/store/${NAME}/fullchain.pem" ]; then

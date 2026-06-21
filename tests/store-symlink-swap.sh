@@ -188,7 +188,8 @@ for i in $(seq 1 30); do
 done
 
 run_server() {
-    # $1 = store mode ("secure" or "certbot")
+    # $1 = store mode ("secure" or "certbot"); $2 = store path.
+    local store_path="${2:-$PREFIX/store}"
     cat > "$PREFIX/conf/nginx.conf" <<EOF
 load_module $HTTP_SO;
 user root;
@@ -200,7 +201,7 @@ http {
     autocert_resolver 127.0.0.1:${DNS_PORT};
     autocert_resolver_timeout 5s;
     autocert_ca_certificate $PREFIX/ca.pem;
-    autocert_path $PREFIX/store;
+    autocert_path $store_path;
     autocert_store $1;
     server { listen 80; server_name ${NAME}; }
 }
@@ -287,5 +288,38 @@ if [ -n "$(ls -A "$PREFIX/escape" 2>/dev/null)" ]; then
     exit 1
 fi
 echo "✓ certbot: escape dir is empty — no write escaped the store"
+"$SERVER_BIN" -p "$PREFIX" -c "$PREFIX/conf/nginx.conf" -s stop 2>/dev/null || true
+sleep 1
 
-echo "✓✓ store symlink-swap (TOCTOU) hardening verified"
+#
+# (3) ancestor component: <prefix>/parent is a symlink. This must be rejected
+# before the driver creates .driver.lock, accounts/, or any certificate path;
+# O_NOFOLLOW on only the final <store> component would otherwise follow it.
+#
+echo "== ancestor component: <prefix>/parent -> escape =="
+rm -rf "$PREFIX/store" "$PREFIX/escape" "$PREFIX/parent"
+mkdir -p "$PREFIX/escape"
+ln -s "$PREFIX/escape" "$PREFIX/parent"
+rm -f "$PREFIX/logs/error.log"
+run_server secure "$PREFIX/parent/store"
+
+for i in $(seq 1 30); do
+    if grep -q 'cannot open/create store dir' "$PREFIX/logs/error.log"; then
+        break
+    fi
+    sleep 0.2
+    [ "$i" = 30 ] && {
+        echo "::error::ancestor symlink was not refused by the driver"
+        grep autocert "$PREFIX/logs/error.log" | tail -20
+        exit 1
+    }
+done
+
+if [ -n "$(ls -A "$PREFIX/escape" 2>/dev/null)" ]; then
+    echo "::error::ancestor symlink redirected lock/account/certificate writes:"
+    ls -la "$PREFIX/escape"
+    exit 1
+fi
+echo "✓ ancestor symlink refused before any store write escaped"
+
+echo "✓✓ store symlink-swap (all path components) hardening verified"

@@ -55,7 +55,8 @@ streq(ngx_str_t *s, const char *lit)
 /* ---- parse_url ---- */
 
 static void
-url_ok(const char *url, const char *host, int port, const char *uri)
+url_ok(const char *url, const char *host, int port, const char *uri,
+    ngx_uint_t ipv6)
 {
     ngx_autocert_acme_request_t  r;
     char  msg[160];
@@ -69,7 +70,8 @@ url_ok(const char *url, const char *host, int port, const char *uri)
         CHECK(0, msg);
         return;
     }
-    CHECK(streq(&r.host, host) && r.port == port && streq(&r.uri, uri), msg);
+    CHECK(streq(&r.host, host) && r.port == port && streq(&r.uri, uri)
+          && r.host_is_ipv6 == ipv6, msg);
     ngx_http_fuzz_pool_reset(&pool);
 }
 
@@ -105,16 +107,16 @@ static void
 test_parse_url(void)
 {
     /* scheme / host / port / uri split */
-    url_ok("https://acme.example.com/dir", "acme.example.com", 443, "/dir");
-    url_ok("https://acme.example.com", "acme.example.com", 443, "/");
-    url_ok("https://acme.example.com:8443/x", "acme.example.com", 8443, "/x");
-    url_ok("https://acme.example.com:443/", "acme.example.com", 443, "/");
-    url_ok("https://[2001:db8::1]/p", "2001:db8::1", 443, "/p");
-    url_ok("https://[2001:db8::1]:8443/p", "2001:db8::1", 8443, "/p");
-    url_ok("https://h/a/b?c=d&e=f", "h", 443, "/a/b?c=d&e=f");
+    url_ok("https://acme.example.com/dir", "acme.example.com", 443, "/dir", 0);
+    url_ok("https://acme.example.com", "acme.example.com", 443, "/", 0);
+    url_ok("https://acme.example.com:8443/x", "acme.example.com", 8443, "/x", 0);
+    url_ok("https://acme.example.com:443/", "acme.example.com", 443, "/", 0);
+    url_ok("https://[2001:db8::1]/p", "2001:db8::1", 443, "/p", 1);
+    url_ok("https://[2001:db8::1]:8443/p", "2001:db8::1", 8443, "/p", 1);
+    url_ok("https://h/a/b?c=d&e=f", "h", 443, "/a/b?c=d&e=f", 0);
 
     /* scheme is case-insensitive */
-    url_ok("HTTPS://h/x", "h", 443, "/x");
+    url_ok("HTTPS://h/x", "h", 443, "/x", 0);
 
     /* missing / wrong scheme */
     url_bad("http://acme.example.com/dir");   /* TLS-only: http rejected */

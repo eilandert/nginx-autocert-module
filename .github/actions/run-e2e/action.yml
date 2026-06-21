@@ -20,6 +20,9 @@ inputs:
   sudo:
     description: Run the script under sudo (needed when it binds :80). "true"/"false".
     default: "false"
+  cert_case:
+    description: Optional cert-validate-reject.sh fixture case.
+    default: key-mismatch
 
 runs:
   using: composite
@@ -62,7 +65,9 @@ runs:
         chmod +x "$BIN"
         script="$GITHUB_WORKSPACE/tests/${{ inputs.script }}"
         if [ "${{ inputs.sudo }}" = "true" ]; then
-          sudo env SERVER_BIN="$BIN" NGX_BUILD_DIR="$NGX" bash "$script"
+          sudo env SERVER_BIN="$BIN" NGX_BUILD_DIR="$NGX" \
+            CERT_CASE="${{ inputs.cert_case }}" bash "$script"
         else
-          SERVER_BIN="$BIN" NGX_BUILD_DIR="$NGX" bash "$script"
+          SERVER_BIN="$BIN" NGX_BUILD_DIR="$NGX" \
+            CERT_CASE="${{ inputs.cert_case }}" bash "$script"
         fi

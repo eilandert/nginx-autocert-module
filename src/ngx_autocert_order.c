@@ -48,7 +48,7 @@
 
 /*
  * TOCTOU hardening: every store mutation is performed through a directory fd
- * pinned with O_DIRECTORY|O_NOFOLLOW (ngx_autocert_open_dir) and *at() syscalls
+ * pinned with O_DIRECTORY|O_NOFOLLOW (ngx_autocert_open_dir_path) and *at() syscalls
  * relative to it. Pinning the container inode means an attacker who can swap a
  * path *component* (e.g. replace <store>/live with a symlink between two path
  * lookups) cannot redirect a subsequent mkdir/rename/open: the kernel resolves
@@ -58,16 +58,6 @@
 
 /* ngx_autocert_renameat2() is shared via ngx_autocert_shared.h — the same
  * fd-pinned rename primitive used by the account-key migration in driver.c. */
-
-
-/* Open a directory by path with O_DIRECTORY|O_NOFOLLOW so the final component is
- * never a followed symlink and the result is guaranteed to be a directory inode.
- * Returns the fd, or -1 (errno set: ELOOP=symlink, ENOTDIR=file, ENOENT=absent). */
-static int
-ngx_autocert_open_dir(const char *path)
-{
-    return open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-}
 
 
 /* Authorization poll: up to ~180 tries, 1s apart. Pebble validates fast, but
@@ -1692,6 +1682,26 @@ ngx_autocert_order_validate_cert(ngx_autocert_order_t *order)
         goto done;
     }
 
+    /* A matching key alone is not sufficient: a trusted-but-buggy CA could
+     * sign the CSR key into another DNS name, or return an unusable validity
+     * window. Reject it before it can replace the last known-good certificate. */
+    if (X509_check_host(leaf, (char *) order->domain.data, order->domain.len,
+                        0, NULL) != 1)
+    {
+        ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                      "autocert: downloaded leaf does not cover \"%V\"",
+                      &order->domain);
+        goto done;
+    }
+    if (X509_cmp_current_time(X509_get0_notBefore(leaf)) > 0
+        || X509_cmp_current_time(X509_get0_notAfter(leaf)) < 0)
+    {
+        ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                      "autocert: downloaded leaf for \"%V\" is not currently valid",
+                      &order->domain);
+        goto done;
+    }
+
     rc = NGX_OK;
 
 done:
@@ -2001,7 +2011,7 @@ ngx_autocert_order_store(ngx_autocert_order_t *order)
         p = ngx_cpymem(base, order->store_path.data, order->store_path.len);
         *p = '\0';
 
-        bfd = ngx_autocert_open_dir((char *) base);
+        bfd = ngx_autocert_open_dir_path((char *) base, 0, 0);
         if (bfd == -1) {
             ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
                           "autocert: open store dir \"%V\" failed",
@@ -2024,7 +2034,7 @@ ngx_autocert_order_store(ngx_autocert_order_t *order)
         }
 
     } else {
-        cfd = ngx_autocert_open_dir((char *) cdir);
+        cfd = ngx_autocert_open_dir_path((char *) cdir, 0, 0);
         if (cfd == -1) {
             ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
                           "autocert: open store dir \"%s\" failed", cdir);
