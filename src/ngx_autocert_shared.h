@@ -18,6 +18,7 @@
 typedef struct {
     ngx_uint_t       configured;     /* 0 => autocert not present in http{} */
     ngx_str_t        ca;             /* ACME directory URL */
+    ngx_str_t        email;          /* account contact email, "" if none */
     ngx_resolver_t  *resolver;       /* may be NULL if autocert_resolver unset */
     time_t           resolver_timeout;
     ngx_str_t        ca_certificate; /* PEM trust bundle path, "" => system */

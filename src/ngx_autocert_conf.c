@@ -81,6 +81,7 @@ ngx_autocert_get_conf(ngx_cycle_t *cycle, ngx_autocert_conf_t *out)
                    amcf->challenge,
                    amcf->names ? amcf->names->nelts : (ngx_uint_t) 0);
     out->ca = amcf->ca;
+    out->email = amcf->email;
     out->resolver = amcf->resolver;
     out->resolver_timeout = amcf->resolver_timeout;
     out->ca_certificate = amcf->ca_certificate;

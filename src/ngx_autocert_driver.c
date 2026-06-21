@@ -232,6 +232,7 @@ ngx_autocert_kick_handler(ngx_event_t *ev)
     acct->log = cycle->log;
     acct->directory_url = acf.ca;
     acct->key_type = acf.key_type;
+    acct->email = acf.email;
     acct->eab_kid = acf.eab_kid;
     acct->eab_hmac_key = acf.eab_hmac_key;
     acct->handler = ngx_autocert_account_done;
