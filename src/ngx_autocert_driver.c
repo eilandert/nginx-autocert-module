@@ -1458,6 +1458,75 @@ ngx_autocert_driver_init_process(ngx_cycle_t *cycle)
 
 
 /*
+ * Shared teardown primitives, used by BOTH exit_process and the
+ * master_process-off reload path so the two can never drift (a field freed in
+ * one but not the other would be a latent leak on whichever path was missed).
+ */
+
+/* Cancel every driver timer bound to the (old) cycle. */
+static void
+ngx_autocert_driver_cancel_timers(void)
+{
+    if (ngx_autocert_kick_timer.timer_set) {
+        ngx_del_timer(&ngx_autocert_kick_timer);
+    }
+    if (ngx_autocert_sched_timer.timer_set) {
+        ngx_del_timer(&ngx_autocert_sched_timer);
+    }
+    if (ngx_autocert_relock_timer.timer_set) {
+        ngx_del_timer(&ngx_autocert_relock_timer);
+    }
+}
+
+/* Free the in-flight order and its (cycle-independent) pool. */
+static void
+ngx_autocert_driver_drop_order(void)
+{
+    if (ngx_autocert_order != NULL) {
+        ngx_autocert_order_free(ngx_autocert_order);
+        ngx_autocert_order = NULL;
+    }
+    if (ngx_autocert_order_pool != NULL) {
+        ngx_destroy_pool(ngx_autocert_order_pool);
+        ngx_autocert_order_pool = NULL;
+    }
+}
+
+/* Tear down every per-CA engine (account + bootstrap pool + client). The
+ * ca_states array itself lives in the cycle pool (freed by nginx), so just drop
+ * the pointer after releasing each engine's owned resources. */
+static void
+ngx_autocert_driver_drop_ca_states(void)
+{
+    ngx_uint_t  i;
+
+    if (ngx_autocert_ca_states == NULL) {
+        return;
+    }
+
+    for (i = 0; i < ngx_autocert_ca_states_n; i++) {
+        ngx_autocert_ca_state_t  *state = &ngx_autocert_ca_states[i];
+
+        if (state->account != NULL) {
+            ngx_autocert_account_free(state->account);
+            state->account = NULL;
+        }
+        if (state->account_pool != NULL) {
+            ngx_destroy_pool(state->account_pool);
+            state->account_pool = NULL;
+        }
+        if (state->client_ready) {
+            ngx_autocert_acme_client_destroy(&state->client);
+            state->client_ready = 0;
+        }
+    }
+
+    ngx_autocert_ca_states = NULL;
+    ngx_autocert_ca_states_n = 0;
+}
+
+
+/*
  * Worker-0 teardown on exit_process. Best-effort: free the in-flight order, the
  * live account (account key + bootstrap pool), and the outbound client. The
  * kernel would reclaim everything on exit anyway, but freeing explicitly keeps
@@ -1468,49 +1537,9 @@ ngx_autocert_driver_exit_process(ngx_cycle_t *cycle)
 {
     (void) cycle;
 
-    if (ngx_autocert_kick_timer.timer_set) {
-        ngx_del_timer(&ngx_autocert_kick_timer);
-    }
-    if (ngx_autocert_sched_timer.timer_set) {
-        ngx_del_timer(&ngx_autocert_sched_timer);
-    }
-    if (ngx_autocert_relock_timer.timer_set) {
-        ngx_del_timer(&ngx_autocert_relock_timer);
-    }
-
-    if (ngx_autocert_order != NULL) {
-        ngx_autocert_order_free(ngx_autocert_order);
-        ngx_autocert_order = NULL;
-    }
-    if (ngx_autocert_order_pool != NULL) {
-        ngx_destroy_pool(ngx_autocert_order_pool);
-        ngx_autocert_order_pool = NULL;
-    }
-
-    /* M5: tear down every per-CA engine (account + bootstrap pool + client). */
-    if (ngx_autocert_ca_states != NULL) {
-        ngx_uint_t  i;
-
-        for (i = 0; i < ngx_autocert_ca_states_n; i++) {
-            ngx_autocert_ca_state_t  *state = &ngx_autocert_ca_states[i];
-
-            if (state->account != NULL) {
-                ngx_autocert_account_free(state->account);
-                state->account = NULL;
-            }
-            if (state->account_pool != NULL) {
-                ngx_destroy_pool(state->account_pool);
-                state->account_pool = NULL;
-            }
-            if (state->client_ready) {
-                ngx_autocert_acme_client_destroy(&state->client);
-                state->client_ready = 0;
-            }
-        }
-        /* ca_states itself is in the cycle pool; nginx frees it. */
-        ngx_autocert_ca_states = NULL;
-        ngx_autocert_ca_states_n = 0;
-    }
+    ngx_autocert_driver_cancel_timers();
+    ngx_autocert_driver_drop_order();
+    ngx_autocert_driver_drop_ca_states();
 
     /* Release the singleton lock (kernel drops it on close) so the next
      * generation's worker 0 can take over immediately. */
@@ -1543,15 +1572,7 @@ ngx_autocert_driver_reload(ngx_cycle_t *cycle)
 {
     /* Cancel every driver timer bound to the old cycle. The handlers carry the
      * old cycle in ev->data, so they must not fire after the cycle is gone. */
-    if (ngx_autocert_kick_timer.timer_set) {
-        ngx_del_timer(&ngx_autocert_kick_timer);
-    }
-    if (ngx_autocert_sched_timer.timer_set) {
-        ngx_del_timer(&ngx_autocert_sched_timer);
-    }
-    if (ngx_autocert_relock_timer.timer_set) {
-        ngx_del_timer(&ngx_autocert_relock_timer);
-    }
+    ngx_autocert_driver_cancel_timers();
 
     /* Detach any pending ACME resolver/socket event BEFORE freeing the pools its
      * request lives in: the process keeps running across this reload, so a live
@@ -1559,41 +1580,13 @@ ngx_autocert_driver_reload(ngx_cycle_t *cycle)
      * dead-cycle driver state we are about to drop). */
     ngx_autocert_acme_cancel_inflight();
 
-    /* Drop the in-flight order (its pool is independent of the cycle pool). */
-    if (ngx_autocert_order != NULL) {
-        ngx_autocert_order_free(ngx_autocert_order);
-        ngx_autocert_order = NULL;
-    }
-    if (ngx_autocert_order_pool != NULL) {
-        ngx_destroy_pool(ngx_autocert_order_pool);
-        ngx_autocert_order_pool = NULL;
-    }
-
-    /* Tear down every per-CA engine. ca_states itself was allocated from the OLD
-     * cycle pool (freed by ngx_clean_old_cycles once the old cycle retires), so
-     * just drop the pointer — the kick rebuilds it from the new cycle's ca_list. */
-    if (ngx_autocert_ca_states != NULL) {
-        ngx_uint_t  i;
-
-        for (i = 0; i < ngx_autocert_ca_states_n; i++) {
-            ngx_autocert_ca_state_t  *state = &ngx_autocert_ca_states[i];
-
-            if (state->account != NULL) {
-                ngx_autocert_account_free(state->account);
-                state->account = NULL;
-            }
-            if (state->account_pool != NULL) {
-                ngx_destroy_pool(state->account_pool);
-                state->account_pool = NULL;
-            }
-            if (state->client_ready) {
-                ngx_autocert_acme_client_destroy(&state->client);
-                state->client_ready = 0;
-            }
-        }
-        ngx_autocert_ca_states = NULL;
-        ngx_autocert_ca_states_n = 0;
-    }
+    /* Drop the in-flight order (pool is cycle-independent) and every per-CA
+     * engine. ca_states was allocated from the OLD cycle pool (freed by
+     * ngx_clean_old_cycles when the old cycle retires); the helper drops the
+     * pointer and the kick rebuilds it from the new cycle's ca_list. Same free
+     * set as exit_process — shared so the two paths cannot drift. */
+    ngx_autocert_driver_drop_order();
+    ngx_autocert_driver_drop_ca_states();
 
     /* Reset the scheduler cursor and the one-shot test-seed latches so the new
      * config is scanned and (re)seeded from scratch. */
