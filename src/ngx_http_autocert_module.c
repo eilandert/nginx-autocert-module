@@ -829,6 +829,43 @@ ngx_http_autocert_postconfig(ngx_conf_t *cf)
             }
 
             if (i < amcf->names->nelts) {
+                /*
+                 * The name is already claimed by an earlier vhost. There is ONE
+                 * stored certificate per name, so it must resolve to ONE CA. If
+                 * this vhost pins it to a DIFFERENT CA than the one that first
+                 * claimed it, that is an ambiguous config (which CA signs the
+                 * single cert?) — reject at parse rather than silently keeping
+                 * the first CA (Codex M5 LOW). Same CA = the harmless dup we skip.
+                 */
+                ngx_autocert_ca_entry_t  *owner = NULL;
+                ngx_uint_t                k, m;
+
+                ce = amcf->ca_list->elts;
+                for (k = 0; k < amcf->ca_list->nelts && owner == NULL; k++) {
+                    ngx_str_t  *gn = ce[k].names->elts;
+                    for (m = 0; m < ce[k].names->nelts; m++) {
+                        if (gn[m].len == name.len
+                            && ngx_strncmp(gn[m].data, name.data, name.len) == 0)
+                        {
+                            owner = &ce[k];
+                            break;
+                        }
+                    }
+                }
+
+                if (owner != NULL
+                    && (owner->ca_conf.ca.len != cac->ca.len
+                        || ngx_strncmp(owner->ca_conf.ca.data, cac->ca.data,
+                                       cac->ca.len) != 0))
+                {
+                    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                        "autocert: server name \"%V\" is claimed by two vhosts "
+                        "with different CAs (\"%V\" vs \"%V\"); one name issues "
+                        "one certificate from one CA — pin it to a single CA",
+                        &name, &owner->ca_conf.ca, &cac->ca);
+                    return NGX_ERROR;
+                }
+
                 continue;
             }
 
