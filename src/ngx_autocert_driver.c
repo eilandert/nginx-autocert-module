@@ -503,7 +503,9 @@ ngx_autocert_bootstrap_ca(ngx_cycle_t *cycle, ngx_uint_t ca_idx)
         acct->log = cycle->log;
         acct->directory_url = state->entry->ca_conf.ca;
         acct->key_type = acf.key_type;
-        acct->email = acf.email;
+        /* Per-CA contact: this CA group's own email, or the legacy first-overall
+         * email if the group set none. */
+        acct->email = state->entry->email.len ? state->entry->email : acf.email;
         acct->eab_kid = state->entry->ca_conf.eab_kid;
         acct->eab_hmac_key = state->entry->ca_conf.eab_hmac_key;
         acct->handler = ngx_autocert_account_done;

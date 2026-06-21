@@ -104,7 +104,9 @@ moment it is issued — and on every renewal — **without a reload**.
 
 `autocert` is valid in `http{}` (the instance default) and in `server{}`. The
 optional `email` is the ACME account contact. A `server{}` value overrides the
-`http{}` global.
+`http{}` global. With per-vhost CAs (see *Multiple CAs* below), the contact is
+per-CA: each CA's account uses the first email set by a vhost in that CA group,
+and configuring one CA with two different contacts is rejected at startup.
 
 ```nginx
 http {
