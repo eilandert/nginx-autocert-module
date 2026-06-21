@@ -795,6 +795,11 @@ ngx_autocert_order_publish_dns(ngx_autocert_order_t *order)
     order->dns_delay_timer.handler = ngx_autocert_order_dns_delay_timer;
     order->dns_delay_timer.data = order;
     order->dns_delay_timer.log = order->log;
+    /* cancelable: a pending ACME timer must not pin a gracefully-exiting worker
+     * 0 open (which would retain .driver.lock and block driver hand-off on
+     * reload). The in-flight order is abandoned on exit — ACME is idempotent, it
+     * re-orders next sweep. */
+    order->dns_delay_timer.cancelable = 1;
     ngx_add_timer(&order->dns_delay_timer, delay);
 
     return NGX_OK;
@@ -883,6 +888,10 @@ ngx_autocert_order_respond_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
     order->poll_timer.handler = ngx_autocert_order_poll_timer;
     order->poll_timer.data = order;
     order->poll_timer.log = order->log;
+    /* cancelable: never pin a gracefully-exiting worker 0 (driver-lock handoff
+     * on reload — see audit MED). The bare re-arm in the handler reuses this
+     * event, so the flag persists across re-arms. */
+    order->poll_timer.cancelable = 1;
     ngx_add_timer(&order->poll_timer, NGX_AUTOCERT_ORDER_POLL_DELAY);
     ngx_log_debug1(NGX_LOG_DEBUG_CORE, order->log, 0,
                    "autocert: authz poll armed in %M ms",
@@ -1116,6 +1125,7 @@ ngx_autocert_order_finalize_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
             order->order_timer.handler = ngx_autocert_order_poll_order_timer;
             order->order_timer.data = order;
             order->order_timer.log = order->log;
+            order->order_timer.cancelable = 1;   /* don't pin exiting worker 0 */
             ngx_add_timer(&order->order_timer, NGX_AUTOCERT_ORDER_FIN_DELAY);
             return;
         }
@@ -1134,6 +1144,7 @@ ngx_autocert_order_finalize_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
     order->order_timer.handler = ngx_autocert_order_poll_order_timer;
     order->order_timer.data = order;
     order->order_timer.log = order->log;
+    order->order_timer.cancelable = 1;   /* don't pin exiting worker 0 */
     ngx_add_timer(&order->order_timer, NGX_AUTOCERT_ORDER_FIN_DELAY);
     ngx_log_debug1(NGX_LOG_DEBUG_CORE, order->log, 0,
                    "autocert: order poll armed in %M ms",
