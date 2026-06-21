@@ -44,6 +44,21 @@ static void ngx_autocert_acme_finalize(ngx_autocert_acme_request_t *r,
     ngx_int_t rc);
 
 
+/*
+ * The single in-flight ACME request, if any. The driver runs exactly one ACME
+ * flow at a time (one order, sequential account bootstrap), so at most one
+ * request is ever pending — once ngx_autocert_acme_request() returns NGX_OK an
+ * async resolver/connect/read/write event is armed and owns *r, which lives in a
+ * pool the driver will destroy. On a `master_process off` reload the driver
+ * tears that pool down while the process keeps running, so a pending event would
+ * fire on freed memory. We track the pending request here so reload can cancel
+ * it (close its connection / stop its resolve) BEFORE the pool dies. Set on each
+ * NGX_OK (event-armed) return, cleared in finalize (the one completion choke
+ * point every request passes through exactly once).
+ */
+static ngx_autocert_acme_request_t  *ngx_autocert_acme_inflight;
+
+
 ngx_int_t
 ngx_autocert_acme_client_create(ngx_autocert_acme_client_t *client,
     ngx_cycle_t *cycle, ngx_str_t *trusted_cert, ngx_resolver_t *resolver,
@@ -125,6 +140,46 @@ ngx_autocert_acme_client_destroy(ngx_autocert_acme_client_t *client)
     if (client->ssl.ctx) {
         ngx_ssl_cleanup_ctx(&client->ssl);
         client->ssl.ctx = NULL;
+    }
+}
+
+
+/*
+ * Cancel the single in-flight request (if any) WITHOUT invoking its completion
+ * handler. Used by the `master_process off` reload path: the driver is about to
+ * destroy the pools the request and its handler closure live in, so any pending
+ * resolver/socket event must be detached first, and the handler (which would
+ * touch the dead-cycle driver state) must NOT run. Mirrors the teardown half of
+ * ngx_autocert_acme_finalize() but skips the r->handler call. Safe to call when
+ * nothing is in flight (no-op).
+ */
+void
+ngx_autocert_acme_cancel_inflight(void)
+{
+    ngx_autocert_acme_request_t  *r = ngx_autocert_acme_inflight;
+    ngx_connection_t             *c;
+
+    if (r == NULL) {
+        return;
+    }
+
+    ngx_autocert_acme_inflight = NULL;
+    r->done = 1;                       /* a late finalize must become a no-op */
+
+    if (r->resolve) {
+        ngx_resolve_name_done(r->resolve);
+        r->resolve = NULL;
+    }
+
+    c = r->peer.connection;
+    if (c) {
+        if (c->ssl) {
+            c->ssl->no_wait_shutdown = 1;
+            c->ssl->no_send_shutdown = 1;
+            (void) ngx_ssl_shutdown(c);
+        }
+        ngx_close_connection(c);
+        r->peer.connection = NULL;
     }
 }
 
@@ -212,6 +267,7 @@ ngx_autocert_acme_request(ngx_autocert_acme_request_t *r)
         return NGX_ERROR;
     }
 
+    ngx_autocert_acme_inflight = r;     /* resolve armed; cancelable on reload */
     return NGX_OK;
 }
 
@@ -436,6 +492,7 @@ ngx_autocert_acme_connect(ngx_autocert_acme_request_t *r,
         ngx_log_debug1(NGX_LOG_DEBUG_CORE, r->log, 0,
                        "autocert: connect to \"%V\" in progress", &r->host);
         ngx_add_timer(c->write, r->client->connect_timeout);
+        ngx_autocert_acme_inflight = r;   /* connect armed; cancelable on reload */
         return NGX_OK;
     }
 
@@ -457,6 +514,7 @@ ngx_autocert_acme_connect(ngx_autocert_acme_request_t *r,
         return NGX_ERROR;
     }
 
+    ngx_autocert_acme_inflight = r;       /* TLS handshake armed; cancelable */
     return NGX_OK;
 }
 
@@ -1307,6 +1365,10 @@ ngx_autocert_acme_finalize(ngx_autocert_acme_request_t *r, ngx_int_t rc)
         return;
     }
     r->done = 1;
+
+    if (r == ngx_autocert_acme_inflight) {
+        ngx_autocert_acme_inflight = NULL;
+    }
 
     if (r->resolve) {
         ngx_resolve_name_done(r->resolve);

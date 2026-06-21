@@ -370,6 +370,12 @@ chmod 0700 /var/lib/autocert
   zone accessible to all workers.
 - Certificates are loaded **per-SNI at the TLS handshake**, so renewal needs no
   config reload.
+- A **config reload** is handled in both run modes. In the normal master+workers
+  model nginx forks fresh workers, so the new worker 0 simply re-arms the engine.
+  In **`master_process off`** (single-process) mode the process survives the
+  reload, so the module rebinds the driver and the per-SNI serve gate to the new
+  configuration in place — added/removed issuance names take effect, and any
+  in-flight ACME request is cancelled cleanly before the old state is torn down.
 
 The addon ships a **single** dynamic module: `ngx_http_autocert_module.so`.
 

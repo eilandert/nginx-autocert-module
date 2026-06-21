@@ -269,6 +269,36 @@ static ngx_command_t  ngx_http_autocert_commands[] = {
  * single gate covers both. Other workers (and the master / cache procs / signaller)
  * return without arming — they only serve challenges from the shared zone.
  */
+/*
+ * Single-process (`master_process off`) reload tracker. In single-process mode
+ * the process survives a SIGHUP and nginx re-runs every module's init_module
+ * (with the new cycle) but NEVER calls exit_process/init_process again. We use
+ * init_module as the reload hook there: the FIRST init_module is the initial
+ * boot (init_process still does the arming), every later one is a reload and must
+ * rebind the driver + serve state to the new cycle. The flag is set in
+ * init_process so init_module can tell boot from reload. Irrelevant in
+ * master+workers mode (init_module runs in the master, which holds no per-worker
+ * driver/serve state; fresh workers re-init via fork each generation).
+ */
+static ngx_uint_t  ngx_http_autocert_single_started;
+
+
+static ngx_int_t
+ngx_http_autocert_init_module(ngx_cycle_t *cycle)
+{
+    if (ngx_process == NGX_PROCESS_SINGLE
+        && ngx_worker == 0
+        && ngx_http_autocert_single_started)
+    {
+        /* A reload in `master_process off`: rebuild against the new cycle. */
+        ngx_autocert_serve_reload();
+        ngx_autocert_driver_reload(cycle);
+    }
+
+    return NGX_OK;
+}
+
+
 static ngx_int_t
 ngx_http_autocert_init_process(ngx_cycle_t *cycle)
 {
@@ -276,6 +306,9 @@ ngx_http_autocert_init_process(ngx_cycle_t *cycle)
          || ngx_process == NGX_PROCESS_SINGLE)
         && ngx_worker == 0)
     {
+        if (ngx_process == NGX_PROCESS_SINGLE) {
+            ngx_http_autocert_single_started = 1;
+        }
         ngx_autocert_driver_init_process(cycle);
     }
 
@@ -316,7 +349,7 @@ ngx_module_t  ngx_http_autocert_module = {
     ngx_http_autocert_commands,        /* module directives */
     NGX_HTTP_MODULE,                   /* module type */
     NULL,                              /* init master */
-    NULL,                              /* init module */
+    ngx_http_autocert_init_module,     /* init module (single-process reload hook) */
     ngx_http_autocert_init_process,    /* init process (arms ACME on worker 0) */
     NULL,                              /* init thread */
     NULL,                              /* exit thread */

@@ -43,4 +43,12 @@ ngx_int_t ngx_http_autocert_serve_init(ngx_conf_t *cf,
     ngx_http_autocert_main_conf_t *amcf);
 
 
+/*
+ * `master_process off` reload: drop the per-worker cert cache + name-index gate
+ * so they rebuild from the new config. Call from init_module (single-process
+ * path only). No-op-safe before the first handshake builds anything.
+ */
+void ngx_autocert_serve_reload(void);
+
+
 #endif /* _NGX_AUTOCERT_SERVE_H_INCLUDED_ */
