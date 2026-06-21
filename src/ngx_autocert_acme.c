@@ -544,6 +544,15 @@ ngx_autocert_acme_ssl_init(ngx_autocert_acme_request_t *r)
         return NGX_OK;
     }
 
+    /*
+     * Synchronous handshake (rc == NGX_OK): drive the handshake handler inline.
+     * This runs build_request + write_handler synchronously, but write_handler
+     * always ends by waiting for the response read (read_handler returns on the
+     * first NGX_AGAIN — the reply can't be buffered before we unwind), so the
+     * completion handler (finalize) is NOT reached on this stack. The "handler
+     * fires later" contract (see ngx_autocert_acme.h) therefore holds even on
+     * the fully-synchronous connect+handshake path; no defer-to-loop needed.
+     */
     ngx_autocert_acme_ssl_handshake_handler(c);
     return NGX_OK;
 }
