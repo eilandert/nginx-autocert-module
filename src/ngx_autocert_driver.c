@@ -147,30 +147,9 @@ static ngx_event_t                  ngx_autocert_relock_timer;
 
 
 
-/*
- * M3 (TOCTOU-hardened): renameat2 between two pinned dir fds. Returns NGX_OK on
- * success; NGX_DECLINED when the syscall/flag is unsupported (caller falls back
- * to plain renameat); NGX_ERROR otherwise with ngx_errno set (incl. EEXIST when
- * RENAME_NOREPLACE hits an existing destination — caller inspects).
- */
-static ngx_int_t
-ngx_autocert_renameat2(int oldfd, const char *oldp, int newfd,
-    const char *newp, unsigned int flags)
-{
-#if defined(__linux__) && defined(SYS_renameat2)
-    if (syscall(SYS_renameat2, oldfd, oldp, newfd, newp, flags) == 0) {
-        return NGX_OK;
-    }
-    if (ngx_errno == NGX_ENOSYS || ngx_errno == EINVAL
-        || ngx_errno == ENOTTY || ngx_errno == EOPNOTSUPP)
-    {
-        return NGX_DECLINED;
-    }
-    return NGX_ERROR;
-#else
-    return NGX_DECLINED;
-#endif
-}
+/* ngx_autocert_renameat2() is shared via ngx_autocert_shared.h — used by both
+ * the account-key migration here and the store commit in order.c, so the two
+ * security-sensitive fd-pinned renames can never drift. */
 
 
 /*
