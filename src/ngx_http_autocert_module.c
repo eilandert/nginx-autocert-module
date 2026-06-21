@@ -540,10 +540,11 @@ ngx_http_autocert_postconfig(ngx_conf_t *cf)
              * Only concrete FQDNs are issuable. Skip:
              *  - regex names — nginx strips the leading '~' from sn->name, so
              *    test sn->regex, not the first byte (which is then '^', etc.).
-             *  - wildcard forms — leading '*.'/'.'  AND trailing '.*' (suffix
-             *    wildcard, also stored without the leading char): reject any
-             *    '*' anywhere in the name. A single ACME order can't cover
-             *    these (DNS-01 wildcard support is deferred).
+             *  - wildcard forms — only a leading-label wildcard "*.rest" is
+             *    issuable, and only via dns-01 (RFC 8555 §7.1.3 forbids http-01/
+             *    tls-alpn-01 for a wildcard). Any other '*' (suffix ".*",
+             *    embedded, or a leading wildcard under a non-dns-01 challenge)
+             *    is rejected. A leading '.' (".rest") is never a concrete name.
              *  - the empty catch-all "".
              */
 #if (NGX_PCRE)
@@ -551,11 +552,21 @@ ngx_http_autocert_postconfig(ngx_conf_t *cf)
                 continue;
             }
 #endif
-            if (name.len == 0
-                || name.data[0] == '.'
-                || ngx_strlchr(name.data, name.data + name.len, '*') != NULL)
-            {
+            if (name.len == 0 || name.data[0] == '.') {
                 continue;
+            }
+            if (ngx_strlchr(name.data, name.data + name.len, '*') != NULL) {
+                /* D4: keep "*.rest" only under dns-01 and only if the '*' is the
+                 * sole, leading-label wildcard. The order flow sends "*.rest" as
+                 * the ACME identifier and stores it under "_wildcard_.rest". */
+                if (amcf->challenge != NGX_HTTP_AUTOCERT_CHALLENGE_DNS_01
+                    || name.len < 3
+                    || name.data[0] != '*' || name.data[1] != '.'
+                    || ngx_strlchr(name.data + 2, name.data + name.len, '*')
+                       != NULL)
+                {
+                    continue;
+                }
             }
 
             /* Dedup: the same name may appear across vhosts. */

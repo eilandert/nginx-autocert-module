@@ -643,6 +643,8 @@ ngx_autocert_name_due(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
     time_t      not_after, now;
     ngx_int_t   rc;
     ngx_uint_t  certbot;
+    ngx_str_t   seg;
+    u_char      seg_buf[NGX_AUTOCERT_DOMAIN_SEG_MAX];
 
     if (acf->path.len == 0) {
         ngx_log_debug1(NGX_LOG_DEBUG_CORE, cycle->log, 0,
@@ -680,8 +682,20 @@ ngx_autocert_name_due(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
      */
     certbot = (acf->store == NGX_HTTP_AUTOCERT_STORE_CERTBOT);
 
+    /* D4: a wildcard name "*.rest" is stored under "_wildcard_.rest"; map to the
+     * same fs segment the store writer + serve path use so the freshness check
+     * stats the file that was actually written (else it would look perpetually
+     * un-issued and reorder every sweep). */
+    seg.data = seg_buf;
+    seg.len = ngx_autocert_fs_segment(seg_buf, sizeof(seg_buf), name);
+    if (seg.len == 0) {
+        ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
+                      "autocert: store segment too long for \"%V\"", name);
+        return 0;
+    }
+
     base = acf->path.len + (certbot ? sizeof("/live") - 1 : 0)
-           + 1 + name->len + sizeof("/fullchain.pem");
+           + 1 + seg.len + sizeof("/fullchain.pem");
     if (base > NGX_MAX_PATH) {
         ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
                       "autocert: store path too long for \"%V\"", name);
@@ -693,7 +707,7 @@ ngx_autocert_name_due(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
         p = ngx_cpymem(p, "/live", sizeof("/live") - 1);
     }
     *p++ = '/';
-    p = ngx_cpymem(p, name->data, name->len);
+    p = ngx_cpymem(p, seg.data, seg.len);
     ngx_memcpy(p, "/fullchain.pem", sizeof("/fullchain.pem"));
 
     rc = ngx_http_autocert_cert_not_after((char *) path, &not_after);
