@@ -501,10 +501,69 @@ ngx_http_autocert_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
 
 
 /*
+ * M2: the CA a given server issues against. In M1/M2 the CA directives are
+ * http{}-global, so every server resolves to the one global ca_conf. M4
+ * (SRV-scope directives + merge) returns the per-server merged ca_conf here
+ * instead — that's the single seam that turns one CA group into many.
+ */
+static ngx_autocert_ca_conf_t *
+ngx_http_autocert_effective_ca(ngx_http_autocert_main_conf_t *amcf,
+    ngx_http_autocert_srv_conf_t *ascf)
+{
+    (void) ascf;
+    return &amcf->ca_conf;
+}
+
+
+/*
+ * M2: find (or create) the ca_list entry for a CA, keyed by its canonical
+ * directory URL. ca_hash = crc32(url) as 8 lowercase hex, used by M3 for the
+ * per-CA account dir. Returns NULL on alloc failure.
+ */
+static ngx_autocert_ca_entry_t *
+ngx_http_autocert_ca_entry(ngx_conf_t *cf,
+    ngx_http_autocert_main_conf_t *amcf, ngx_autocert_ca_conf_t *cac)
+{
+    static const u_char       hex[] = "0123456789abcdef";
+    ngx_autocert_ca_entry_t  *e;
+    ngx_uint_t                i;
+    uint32_t                  h;
+
+    e = amcf->ca_list->elts;
+    for (i = 0; i < amcf->ca_list->nelts; i++) {
+        if (e[i].ca_conf.ca.len == cac->ca.len
+            && ngx_strncmp(e[i].ca_conf.ca.data, cac->ca.data, cac->ca.len) == 0)
+        {
+            return &e[i];
+        }
+    }
+
+    e = ngx_array_push(amcf->ca_list);
+    if (e == NULL) {
+        return NULL;
+    }
+    ngx_memzero(e, sizeof(ngx_autocert_ca_entry_t));
+    e->ca_conf = *cac;
+    e->names = ngx_array_create(cf->pool, 4, sizeof(ngx_str_t));
+    if (e->names == NULL) {
+        return NULL;
+    }
+
+    h = ngx_crc32_long(cac->ca.data, cac->ca.len);
+    for (i = 0; i < 8; i++) {
+        e->ca_hash[i] = hex[(h >> ((7 - i) * 4)) & 0xf];
+    }
+    e->ca_hash[8] = '\0';
+
+    return e;
+}
+
+
+/*
  * Run after the whole http{} config is parsed and merged. Walk every server,
  * and for each one with autocert enabled, copy its server_name strings into
- * the main-conf name array (deduplicated). Then size and register the shared
- * zone that publishes that set to the helper process.
+ * the main-conf name array (deduplicated) AND into its CA's ca_list group. Then
+ * size and register the shared zone that publishes that set to the helper.
  */
 static ngx_int_t
 ngx_http_autocert_postconfig(ngx_conf_t *cf)
@@ -516,12 +575,21 @@ ngx_http_autocert_postconfig(ngx_conf_t *cf)
     ngx_http_autocert_main_conf_t  *amcf;
     ngx_http_core_srv_conf_t      **cscfp, *cscf;
     ngx_http_core_main_conf_t      *cmcf;
+    ngx_autocert_ca_entry_t        *ce;
+    ngx_autocert_ca_conf_t         *cac;
 
     amcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_autocert_module);
     cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
 
     amcf->names = ngx_array_create(cf->pool, 8, sizeof(ngx_str_t));
     if (amcf->names == NULL) {
+        return NGX_ERROR;
+    }
+
+    /* M2: per-CA name groups. One entry in the M1/M2 single-CA world. */
+    amcf->ca_list = ngx_array_create(cf->pool, 2,
+                                     sizeof(ngx_autocert_ca_entry_t));
+    if (amcf->ca_list == NULL) {
         return NGX_ERROR;
     }
 
@@ -546,6 +614,12 @@ ngx_http_autocert_postconfig(ngx_conf_t *cf)
         if (amcf->email.len == 0 && ascf->email.len != 0) {
             amcf->email = ascf->email;
         }
+
+        /* M2: this server's effective CA (M1/M2: the global one). The ca_list
+         * entry is created LAZILY below, only when a globally-new name actually
+         * joins it, so a skip-only / duplicate-only server never makes an empty
+         * CA group (the invariant M5 relies on). */
+        cac = ngx_http_autocert_effective_ca(amcf, ascf);
 
         sn = cscf->server_names.elts;
 
@@ -606,12 +680,27 @@ ngx_http_autocert_postconfig(ngx_conf_t *cf)
             }
 
             *slot = name;
+
+            /* M2: first-wins by CA — a new global name also joins the group of
+             * the CA of the server that introduced it. Create the group lazily
+             * here (only now is there a name for it) so no empty entry appears.
+             * ca_entry may grow ca_list (realloc), so use the fresh `ce` at once
+             * — nothing else touches ca_list before the push below. */
+            ce = ngx_http_autocert_ca_entry(cf, amcf, cac);
+            if (ce == NULL) {
+                return NGX_ERROR;
+            }
+            slot = ngx_array_push(ce->names);
+            if (slot == NULL) {
+                return NGX_ERROR;
+            }
+            *slot = name;
         }
     }
 
     ngx_log_error(NGX_LOG_NOTICE, cf->log, 0,
-                  "autocert: %ui name(s) enabled for issuance",
-                  amcf->names->nelts);
+                  "autocert: %ui name(s) enabled for issuance across %ui CA(s)",
+                  amcf->names->nelts, amcf->ca_list->nelts);
 
     /*
      * M10b: when tls-alpn-01 is the configured challenge (or a test seed is
