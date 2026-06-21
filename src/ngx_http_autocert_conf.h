@@ -67,6 +67,14 @@ typedef struct {
     ngx_array_t            *names;             /* ngx_str_t under this CA */
     u_char                  ca_hash[9];        /* crc32(ca url) hex8 + NUL */
     ngx_str_t               account_key_path;  /* M3 fills; "" in M2 */
+    /*
+     * Per-CA account contact. Each CA has its own ACME account, so each gets its
+     * own newAccount contact: the FIRST enabled vhost in this CA group with a
+     * non-empty `autocert on <email>` supplies it; a second vhost in the same
+     * group with a DIFFERENT non-empty email is rejected at postconfig (one CA =
+     * one account = one contact). "" if no vhost in the group set an email.
+     */
+    ngx_str_t               email;
 } ngx_autocert_ca_entry_t;
 
 

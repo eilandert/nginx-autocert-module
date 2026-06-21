@@ -687,6 +687,29 @@ jobs:
           dir: ${{ matrix.dir }}
           script: multi-ca.sh
 
+  multi-ca-contact:
+    name: per-CA account contact (one mailto per CA) [${{ matrix.flavor }}]
+    needs: [resolve, build-nginx, build-angie]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: nginx
+            dir: ${{ needs.resolve.outputs.nginx_dir }}
+          - flavor: angie
+            dir: ${{ needs.resolve.outputs.angie_dir }}
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: each CA's newAccount carries its own vhost contact
+        uses: ./.github/actions/run-e2e
+        with:
+          flavor: ${{ matrix.flavor }}
+          dir: ${{ matrix.dir }}
+          script: multi-ca-contact.sh
+
   account-migration:
     name: per-CA account path + legacy migration (M3, #15) [${{ matrix.flavor }}]
     needs: [resolve, build-nginx, build-angie]

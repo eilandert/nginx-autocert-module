@@ -686,6 +686,39 @@ ngx_http_autocert_ca_entry(ngx_conf_t *cf,
 
 
 /*
+ * Bind a vhost's account contact to its CA group. First non-empty email in the
+ * group wins (becomes the CA's newAccount contact); a second, DIFFERENT non-empty
+ * email for the SAME CA is a config error — one CA has one account, so one
+ * contact. An empty vhost email never overrides an already-set group contact.
+ */
+static ngx_int_t
+ngx_http_autocert_bind_ca_email(ngx_conf_t *cf, ngx_autocert_ca_entry_t *ce,
+    ngx_str_t *email)
+{
+    if (email->len == 0) {
+        return NGX_OK;
+    }
+
+    if (ce->email.len == 0) {
+        ce->email = *email;
+        return NGX_OK;
+    }
+
+    if (ce->email.len != email->len
+        || ngx_strncmp(ce->email.data, email->data, email->len) != 0)
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "autocert: CA \"%V\" is configured with conflicting account "
+            "contacts across servers (\"%V\" vs \"%V\"); one CA uses one "
+            "account and one contact", &ce->ca_conf.ca, &ce->email, email);
+        return NGX_ERROR;
+    }
+
+    return NGX_OK;
+}
+
+
+/*
  * Run after the whole http{} config is parsed and merged. Walk every server,
  * and for each one with autocert enabled, copy its server_name strings into
  * the main-conf name array (deduplicated) AND into its CA's ca_list group. Then
@@ -756,11 +789,11 @@ ngx_http_autocert_postconfig(ngx_conf_t *cf)
         }
 
         /*
-         * Account contact: the ACME account is a single per-instance object, but
-         * the email is configured per-vhost (`autocert on <email>`). Policy:
-         * the FIRST enabled vhost with a non-empty email supplies the account
-         * contact; later/other emails are ignored (documented in README). It is
-         * emitted as contact:["mailto:<email>"] in newAccount.
+         * Account contact is per-CA: each CA's newAccount gets the first email
+         * configured by a vhost in that CA group (bound below via
+         * ngx_http_autocert_bind_ca_email, conflicts rejected). amcf->email keeps
+         * the first-overall email only as a legacy fallback for a CA group whose
+         * own vhosts set none.
          */
         if (amcf->email.len == 0 && ascf->email.len != 0) {
             amcf->email = ascf->email;
@@ -866,6 +899,27 @@ ngx_http_autocert_postconfig(ngx_conf_t *cf)
                     return NGX_ERROR;
                 }
 
+                /* Dup name, same CA URL: this vhost adds no new name, but it must
+                 * still pass the SAME trust/EAB-conflict gate a name-contributing
+                 * vhost does (ngx_http_autocert_ca_entry rejects a same-URL group
+                 * reconfigured with a different ca_certificate/EAB), and its
+                 * `autocert on <email>` binds to the CA group's contact. Route
+                 * through ca_entry so the dup path can't bypass that validation;
+                 * the entry already exists (the name claimed it) so no group grows. */
+                if (owner != NULL) {
+                    ngx_autocert_ca_entry_t  *grp;
+
+                    grp = ngx_http_autocert_ca_entry(cf, amcf, cac);
+                    if (grp == NULL) {
+                        return NGX_ERROR;
+                    }
+                    if (ngx_http_autocert_bind_ca_email(cf, grp, &ascf->email)
+                        != NGX_OK)
+                    {
+                        return NGX_ERROR;
+                    }
+                }
+
                 continue;
             }
 
@@ -883,6 +937,11 @@ ngx_http_autocert_postconfig(ngx_conf_t *cf)
              * — nothing else touches ca_list before the push below. */
             ce = ngx_http_autocert_ca_entry(cf, amcf, cac);
             if (ce == NULL) {
+                return NGX_ERROR;
+            }
+            if (ngx_http_autocert_bind_ca_email(cf, ce, &ascf->email)
+                != NGX_OK)
+            {
                 return NGX_ERROR;
             }
             slot = ngx_array_push(ce->names);
