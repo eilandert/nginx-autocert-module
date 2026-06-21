@@ -37,10 +37,31 @@ typedef enum {
 } ngx_http_autocert_challenge_e;
 
 
+/*
+ * multi-CA M1 (#15 residual): the CA-identifying knobs grouped into one struct
+ * so they can later live per-server (autocert_ca / _staging / _ca_certificate /
+ * _eab_kid / _eab_hmac_key). M1 only extracts the struct — NO behavior change:
+ * the directives stay http{}-global and write main_conf.ca_conf. M4 gives
+ * srv_conf its own ca_conf and merges global→server; M2/M5 group names+driver
+ * state by CA.
+ */
+typedef struct {
+    ngx_str_t    ca;                /* ACME directory URL */
+    ngx_flag_t   staging;           /* autocert_staging on|off */
+    ngx_str_t    ca_certificate;    /* PEM trust bundle to verify the CA, "" */
+    ngx_str_t    eab_kid;           /* EAB key id (RFC 8555 §7.3.4), "" */
+    ngx_str_t    eab_hmac_key;      /* base64url EAB HMAC key, "" */
+} ngx_autocert_ca_conf_t;
+
+
 /* Per-server config: the on/off switch + optional contact (M0). */
 typedef struct {
     ngx_flag_t   enable;    /* autocert on|off; NGX_CONF_UNSET until set */
     ngx_str_t    email;     /* optional ACME account contact, "" if absent */
+
+    /* M1 prep: per-server CA knobs. UNSET in M1 (directives still MAIN-only);
+     * M4 adds NGX_HTTP_SRV_CONF to the directives + merges global→server. */
+    ngx_autocert_ca_conf_t  ca_conf;
 } ngx_http_autocert_srv_conf_t;
 
 
@@ -50,9 +71,12 @@ typedef struct {
  * occurrence of create_main_conf, read by every server.
  */
 typedef struct {
-    ngx_str_t    ca;                /* ACME directory URL */
+    /* M1: the CA-identifying knobs (ca/staging/ca_certificate/eab_kid/
+     * eab_hmac_key) live here so M4 can give each server its own. Directives are
+     * still http{}-global and write this one. */
+    ngx_autocert_ca_conf_t  ca_conf;
+
     ngx_str_t    email;             /* account contact (1st enabled vhost), "" */
-    ngx_flag_t   staging;          /* autocert_staging on|off */
     time_t       renew_before;      /* seconds before notAfter to renew */
     ngx_uint_t   key_type;          /* ngx_http_autocert_key_type_e */
     ngx_uint_t   store;             /* ngx_http_autocert_store_e */
@@ -62,13 +86,6 @@ typedef struct {
     /* M4b outbound-client knobs, read by the helper process. */
     ngx_resolver_t  *resolver;      /* built at config time, NULL if unset */
     time_t       resolver_timeout;  /* seconds */
-    ngx_str_t    ca_certificate;    /* PEM trust bundle to verify the CA, "" */
-
-    /* M15: External Account Binding (RFC 8555 §7.3.4). Both-or-neither; "" if
-     * unset. eab_hmac_key is the base64url-encoded HMAC key as handed out by
-     * the CA (decoded to raw bytes at registration time). */
-    ngx_str_t    eab_kid;           /* CA-issued key identifier, "" if unset */
-    ngx_str_t    eab_hmac_key;      /* base64url HMAC key, "" if unset */
 
     /* M16: dns-01 challenge. The driver publishes a TXT record by exec'ing an
      * operator hook (D3), waits dns_propagation_delay, then asks the CA to
