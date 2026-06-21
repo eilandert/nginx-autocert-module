@@ -160,7 +160,7 @@ runs:
         run_neg "invalid email"        'server { listen 8080; autocert on x@; }'                          'invalid email'
         run_neg "bad key_type"         'autocert_key_type rsa2048;'                                       'invalid key type'
         run_neg "bad store"            'autocert_store vault;'                                            'invalid store'
-        run_neg "bad challenge"        'autocert_challenge dns-01;'                                       'invalid challenge'
+        run_neg "bad challenge"        'autocert_challenge bogus-01;'                                     'invalid challenge'
         run_neg "duplicate key"        'autocert_key_type secp384r1; autocert_key_type secp256r1;'        'is duplicate'
         run_neg "knob in server{}"     'server { listen 8080; autocert_renew_before 10d; }'               'directive is not allowed'
         run_neg "staging+ca conflict"  'autocert_staging on; autocert_ca https://example.com/dir;'        'mutually exclusive'

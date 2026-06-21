@@ -43,10 +43,16 @@ $body
     server { listen $PORT; server_name x.example.com; }
 }
 EOF
-    local out
-    out=$("$SERVER_BIN" -t -p "$PREFIX" -c "$PREFIX/conf/nginx.conf" 2>&1 || true)
-    if printf '%s' "$out" | grep -q "syntax is ok"; then
-        echo "::error::$label: config was ACCEPTED but should be rejected"
+    # Detect rejection by `-t` exit status, not by the absence of the
+    # "syntax is ok" line: angie prints "syntax is ok" for the *parse* phase
+    # and only then fails the init test (init_main_conf), so the string-based
+    # heuristic wrongly read a rejected angie config as accepted. The high
+    # PORT above means no privileged bind can make `-t` fail spuriously, so a
+    # non-zero exit reliably means "config rejected" on both nginx and angie.
+    local out rc=0
+    out=$("$SERVER_BIN" -t -p "$PREFIX" -c "$PREFIX/conf/nginx.conf" 2>&1) || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        echo "::error::$label: config was ACCEPTED (-t exit 0) but should be rejected"
         printf '%s\n' "$out" | sed 's/^/    /'
         return 1
     fi

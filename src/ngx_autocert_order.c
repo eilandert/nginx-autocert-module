@@ -1667,7 +1667,6 @@ ngx_autocert_order_validate_cert(ngx_autocert_order_t *order)
     bio = BIO_new_mem_buf(order->cert_key_pem.data,
                           (int) order->cert_key_pem.len);
     if (bio == NULL) {
-        bio = NULL;
         goto done;
     }
     key = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL);
