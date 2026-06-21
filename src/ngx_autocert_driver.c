@@ -347,6 +347,21 @@ ngx_autocert_kick_handler(ngx_event_t *ev)
         }
     }
 
+    /*
+     * M4 (Codex #4): no issuable names => nothing to order, so do NOT build the
+     * ACME client or bootstrap an account. With per-vhost multi-CA an empty
+     * ca_list leaves acf.ca == "" (the flat bridge has no [0] entry); proceeding
+     * would register an account against an empty directory URL. The test seeds
+     * above are intentionally exempt (they exercise the serve path without an
+     * order flow). The renewal scheduler already guards on names; this guards
+     * the one-time account bootstrap on the same condition.
+     */
+    if (acf.names == NULL || acf.names->nelts == 0) {
+        ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
+                      "autocert: no issuable names; driver idle (no account)");
+        return;
+    }
+
     if (!ngx_autocert_client_ready) {
         if (ngx_autocert_acme_client_create(&ngx_autocert_client, cycle,
                                             &acf.ca_certificate, acf.resolver,

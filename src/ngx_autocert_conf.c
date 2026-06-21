@@ -80,13 +80,27 @@ ngx_autocert_get_conf(ngx_cycle_t *cycle, ngx_autocert_conf_t *out)
                    "autocert: resolved http conf, challenge:%ui names:%ui",
                    amcf->challenge,
                    amcf->names ? amcf->names->nelts : (ngx_uint_t) 0);
-    out->ca = amcf->ca_conf.ca;
+    /*
+     * M4 bridge: the CA knobs moved to SRV scope (srv_conf.ca_conf) and the
+     * directives no longer populate amcf->ca_conf. postconfig resolves each
+     * server's effective ca_conf and groups names by CA into ca_list. The
+     * worker-0 driver is still single-CA until M5, so source the flat CA fields
+     * from the first ca_list entry (the resolved, validated primary CA). With
+     * no enabled names ca_list is empty -> CA fields stay "" and the driver
+     * idles, which is correct (nothing to issue).
+     */
+    if (amcf->ca_list != NULL && amcf->ca_list->nelts > 0) {
+        ngx_autocert_ca_entry_t  *ce0 = amcf->ca_list->elts;
+
+        out->ca = ce0->ca_conf.ca;
+        out->ca_certificate = ce0->ca_conf.ca_certificate;
+        out->eab_kid = ce0->ca_conf.eab_kid;
+        out->eab_hmac_key = ce0->ca_conf.eab_hmac_key;
+    }
+
     out->email = amcf->email;
     out->resolver = amcf->resolver;
     out->resolver_timeout = amcf->resolver_timeout;
-    out->ca_certificate = amcf->ca_conf.ca_certificate;
-    out->eab_kid = amcf->ca_conf.eab_kid;
-    out->eab_hmac_key = amcf->ca_conf.eab_hmac_key;
     out->dns_hook_add = amcf->dns_hook_add;
     out->dns_hook_remove = amcf->dns_hook_remove;
     out->dns_propagation_delay = amcf->dns_propagation_delay;

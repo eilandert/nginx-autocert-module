@@ -76,8 +76,11 @@ typedef struct {
     ngx_flag_t   enable;    /* autocert on|off; NGX_CONF_UNSET until set */
     ngx_str_t    email;     /* optional ACME account contact, "" if absent */
 
-    /* M1 prep: per-server CA knobs. UNSET in M1 (directives still MAIN-only);
-     * M4 adds NGX_HTTP_SRV_CONF to the directives + merges global→server. */
+    /* M4: per-server CA knobs. The CA directives are MAIN+SRV scope and write
+     * here via SRV_CONF_OFFSET; merge_srv_conf folds the http{} default into
+     * each server, postconfig resolves + validates each effective ca_conf and
+     * groups names by CA URL into main_conf.ca_list. staging starts UNSET (set
+     * in create_srv_conf) so merge can tell "not set" from "off". */
     ngx_autocert_ca_conf_t  ca_conf;
 } ngx_http_autocert_srv_conf_t;
 
@@ -88,9 +91,10 @@ typedef struct {
  * occurrence of create_main_conf, read by every server.
  */
 typedef struct {
-    /* M1: the CA-identifying knobs (ca/staging/ca_certificate/eab_kid/
-     * eab_hmac_key) live here so M4 can give each server its own. Directives are
-     * still http{}-global and write this one. */
+    /* M4: vestigial. The CA knobs moved to SRV scope (srv_conf.ca_conf); the
+     * directives no longer write this. Kept only so the flat-conf accessor
+     * (ngx_autocert_conf.c) compiles against a stable layout — it now sources
+     * the primary CA from ca_list[0]. Remove when M5 drops the flat bridge. */
     ngx_autocert_ca_conf_t  ca_conf;
 
     ngx_str_t    email;             /* account contact (1st enabled vhost), "" */
