@@ -13,6 +13,7 @@
 #include "ngx_autocert_alpn.h"
 #include "ngx_http_autocert_crypto.h"
 #include "ngx_http_autocert_conf.h"     /* key-type enum mapping */
+#include "ngx_autocert_shared.h"        /* shared ngx_autocert_renameat2() */
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -55,26 +56,8 @@
  * components are single names (no '/'), so they cannot themselves traverse.
  */
 
-/* renameat2 via syscall (no glibc wrapper dependency); NGX_DECLINED when the
- * flag/syscall is unsupported so the caller can fall back. */
-static ngx_int_t
-ngx_autocert_renameat2(int oldfd, const char *oldp, int newfd,
-    const char *newp, unsigned int flags)
-{
-#if defined(__linux__) && defined(SYS_renameat2)
-    if (syscall(SYS_renameat2, oldfd, oldp, newfd, newp, flags) == 0) {
-        return NGX_OK;
-    }
-    if (ngx_errno == NGX_ENOSYS || ngx_errno == EINVAL
-        || ngx_errno == ENOTTY || ngx_errno == EOPNOTSUPP)
-    {
-        return NGX_DECLINED;
-    }
-    return NGX_ERROR;
-#else
-    return NGX_DECLINED;
-#endif
-}
+/* ngx_autocert_renameat2() is shared via ngx_autocert_shared.h — the same
+ * fd-pinned rename primitive used by the account-key migration in driver.c. */
 
 
 /* Open a directory by path with O_DIRECTORY|O_NOFOLLOW so the final component is

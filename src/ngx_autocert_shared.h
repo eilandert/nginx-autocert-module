@@ -69,4 +69,45 @@ typedef struct {
 ngx_int_t ngx_autocert_get_conf(ngx_cycle_t *cycle, ngx_autocert_conf_t *out);
 
 
+/*
+ * renameat2(2) wrapper, shared by the store commit (order.c) and the account-key
+ * migration (driver.c) — both fd-pinned, security-sensitive renames that must
+ * not drift. Called via syscall() so the build needs no glibc renameat2 wrapper.
+ * Returns NGX_OK on success; NGX_DECLINED when the syscall/flag is unsupported
+ * (caller falls back or defers); NGX_ERROR otherwise with ngx_errno set (incl.
+ * EEXIST for RENAME_NOREPLACE against an existing destination — caller inspects).
+ */
+#include <fcntl.h>
+#include <errno.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#ifndef RENAME_NOREPLACE
+#define RENAME_NOREPLACE (1 << 0)
+#endif
+#ifndef RENAME_EXCHANGE
+#define RENAME_EXCHANGE (1 << 1)
+#endif
+#endif
+
+static ngx_inline ngx_int_t
+ngx_autocert_renameat2(int oldfd, const char *oldp, int newfd,
+    const char *newp, unsigned int flags)
+{
+#if defined(__linux__) && defined(SYS_renameat2)
+    if (syscall(SYS_renameat2, oldfd, oldp, newfd, newp, flags) == 0) {
+        return NGX_OK;
+    }
+    if (ngx_errno == NGX_ENOSYS || ngx_errno == EINVAL
+        || ngx_errno == ENOTTY || ngx_errno == EOPNOTSUPP)
+    {
+        return NGX_DECLINED;
+    }
+    return NGX_ERROR;
+#else
+    (void) oldfd; (void) oldp; (void) newfd; (void) newp; (void) flags;
+    return NGX_DECLINED;
+#endif
+}
+
+
 #endif /* _NGX_AUTOCERT_SHARED_H_INCLUDED_ */
