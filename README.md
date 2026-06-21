@@ -87,11 +87,14 @@ soon as it's issued — and on every renewal — without a reload.
    names back off (exponential, 60 s → 1 h); a CA `HTTP 429` `Retry-After` is
    honoured.
 
-**Two challenge types.** HTTP-01 (default) is answered transparently on port 80
+**Three challenge types.** HTTP-01 (default) is answered transparently on port 80
 by a built-in handler — no `location` block. TLS-ALPN-01
 ([RFC 8737](https://datatracker.ietf.org/doc/html/rfc8737)),
 `autocert_challenge tls-alpn-01;`, validates entirely inside the TLS handshake,
-so **port 80 can stay closed**.
+so **port 80 can stay closed**. DNS-01, `autocert_challenge dns-01;`, publishes a
+`_acme-challenge` TXT record through an operator hook script — the only challenge
+that can issue **wildcard** certificates (`*.example.com`), and it needs no
+inbound port at all. See [DNS-01 challenge](#dns-01-challenge-wildcards) below.
 
 The whole flow is verified end-to-end against
 [Pebble](https://github.com/letsencrypt/pebble) in CI, plus fuzzing, Valgrind,
@@ -149,12 +152,16 @@ One ACME policy per instance. All optional.
 | `autocert_key_type secp384r1\|secp256r1;` | `secp384r1` | ECDSA curve (no RSA) |
 | `autocert_store secure\|certbot;` | `secure` | on-disk layout. `secure`: `<path>/<domain>/{privkey,fullchain}.pem`. `certbot`: `<path>/live/<domain>/{privkey,cert,chain,fullchain}.pem` (flat live/, real files — no archive/ + symlinks) |
 | `autocert_path <dir>;` | `autocert` | store location (relative to the nginx prefix) |
-| `autocert_challenge http-01\|tls-alpn-01;` | `http-01` | challenge type |
+| `autocert_challenge http-01\|tls-alpn-01\|dns-01;` | `http-01` | challenge type — `dns-01` needs the hook directives below |
 | `autocert_resolver <addr>...;` | the `http{}` `resolver` | DNS used to reach the CA |
 | `autocert_resolver_timeout <time>;` | `30s` | DNS query timeout |
 | `autocert_ca_certificate <file>;` | system trust store | PEM bundle to verify the CA |
 | `autocert_eab_kid <key-id>;` | *(none)* | EAB key identifier — see below |
 | `autocert_eab_hmac_key <base64url>;` | *(none)* | EAB HMAC key (base64url) — see below |
+| `autocert_dns_hook_add <path>;` | *(none)* | DNS-01 only: absolute path of the publish-TXT hook — see below |
+| `autocert_dns_hook_remove <path>;` | *(none)* | DNS-01 only: absolute path of the remove-TXT hook |
+| `autocert_dns_propagation_delay <time>;` | `10s` | DNS-01 only: wait after publishing before asking the CA to validate |
+| `autocert_dns_hook_timeout <time>;` | `30s` | DNS-01 only: max runtime for a single hook exec before it is killed |
 
 > `autocert_key_type` takes the OpenSSL curve names `secp384r1` / `secp256r1`,
 > not `p384` / `p256`. The ACME server's certificate is **always** verified
@@ -191,12 +198,74 @@ only one fails config. The binding is computed and sent **only** on account
 registration (`newAccount`); ordinary order/renewal requests are unaffected.
 Let's Encrypt does not use EAB — leave both unset for it.
 
+### DNS-01 challenge (wildcards)
+
+DNS-01 proves control by publishing a TXT record at
+`_acme-challenge.<domain>`. It is the only challenge that can issue **wildcard**
+certificates (`*.example.com`) and needs **no inbound port** — useful behind a
+load balancer or on a host that exposes neither 80 nor 443 to the CA.
+
+Because every DNS provider has a different API, publishing is delegated to two
+operator **hook scripts** you supply. Both are required when
+`autocert_challenge dns-01;`, and both must be **absolute paths**:
+
+```nginx
+http {
+    autocert on admin@example.com;
+    autocert_challenge dns-01;
+    autocert_dns_hook_add    /etc/nginx/acme/publish.sh;
+    autocert_dns_hook_remove /etc/nginx/acme/unpublish.sh;
+    autocert_dns_propagation_delay 30s;   # let the record propagate first
+
+    server {
+        listen 443 ssl;
+        server_name example.com *.example.com;   # wildcard needs dns-01
+        autocert on;
+    }
+}
+```
+
+**Hook contract.** Each hook is run `fork()` + `execve()` (no shell) with:
+
+```
+argv = { <hook-path>, "_acme-challenge.<domain>", "<txt-value>" }
+```
+
+For a wildcard `*.example.com` the record name is the base
+(`_acme-challenge.example.com`). The hook **must exit 0 on success**; a non-zero
+exit (or a timeout past `autocert_dns_hook_timeout`) fails the order. Example
+publish hook for a provider with an HTTP API:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+# $1 = _acme-challenge.example.com   $2 = the TXT value
+curl -fsS -X POST "https://dns.example/api/txt" \
+     -H "Authorization: Bearer ${DNS_API_TOKEN}" \
+     -d "name=${1}." -d "value=${2}" >/dev/null
+```
+
+Caveats:
+
+- **The hook runs on the ACME worker** and blocks it for the duration of the
+  exec (bounded by `autocert_dns_hook_timeout`). Keep hooks fast — a single API
+  call, not a propagation poll. The propagation *wait* is handled separately and
+  asynchronously by `autocert_dns_propagation_delay`.
+- **The hook inherits nginx's environment** by design, so provider credentials
+  can be passed via env (e.g. `DNS_API_TOKEN`), the certbot-manual convention.
+- The record is removed via the remove-hook once the authorization settles
+  (cleanup failure is non-fatal — the record expires by TTL).
+
 ### Which names get provisioned
 
 The module collects the concrete `server_name`s of every vhost with `autocert
-on` (deduplicated). **Skipped:** vhosts set `autocert off`, the empty catch-all
-`""`, and wildcard (`*.x` / `.x`) or regex (`~…`) names — a single ACME order
-can't cover those (wildcards need DNS-01, which isn't supported yet).
+on` (deduplicated). **Wildcards** (`*.example.com`) are provisioned **only under
+`autocert_challenge dns-01;`** (RFC 8555 forbids HTTP-01/TLS-ALPN-01 for a
+wildcard); the cert is stored under a `_wildcard_.example.com` directory and
+served for any single-label subdomain SNI. **Skipped:** vhosts set `autocert
+off`, the empty catch-all `""`, a leading-dot (`.x`) or regex (`~…`) name, and a
+wildcard when the challenge is not dns-01 — a single ACME order can't cover
+those.
 
 ---
 
@@ -246,15 +315,16 @@ user).
 
 ## Status
 
-**Works today:** full issuance + renewal on nginx mainline, HTTP-01 and
-TLS-ALPN-01, per-SNI serving with bootstrap + zero-reload hot-swap, ECDSA
+**Works today:** full issuance + renewal on nginx mainline, HTTP-01,
+TLS-ALPN-01 and DNS-01 (incl. **wildcard** `*.x` via operator hooks), EAB for
+commercial CAs, per-SNI serving with bootstrap + zero-reload hot-swap, ECDSA
 P-384/P-256, worker-owned `secure` and `certbot` store layouts, `badNonce`
 retry, per-name backoff, and `429` / `Retry-After` awareness.
 
-**Not yet:** wildcard / DNS-01 certificates, multiple CAs / EAB, and a packaged
-Debian sub-package. Both nginx and Angie are fully supported and run the same
-end-to-end test suite; on Angie the `autocert` directive coexists with Angie's
-own native `acme` (pick whichever you prefer).
+**Not yet:** multiple CAs per instance (one ACME policy at a time), and a
+packaged Debian sub-package. Both nginx and Angie are fully supported and run the
+same end-to-end test suite; on Angie the `autocert` directive coexists with
+Angie's own native `acme` (pick whichever you prefer).
 
 ---
 
