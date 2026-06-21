@@ -315,16 +315,49 @@ done:
  * SNI has no issued cert — the bootstrap cert lets the connection complete and
  * the client sees a name mismatch, which is the honest state pre-issuance.
  */
+
+/*
+ * Is `name` (hash = crc32(name)) one of the configured issuable names? O(log n)
+ * via the rbtree index when built, else the O(n) linear fallback. Caller must
+ * have confirmed sctx->names != NULL. Mirrors the gate that bounds the
+ * per-worker cache to the configured set.
+ */
+static ngx_int_t
+ngx_autocert_serve_name_match(ngx_autocert_serve_ctx_t *sctx, ngx_str_t *name,
+    uint32_t hash)
+{
+    ngx_str_t   *nm;
+    ngx_uint_t   i;
+
+    if (ngx_autocert_names_built) {
+        return ngx_str_rbtree_lookup(&ngx_autocert_names_rbtree, name, hash)
+               != NULL;
+    }
+
+    nm = sctx->names->elts;
+    for (i = 0; i < sctx->names->nelts; i++) {
+        if (nm[i].len == name->len
+            && ngx_strncmp(nm[i].data, name->data, name->len) == 0)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+
 static int
 ngx_http_autocert_cert_cb(SSL *ssl_conn, void *arg)
 {
     ngx_autocert_serve_ctx_t  *sctx = arg;
     ngx_connection_t          *c;
     ngx_autocert_cert_t       *cert;
-    ngx_str_t                  host;
+    ngx_str_t                  host, store;
     u_char                     host_buf[256];
+    u_char                     wc_buf[256];
+    u_char                     key_buf[NGX_AUTOCERT_DOMAIN_SEG_MAX];
     const char                *servername;
-    uint32_t                   hash;
+    uint32_t                   hash, store_hash;
 
     c = ngx_ssl_get_connection(ssl_conn);
     if (c == NULL) {
@@ -457,33 +490,59 @@ ngx_http_autocert_cert_cb(SSL *ssl_conn, void *arg)
     hash = ngx_crc32_short(host.data, host.len);
 
     /*
+     * Resolve the SNI to a store key. By default the key is the SNI itself.
+     *
      * Gate: only serve names this instance is configured to issue for. Bounds
      * the per-worker cache to the config-sized name set, so an SNI flood cannot
-     * grow worker memory or create cache entries. O(log n) via the index when
-     * built; the rare alloc-failure path falls back to the original O(n) scan.
+     * grow worker memory or create cache entries.
+     *
+     * D4 wildcard: if the SNI is not an exact configured name, try the
+     * leading-label wildcard parent "*.<rest>" (RFC 6125 — exactly one label).
+     * On a match the cache + store are keyed by the SHARED wildcard segment
+     * "_wildcard_.<rest>", NOT the SNI: every subdomain under one wildcard maps
+     * to a single cache entry + a single cert dir, so the cache stays bounded by
+     * the configured wildcard count (an SNI flood under "*.example.com" cannot
+     * create unbounded entries).
      */
-    if (sctx->names != NULL) {
-        ngx_int_t  found;
+    store = host;
+    store_hash = hash;
 
-        if (ngx_autocert_names_built) {
-            found = ngx_str_rbtree_lookup(&ngx_autocert_names_rbtree, &host,
-                                          hash) != NULL;
-        } else {
-            ngx_str_t   *nm = sctx->names->elts;
-            ngx_uint_t   i;
+    if (sctx->names != NULL && !ngx_autocert_serve_name_match(sctx, &host, hash))
+    {
+        ngx_int_t   matched = 0;
+        u_char     *dot;
 
-            found = 0;
-            for (i = 0; i < sctx->names->nelts; i++) {
-                if (nm[i].len == host.len
-                    && ngx_strncmp(nm[i].data, host.data, host.len) == 0)
+        dot = ngx_strlchr(host.data, host.data + host.len, '.');
+
+        /* require a non-empty left label (dot > host.data) and a non-empty
+         * remainder: "*.rest" replaces exactly one label (RFC 6125), so a
+         * leading-dot SNI like ".example.com" must not match. */
+        if (dot != NULL && dot > host.data && dot + 1 < host.data + host.len) {
+            ngx_str_t  wc;
+            size_t     rest = (size_t) (host.data + host.len - (dot + 1));
+
+            wc.len = 2 + rest;
+            if (wc.len <= sizeof(wc_buf)) {
+                wc_buf[0] = '*';
+                wc_buf[1] = '.';
+                ngx_memcpy(wc_buf + 2, dot + 1, rest);
+                wc.data = wc_buf;
+
+                if (ngx_autocert_serve_name_match(sctx, &wc,
+                        ngx_crc32_short(wc.data, wc.len)))
                 {
-                    found = 1;
-                    break;
+                    store.len = ngx_autocert_fs_segment(key_buf,
+                                                        sizeof(key_buf), &wc);
+                    if (store.len != 0) {
+                        store.data = key_buf;
+                        store_hash = ngx_crc32_short(store.data, store.len);
+                        matched = 1;
+                    }
                 }
             }
         }
 
-        if (!found) {
+        if (!matched) {
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
                            "autocert: SNI \"%V\" not configured, keeping "
                            "bootstrap cert", &host);
@@ -492,22 +551,23 @@ ngx_http_autocert_cert_cb(SSL *ssl_conn, void *arg)
     }
 
     cert = (ngx_autocert_cert_t *)
-               ngx_str_rbtree_lookup(&ngx_autocert_cache_rbtree, &host, hash);
+               ngx_str_rbtree_lookup(&ngx_autocert_cache_rbtree, &store,
+                                     store_hash);
 
     if (cert == NULL) {
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
                        "autocert: cache miss for \"%V\", creating entry",
-                       &host);
+                       &store);
         cert = ngx_pcalloc(ngx_autocert_cache_pool,
-                           sizeof(ngx_autocert_cert_t) + host.len);
+                           sizeof(ngx_autocert_cert_t) + store.len);
         if (cert == NULL) {
             return 1;
         }
 
         cert->sn.str.data = (u_char *) cert + sizeof(ngx_autocert_cert_t);
-        ngx_memcpy(cert->sn.str.data, host.data, host.len);
-        cert->sn.str.len = host.len;
-        cert->sn.node.key = hash;
+        ngx_memcpy(cert->sn.str.data, store.data, store.len);
+        cert->sn.str.len = store.len;
+        cert->sn.node.key = store_hash;
         cert->mtime = -1;             /* force first load */
 
         ngx_rbtree_insert(&ngx_autocert_cache_rbtree, &cert->sn.node);
@@ -517,9 +577,10 @@ ngx_http_autocert_cert_cb(SSL *ssl_conn, void *arg)
      * Reload if the files changed. A transient failure (missing/unreadable/
      * malformed) leaves the previously cached cert intact — we keep serving the
      * last-good cert rather than dropping to the bootstrap one, so a renewal
-     * race or a momentary read error doesn't break live TLS.
+     * race or a momentary read error doesn't break live TLS. The store key is
+     * the wildcard segment for a wildcard match, so it reads the shared dir.
      */
-    (void) ngx_http_autocert_cache_reload(cert, &host, sctx, c->log);
+    (void) ngx_http_autocert_cache_reload(cert, &store, sctx, c->log);
 
     if (cert->cert == NULL || cert->key == NULL) {
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,

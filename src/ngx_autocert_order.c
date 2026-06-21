@@ -1640,17 +1640,31 @@ ngx_autocert_order_download_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
 static ngx_int_t
 ngx_autocert_order_domain_identifier_safe(ngx_str_t *domain)
 {
-    size_t  i;
+    size_t  i, start = 0;
     u_char  c;
 
-    if (domain->len == 0 || domain->len > 253
-        || domain->data[0] == '.'
+    if (domain->len == 0 || domain->len > 253) {
+        return NGX_ERROR;
+    }
+
+    /*
+     * D4: a leading-label wildcard "*.rest" is a legal ACME dns identifier.
+     * Accept the "*." prefix, then validate the remainder as an ordinary name
+     * (no further '*'). The store writer maps "*." to "_wildcard_." so the
+     * identifier never reaches the filesystem with a literal '*'.
+     */
+    if (domain->len >= 2 && domain->data[0] == '*' && domain->data[1] == '.') {
+        start = 2;
+    }
+
+    if (start >= domain->len                    /* "*." with an empty base */
+        || domain->data[start] == '.'           /* leading dot / empty label */
         || domain->data[domain->len - 1] == '.')
     {
         return NGX_ERROR;
     }
 
-    for (i = 0; i < domain->len; i++) {
+    for (i = start; i < domain->len; i++) {
         c = domain->data[i];
 
         if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
@@ -1761,6 +1775,8 @@ ngx_autocert_order_store(ngx_autocert_order_t *order)
     struct stat   st;
     ngx_int_t     swap;
     ngx_uint_t    certbot;
+    ngx_str_t     seg;
+    u_char        seg_buf[NGX_AUTOCERT_DOMAIN_SEG_MAX];
 
     if (order->store_path.len == 0) {
         ngx_log_error(NGX_LOG_ERR, order->log, 0,
@@ -1771,6 +1787,21 @@ ngx_autocert_order_store(ngx_autocert_order_t *order)
     if (ngx_autocert_order_domain_safe(&order->domain) != NGX_OK) {
         ngx_log_error(NGX_LOG_ERR, order->log, 0,
                       "autocert: refusing unsafe domain \"%V\" as a path",
+                      &order->domain);
+        return NGX_ERROR;
+    }
+
+    /*
+     * D4: the on-disk segment maps a wildcard "*.rest" to "_wildcard_.rest"
+     * (the literal '*' is not a legal path segment). Non-wildcard names map to
+     * themselves. The serve path + driver freshness check use the same mapping
+     * (ngx_autocert_fs_segment), so all three agree on the directory.
+     */
+    seg.data = seg_buf;
+    seg.len = ngx_autocert_fs_segment(seg_buf, sizeof(seg_buf), &order->domain);
+    if (seg.len == 0) {
+        ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                      "autocert: store segment too long for \"%V\"",
                       &order->domain);
         return NGX_ERROR;
     }
@@ -1811,9 +1842,9 @@ ngx_autocert_order_store(ngx_autocert_order_t *order)
         }
     }
 
-    /* live dir: store_path ["/live"] "/" domain "\0" */
+    /* live dir: store_path ["/live"] "/" <seg> "\0" (seg = fs-mapped name) */
     base = order->store_path.len + (certbot ? sizeof("/live") - 1 : 0)
-           + 1 + order->domain.len + 1;
+           + 1 + seg.len + 1;
     dir = ngx_pnalloc(order->pool, base);
     if (dir == NULL) {
         return NGX_ERROR;
@@ -1823,7 +1854,7 @@ ngx_autocert_order_store(ngx_autocert_order_t *order)
         p = ngx_cpymem(p, "/live", sizeof("/live") - 1);
     }
     *p++ = '/';
-    p = ngx_cpymem(p, order->domain.data, order->domain.len);
+    p = ngx_cpymem(p, seg.data, seg.len);
     *p = '\0';
 
     /* staging dir: "<live>.tmp\0" */
