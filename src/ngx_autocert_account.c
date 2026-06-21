@@ -17,9 +17,8 @@
 
 
 static ngx_int_t ngx_autocert_account_load_key(ngx_autocert_account_t *acct);
-static ngx_int_t ngx_autocert_account_save_key(ngx_autocert_account_t *acct);
-static ngx_int_t ngx_autocert_account_fsync_keydir(
-    ngx_autocert_account_t *acct);
+static ngx_int_t ngx_autocert_account_save_key(ngx_autocert_account_t *acct,
+    int dfd, const char *leaf);
 static ngx_int_t ngx_autocert_account_start(ngx_autocert_account_t *acct,
     ngx_str_t *method, ngx_str_t *url, ngx_str_t *body, ngx_str_t *ctype,
     ngx_autocert_acme_handler_pt handler);
@@ -42,6 +41,80 @@ static ngx_int_t ngx_autocert_account_build_eab(ngx_autocert_account_t *acct,
     ngx_str_t *jwk, ngx_str_t *out);
 static void ngx_autocert_account_finish(ngx_autocert_account_t *acct,
     ngx_int_t rc);
+
+
+/*
+ * TOCTOU hardening: open the directory that contains key_path with
+ * O_DIRECTORY|O_NOFOLLOW and return its fd plus a pointer to the leaf component
+ * (the basename, no '/'). The caller does openat(dirfd, leaf, ...) so neither
+ * the parent chain nor the final component can be redirected through a planted
+ * symlink between operations — the kernel resolves the leaf against the pinned
+ * directory inode. Returns -1 on failure (errno set). On success *leaf points
+ * into key_path.data (NUL-terminated original; leaf is a suffix that is itself
+ * NUL-terminated because key_path is).
+ *
+ * To close the full parent chain (not just the final parent component), the
+ * directory is opened by walking it ONE component at a time from the root:
+ * each intermediate is opened O_DIRECTORY|O_NOFOLLOW relative to the previously
+ * pinned fd, so a symlink planted at ANY ancestor (e.g. swapping "accounts")
+ * cannot redirect the descent. A single open() of the whole parent path would
+ * only protect the last component.
+ */
+static int
+ngx_autocert_account_open_keydir(ngx_autocert_account_t *acct,
+    const char **leaf)
+{
+    u_char  *path, *slash, *comp;
+    int      dfd, nfd;
+
+    path = acct->key_path.data;         /* NUL-terminated */
+
+    /* Start fd: "/" for an absolute path, "." otherwise. Both NOFOLLOW. */
+    if (path[0] == '/') {
+        dfd = open("/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        comp = path + 1;
+    } else {
+        dfd = open(".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        comp = path;
+    }
+    if (dfd == -1) {
+        ngx_log_error(NGX_LOG_ERR, acct->log, ngx_errno,
+                      "autocert: open store root failed");
+        return -1;
+    }
+
+    /* Walk each "/"-separated directory component, pinning as we go. The final
+     * component (after the last '/') is the leaf the caller opens itself. */
+    for ( ;; ) {
+        slash = (u_char *) strchr((const char *) comp, '/');
+        if (slash == NULL) {
+            /* comp is the leaf (the key filename). dfd is its pinned parent. */
+            *leaf = (const char *) comp;
+            return dfd;
+        }
+
+        if (slash == comp) {            /* empty component ("//") — skip */
+            comp = slash + 1;
+            continue;
+        }
+
+        *slash = '\0';                  /* temporarily isolate this component */
+        nfd = openat(dfd, (char *) comp,
+                     O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        {
+            ngx_err_t  err = ngx_errno;
+            *slash = '/';               /* restore key_path before any return */
+            (void) close(dfd);
+            if (nfd == -1) {
+                ngx_log_error(NGX_LOG_ERR, acct->log, err,
+                              "autocert: open key dir component failed");
+                return -1;
+            }
+        }
+        dfd = nfd;
+        comp = slash + 1;
+    }
+}
 
 
 /* Copy an ngx_str_t value into the bootstrap pool (the source aliases a
@@ -122,39 +195,58 @@ ngx_autocert_account_load_key(ngx_autocert_account_t *acct)
     ssize_t      n;
     ngx_int_t    rc;
 
+    int          dfd;
+    const char  *leaf;
+
     ngx_memzero(&file, sizeof(ngx_file_t));
     file.name = acct->key_path;
     file.log = acct->log;
 
-    /* O_NOFOLLOW: never read a key through a planted symlink. */
-    file.fd = open((const char *) acct->key_path.data,
-                   O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    /* TOCTOU: pin the parent dir (full chain walked component-by-component),
+     * open the leaf relative to it. O_NOFOLLOW on every component + the leaf:
+     * never read a key through a planted symlink at any path component. The fd
+     * is held across the ENOENT->save path so the directory the key is created
+     * in is provably the same inode we just probed (no swap window between the
+     * absence check and the O_EXCL create). */
+    dfd = ngx_autocert_account_open_keydir(acct, &leaf);
+    if (dfd == -1) {
+        return NGX_ERROR;
+    }
+    file.fd = openat(dfd, leaf, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
 
     if (file.fd == NGX_INVALID_FILE) {
-        if (ngx_errno != NGX_ENOENT) {
-            ngx_log_error(NGX_LOG_ERR, acct->log, ngx_errno,
+        ngx_err_t  err = ngx_errno;     /* close(dfd) below must not clobber it */
+
+        if (err != NGX_ENOENT) {
+            (void) close(dfd);
+            ngx_log_error(NGX_LOG_ERR, acct->log, err,
                           "autocert: open account key \"%V\" failed",
                           &acct->key_path);
             return NGX_ERROR;
         }
 
-        /* absent -> generate + persist */
+        /* absent -> generate + persist into the SAME pinned dir fd. */
         ngx_log_debug2(NGX_LOG_DEBUG_CORE, acct->log, 0,
                        "autocert: account key \"%V\" absent, generating "
                        "(key_type %ui)", &acct->key_path, acct->key_type);
         acct->key = ngx_http_autocert_key_generate(acct->key_type);
         if (acct->key == NULL) {
+            (void) close(dfd);
             ngx_log_error(NGX_LOG_ERR, acct->log, 0,
                           "autocert: account key generation failed");
             return NGX_ERROR;
         }
-        if (ngx_autocert_account_save_key(acct) != NGX_OK) {
+        if (ngx_autocert_account_save_key(acct, dfd, leaf) != NGX_OK) {
+            (void) close(dfd);
             ngx_http_autocert_key_free(acct->key);
             acct->key = NULL;
             return NGX_ERROR;
         }
+        (void) close(dfd);
         return NGX_OK;
     }
+
+    (void) close(dfd);
 
     /* present -> read whole file, parse PEM */
     {
@@ -231,12 +323,20 @@ ngx_autocert_account_load_key(ngx_autocert_account_t *acct)
 }
 
 
+/*
+ * Persist the account key. dfd is the caller's pinned parent dir fd and leaf the
+ * single-component key filename relative to it; the SAME fd was used for the
+ * load-time absence check, so there is no swap window between probe and create,
+ * and the dir fsync below is provably of the inode we wrote into. The caller
+ * owns dfd and closes it; this function never closes it.
+ */
 static ngx_int_t
-ngx_autocert_account_save_key(ngx_autocert_account_t *acct)
+ngx_autocert_account_save_key(ngx_autocert_account_t *acct, int dfd,
+    const char *leaf)
 {
-    ngx_str_t  pem;
-    ngx_fd_t   fd;
-    size_t     off;
+    ngx_str_t    pem;
+    ngx_fd_t     fd;
+    size_t       off;
 
     if (ngx_http_autocert_key_to_pem(acct->pool, acct->key, &pem) != NGX_OK) {
         return NGX_ERROR;
@@ -248,14 +348,13 @@ ngx_autocert_account_save_key(ngx_autocert_account_t *acct)
 
     /*
      * Exclusive create at 0600, no symlink follow: never world-readable, never
-     * clobber an existing key, never be redirected through a planted symlink.
-     * O_EXCL is the point — this is only reached when the load open returned
-     * ENOENT, so the file should not exist; if it now does (race) we bail
-     * rather than overwrite. Raw open() because nginx has no portable EXCL/
-     * NOFOLLOW open macro; the helper is unix-only like the rest of this file.
+     * clobber an existing key, never be redirected through a planted symlink at
+     * the leaf (parent chain is pinned by dfd). O_EXCL is the point — this is
+     * only reached when the load open returned ENOENT, so the file should not
+     * exist; if it now does (race) we bail rather than overwrite.
      */
-    fd = open((const char *) acct->key_path.data,
-              O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    fd = openat(dfd, leaf,
+                O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (fd == NGX_INVALID_FILE) {
         ngx_log_error(NGX_LOG_ERR, acct->log, ngx_errno,
                       "autocert: create account key \"%V\" failed",
@@ -274,7 +373,7 @@ ngx_autocert_account_save_key(ngx_autocert_account_t *acct)
                           "autocert: write account key \"%V\" failed",
                           &acct->key_path);
             ngx_close_file(fd);
-            (void) ngx_delete_file(acct->key_path.data);  /* no partial key */
+            (void) unlinkat(dfd, leaf, 0);                /* no partial key */
             return NGX_ERROR;
         }
         off += (size_t) n;
@@ -291,7 +390,7 @@ ngx_autocert_account_save_key(ngx_autocert_account_t *acct)
                       "autocert: fsync account key \"%V\" failed",
                       &acct->key_path);
         ngx_close_file(fd);
-        (void) ngx_delete_file(acct->key_path.data);
+        (void) unlinkat(dfd, leaf, 0);
         return NGX_ERROR;
     }
 
@@ -299,81 +398,26 @@ ngx_autocert_account_save_key(ngx_autocert_account_t *acct)
         ngx_log_error(NGX_LOG_ERR, acct->log, ngx_errno,
                       "autocert: close account key \"%V\" failed",
                       &acct->key_path);
-        (void) ngx_delete_file(acct->key_path.data);
+        (void) unlinkat(dfd, leaf, 0);
         return NGX_ERROR;
     }
 
-    /* Best-effort: fsync the containing directory so the new key's dentry is
-     * durable too (otherwise a crash after the file fsync but before the
-     * directory metadata reaches disk could leave the key unreferenced). The
-     * key file itself is already fully written + fsynced + closed, so a dir
-     * fsync failure (e.g. a filesystem that rejects directory fsync) must NOT
-     * delete it or fail the save -- just warn. */
-    (void) ngx_autocert_account_fsync_keydir(acct);
-
-    ngx_log_error(NGX_LOG_NOTICE, acct->log, 0,
-                  "autocert: generated + saved account key \"%V\"",
-                  &acct->key_path);
-    return NGX_OK;
-}
-
-
-/*
- * fsync the directory that contains acct->key_path, so the key file's directory
- * entry is durable. key_path is NUL-terminated; the parent is the substring up
- * to the last '/', or "." if there is none.
- */
-static ngx_int_t
-ngx_autocert_account_fsync_keydir(ngx_autocert_account_t *acct)
-{
-    u_char  *slash, *dir;
-    size_t   dlen;
-    int      fd;
-
-    slash = (u_char *) strrchr((const char *) acct->key_path.data, '/');
-
-    if (slash == NULL) {
-        dir = (u_char *) ".";
-
-    } else {
-        dlen = (size_t) (slash - acct->key_path.data);
-        if (dlen == 0) {
-            dlen = 1;                   /* key at "/foo" -> parent is "/" */
-        }
-        dir = ngx_pnalloc(acct->pool, dlen + 1);
-        if (dir == NULL) {
-            return NGX_ERROR;
-        }
-        ngx_memcpy(dir, acct->key_path.data, dlen);
-        dir[dlen] = '\0';
-    }
-
-    fd = open((const char *) dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (fd == -1) {
-        ngx_log_error(NGX_LOG_WARN, acct->log, ngx_errno,
-                      "autocert: open(\"%s\") to fsync key dir failed "
-                      "(best-effort)", dir);
-        return NGX_ERROR;
-    }
-
-    while (fsync(fd) != 0) {
+    /* Best-effort: fsync the containing directory (the pinned dfd) so the new
+     * key's dentry is durable too. The key file itself is already fully
+     * written + fsynced + closed, so a dir fsync failure (e.g. a filesystem
+     * that rejects directory fsync) must NOT delete it or fail the save. */
+    while (fsync(dfd) != 0) {
         if (ngx_errno == NGX_EINTR) {
             continue;
         }
         ngx_log_error(NGX_LOG_WARN, acct->log, ngx_errno,
-                      "autocert: fsync key dir \"%s\" failed (best-effort)",
-                      dir);
-        (void) close(fd);
-        return NGX_ERROR;
+                      "autocert: fsync key dir failed (best-effort)");
+        break;
     }
 
-    if (close(fd) == -1) {
-        ngx_log_error(NGX_LOG_WARN, acct->log, ngx_errno,
-                      "autocert: close key dir \"%s\" after fsync failed",
-                      dir);
-        return NGX_ERROR;
-    }
-
+    ngx_log_error(NGX_LOG_NOTICE, acct->log, 0,
+                  "autocert: generated + saved account key \"%V\"",
+                  &acct->key_path);
     return NGX_OK;
 }
 

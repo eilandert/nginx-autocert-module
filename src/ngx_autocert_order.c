@@ -34,7 +34,52 @@
 #ifndef RENAME_EXCHANGE
 #define RENAME_EXCHANGE (1 << 1)
 #endif
+#ifndef RENAME_NOREPLACE
+#define RENAME_NOREPLACE (1 << 0)
 #endif
+#endif
+
+
+/*
+ * TOCTOU hardening: every store mutation is performed through a directory fd
+ * pinned with O_DIRECTORY|O_NOFOLLOW (ngx_autocert_open_dir) and *at() syscalls
+ * relative to it. Pinning the container inode means an attacker who can swap a
+ * path *component* (e.g. replace <store>/live with a symlink between two path
+ * lookups) cannot redirect a subsequent mkdir/rename/open: the kernel resolves
+ * the leaf against the already-opened inode, not the swapped name. Leaf
+ * components are single names (no '/'), so they cannot themselves traverse.
+ */
+
+/* renameat2 via syscall (no glibc wrapper dependency); NGX_DECLINED when the
+ * flag/syscall is unsupported so the caller can fall back. */
+static ngx_int_t
+ngx_autocert_renameat2(int oldfd, const char *oldp, int newfd,
+    const char *newp, unsigned int flags)
+{
+#if defined(__linux__) && defined(SYS_renameat2)
+    if (syscall(SYS_renameat2, oldfd, oldp, newfd, newp, flags) == 0) {
+        return NGX_OK;
+    }
+    if (ngx_errno == NGX_ENOSYS || ngx_errno == EINVAL
+        || ngx_errno == ENOTTY || ngx_errno == EOPNOTSUPP)
+    {
+        return NGX_DECLINED;
+    }
+    return NGX_ERROR;
+#else
+    return NGX_DECLINED;
+#endif
+}
+
+
+/* Open a directory by path with O_DIRECTORY|O_NOFOLLOW so the final component is
+ * never a followed symlink and the result is guaranteed to be a directory inode.
+ * Returns the fd, or -1 (errno set: ELOOP=symlink, ENOTDIR=file, ENOENT=absent). */
+static int
+ngx_autocert_open_dir(const char *path)
+{
+    return open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+}
 
 
 /* Authorization poll: up to ~180 tries, 1s apart. Pebble validates fast, but
@@ -73,13 +118,13 @@ static void ngx_autocert_order_download_done(
 static ngx_int_t ngx_autocert_order_store(ngx_autocert_order_t *order);
 static ngx_int_t ngx_autocert_order_domain_safe(ngx_str_t *domain);
 static ngx_int_t ngx_autocert_order_domain_identifier_safe(ngx_str_t *domain);
-static ngx_int_t ngx_autocert_order_write_tmp(ngx_autocert_order_t *order,
-    u_char *tmp, ngx_str_t *data, ngx_uint_t mode);
-static ngx_int_t ngx_autocert_order_fsync_dir(ngx_autocert_order_t *order,
-    const char *dir);
-static void ngx_autocert_order_rm_staging(u_char *staging);
-static ngx_int_t ngx_autocert_order_swap_dirs(ngx_autocert_order_t *order,
-    u_char *staging, u_char *dir);
+static ngx_int_t ngx_autocert_order_write_tmp_at(ngx_autocert_order_t *order,
+    int sfd, const char *leaf, ngx_str_t *data, ngx_uint_t mode);
+static ngx_int_t ngx_autocert_order_fsync_dirfd(ngx_autocert_order_t *order,
+    int fd, const char *label);
+static void ngx_autocert_order_rm_staging_at(int cfd, const char *leaf);
+static ngx_int_t ngx_autocert_order_swap_dirs_at(ngx_autocert_order_t *order,
+    int cfd, const char *staging, const char *dir);
 static ngx_int_t ngx_autocert_order_publish_alpn(ngx_autocert_order_t *order);
 static ngx_int_t ngx_autocert_order_publish_dns(ngx_autocert_order_t *order);
 static ngx_int_t ngx_autocert_order_dns_hook(ngx_autocert_order_t *order,
@@ -1766,14 +1811,27 @@ ngx_autocert_order_split_chain(ngx_str_t *full, ngx_str_t *leaf, ngx_str_t *rest
 }
 
 
+/*
+ * Commit the issued pair into the store. TOCTOU-hardened: a single container
+ * directory fd (cfd) is pinned with O_DIRECTORY|O_NOFOLLOW and every mutation
+ * (mkdirat / openat / renameat2 / fstatat / unlinkat) is performed relative to
+ * it on single-component leaf names. Because the kernel resolves each leaf
+ * against the already-opened container inode rather than re-walking the path,
+ * an attacker who swaps a path component between two operations cannot redirect
+ * a write outside the store. The container is <store_path> (secure layout) or
+ * <store_path>/live (certbot layout); both are opened NOFOLLOW so the container
+ * itself can never be a planted symlink.
+ */
 static ngx_int_t
 ngx_autocert_order_store(ngx_autocert_order_t *order)
 {
-    u_char       *dir, *staging, *store_dir, *skey, *schain, *p;
-    u_char       *scert, *schn;
-    size_t        base, slen;
+    u_char       *cdir, *p;
+    u_char        dir[NGX_AUTOCERT_DOMAIN_SEG_MAX + 1];
+    u_char        staging[NGX_AUTOCERT_DOMAIN_SEG_MAX + sizeof(".tmp")];
+    int           cfd, sfd;
+    size_t        clen;
     struct stat   st;
-    ngx_int_t     swap;
+    ngx_int_t     rc, swap;
     ngx_uint_t    certbot;
     ngx_str_t     seg;
     u_char        seg_buf[NGX_AUTOCERT_DOMAIN_SEG_MAX];
@@ -1807,131 +1865,145 @@ ngx_autocert_order_store(ngx_autocert_order_t *order)
     }
 
     /*
-     * Per-domain dir. secure: <store_path>/<domain>. certbot: a flat
-     * <store_path>/live/<domain> (real files, no archive/ + symlinks); the
-     * intermediate <store_path>/live must exist first. Either way the atomic
-     * staging-dir swap below operates on this dir + its "<dir>.tmp" sibling.
+     * Container dir path. secure: <store_path>. certbot: <store_path>/live —
+     * the per-domain live dirs sit flat under live/ (no archive/ + symlinks).
+     * Either way the leaf is <seg> and the staging sibling is "<seg>.tmp".
      */
     certbot = (order->store == NGX_HTTP_AUTOCERT_STORE_CERTBOT);
 
+    clen = order->store_path.len + (certbot ? sizeof("/live") - 1 : 0);
+    cdir = ngx_pnalloc(order->pool, clen + 1);
+    if (cdir == NULL) {
+        return NGX_ERROR;
+    }
+    p = ngx_cpymem(cdir, order->store_path.data, order->store_path.len);
     if (certbot) {
-        u_char  *live;
+        p = ngx_cpymem(p, "/live", sizeof("/live") - 1);
+    }
+    *p = '\0';
 
-        /* <store_path>/live\0 — created 0755 if absent (the parent of all the
-         * per-domain live dirs). EEXIST is fine; anything else is fatal. */
-        live = ngx_pnalloc(order->pool,
-                           order->store_path.len + sizeof("/live"));
-        if (live == NULL) {
+    /*
+     * Pin the container inode. O_NOFOLLOW rejects a planted symlink at the
+     * final component; O_DIRECTORY rejects a non-directory. Every store mutation
+     * below is *at()-relative to this fd.
+     *
+     * certbot: <store_path>/live is created (0755) and pinned via mkdirat/openat
+     * relative to a freshly-pinned <store_path> fd — never path-based, so a
+     * swapped <store_path> component cannot redirect the live/ creation either.
+     */
+    if (certbot) {
+        int      bfd;
+        u_char  *base;
+
+        /* NUL-terminated <store_path> (store_path.data may not be). */
+        base = ngx_pnalloc(order->pool, order->store_path.len + 1);
+        if (base == NULL) {
             return NGX_ERROR;
         }
-        p = ngx_cpymem(live, order->store_path.data, order->store_path.len);
-        ngx_memcpy(p, "/live", sizeof("/live"));
-        if (mkdir((char *) live, 0755) == -1) {
-            if (ngx_errno != NGX_EEXIST) {
-                ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
-                              "autocert: mkdir(\"%s\") failed", live);
-                return NGX_ERROR;
-            }
-            /* Already there: it must be a real directory, not a symlink an
-             * attacker planted to redirect all per-domain writes under live/. */
-            if (lstat((char *) live, &st) == -1 || !S_ISDIR(st.st_mode)) {
-                ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
-                              "autocert: \"%s\" is not a directory", live);
-                return NGX_ERROR;
-            }
+        p = ngx_cpymem(base, order->store_path.data, order->store_path.len);
+        *p = '\0';
+
+        bfd = ngx_autocert_open_dir((char *) base);
+        if (bfd == -1) {
+            ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
+                          "autocert: open store dir \"%V\" failed",
+                          &order->store_path);
+            return NGX_ERROR;
+        }
+        if (mkdirat(bfd, "live", 0755) == -1 && ngx_errno != NGX_EEXIST) {
+            ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
+                          "autocert: mkdir(\"%s\") failed", cdir);
+            (void) close(bfd);
+            return NGX_ERROR;
+        }
+        cfd = openat(bfd, "live",
+                     O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        (void) close(bfd);
+        if (cfd == -1) {
+            ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
+                          "autocert: open store dir \"%s\" failed", cdir);
+            return NGX_ERROR;
+        }
+
+    } else {
+        cfd = ngx_autocert_open_dir((char *) cdir);
+        if (cfd == -1) {
+            ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
+                          "autocert: open store dir \"%s\" failed", cdir);
+            return NGX_ERROR;
         }
     }
 
-    /* live dir: store_path ["/live"] "/" <seg> "\0" (seg = fs-mapped name) */
-    base = order->store_path.len + (certbot ? sizeof("/live") - 1 : 0)
-           + 1 + seg.len + 1;
-    dir = ngx_pnalloc(order->pool, base);
-    if (dir == NULL) {
+    /* Leaf names (single component, no '/'): "<seg>" and "<seg>.tmp". */
+    if (seg.len + sizeof(".tmp") > sizeof(staging)) {
+        ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                      "autocert: store segment too long for \"%V\"",
+                      &order->domain);
+        (void) close(cfd);
         return NGX_ERROR;
     }
-    p = ngx_cpymem(dir, order->store_path.data, order->store_path.len);
-    if (certbot) {
-        p = ngx_cpymem(p, "/live", sizeof("/live") - 1);
-    }
-    *p++ = '/';
-    p = ngx_cpymem(p, seg.data, seg.len);
-    *p = '\0';
-
-    /* staging dir: "<live>.tmp\0" */
-    slen = base - 1 + sizeof(".tmp");
-    staging = ngx_pnalloc(order->pool, slen);
-    if (staging == NULL) {
-        return NGX_ERROR;
-    }
-    p = ngx_cpymem(staging, dir, base - 1);
+    ngx_memcpy(dir, seg.data, seg.len);
+    dir[seg.len] = '\0';
+    p = ngx_cpymem(staging, seg.data, seg.len);
     ngx_memcpy(p, ".tmp", sizeof(".tmp"));
 
-    /* staging files */
-    skey = ngx_pnalloc(order->pool, slen - 1 + sizeof("/privkey.pem"));
-    schain = ngx_pnalloc(order->pool, slen - 1 + sizeof("/fullchain.pem"));
-    if (skey == NULL || schain == NULL) {
-        return NGX_ERROR;
-    }
-    p = ngx_cpymem(skey, staging, slen - 1);
-    ngx_memcpy(p, "/privkey.pem", sizeof("/privkey.pem"));
-    p = ngx_cpymem(schain, staging, slen - 1);
-    ngx_memcpy(p, "/fullchain.pem", sizeof("/fullchain.pem"));
-
-    /* NUL-terminated parent dir for the post-rename fsync: the directory that
-     * actually holds the renamed <domain> entry. secure: <store_path>;
-     * certbot: <store_path>/live (the commit renames into live/, so fsyncing
-     * <store_path> wouldn't make the new entry durable). */
-    store_dir = ngx_pnalloc(order->pool,
-                            order->store_path.len
-                            + (certbot ? sizeof("/live") - 1 : 0) + 1);
-    if (store_dir == NULL) {
-        return NGX_ERROR;
-    }
-    p = ngx_cpymem(store_dir, order->store_path.data, order->store_path.len);
-    if (certbot) {
-        p = ngx_cpymem(p, "/live", sizeof("/live") - 1);
-    }
-    *p = '\0';
-
     /* Clear any staging dir a previous crash left behind, then create a fresh
-     * one we own (0700). After the cleanup the mkdir must succeed; EEXIST means
-     * something raced/planted it, so refuse. */
-    ngx_autocert_order_rm_staging(staging);
+     * one we own (0700) relative to the pinned container. */
+    ngx_autocert_order_rm_staging_at(cfd, (char *) staging);
 
-    if (mkdir((char *) staging, 0700) == -1) {
+    if (mkdirat(cfd, (char *) staging, 0700) == -1) {
         ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
                       "autocert: mkdir(\"%s\") failed", staging);
-        return NGX_ERROR;
-    }
-    /* Must be a real dir we just made, not a pre-planted symlink. */
-    if (lstat((char *) staging, &st) == -1 || !S_ISDIR(st.st_mode)) {
-        ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
-                      "autocert: staging \"%s\" is not a directory", staging);
-        ngx_autocert_order_rm_staging(staging);
+        (void) close(cfd);
         return NGX_ERROR;
     }
 
-    /* Write + fsync both PEMs into the staging dir. */
-    if (ngx_autocert_order_write_tmp(order, skey, &order->cert_key_pem, 0600)
-        != NGX_OK)
-    {
-        ngx_autocert_order_rm_staging(staging);
+    /* Re-open the staging dir we just made, NOFOLLOW, and verify it is a real
+     * directory (defeats a swap of "<seg>.tmp" between mkdirat and this open).
+     * All PEM writes go *at()-relative to this staging fd. */
+    sfd = openat(cfd, (char *) staging,
+                 O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (sfd == -1) {
+        ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
+                      "autocert: open staging \"%s\" failed", staging);
+        ngx_autocert_order_rm_staging_at(cfd, (char *) staging);
+        (void) close(cfd);
         return NGX_ERROR;
     }
-    if (ngx_autocert_order_write_tmp(order, schain, &order->cert_chain, 0644)
-        != NGX_OK)
-    {
-        ngx_autocert_order_rm_staging(staging);
+    if (fstat(sfd, &st) == -1 || !S_ISDIR(st.st_mode)) {
+        ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
+                      "autocert: staging \"%s\" is not a directory", staging);
+        (void) close(sfd);
+        ngx_autocert_order_rm_staging_at(cfd, (char *) staging);
+        (void) close(cfd);
         return NGX_ERROR;
+    }
+
+#define NGX_AUTOCERT_STORE_FAIL()                                            \
+    do {                                                                     \
+        (void) close(sfd);                                                   \
+        ngx_autocert_order_rm_staging_at(cfd, (char *) staging);            \
+        (void) close(cfd);                                                   \
+        return NGX_ERROR;                                                    \
+    } while (0)
+
+    /* Write + fsync both PEMs into the staging dir (openat O_NOFOLLOW leaves). */
+    if (ngx_autocert_order_write_tmp_at(order, sfd, "privkey.pem",
+                                        &order->cert_key_pem, 0600) != NGX_OK)
+    {
+        NGX_AUTOCERT_STORE_FAIL();
+    }
+    if (ngx_autocert_order_write_tmp_at(order, sfd, "fullchain.pem",
+                                        &order->cert_chain, 0644) != NGX_OK)
+    {
+        NGX_AUTOCERT_STORE_FAIL();
     }
 
     /*
      * certbot layout also ships cert.pem (the leaf alone) and chain.pem (the
      * intermediates alone) beside privkey.pem + fullchain.pem. Split the
-     * downloaded fullchain at the end of the first certificate: everything up
-     * to and including the first "-----END CERTIFICATE-----" line is the leaf,
-     * the remainder is the chain. (We only SERVE fullchain+privkey, so this is
-     * purely for certbot-tool compatibility.)
+     * downloaded fullchain at the end of the first certificate. (We only SERVE
+     * fullchain+privkey; this is purely for certbot-tool compatibility.)
      */
     if (certbot) {
         ngx_str_t  leaf, rest;
@@ -1942,54 +2014,68 @@ ngx_autocert_order_store(ngx_autocert_order_t *order)
             ngx_log_error(NGX_LOG_ERR, order->log, 0,
                           "autocert: cannot split fullchain for \"%V\"",
                           &order->domain);
-            ngx_autocert_order_rm_staging(staging);
-            return NGX_ERROR;
+            NGX_AUTOCERT_STORE_FAIL();
         }
 
-        scert = ngx_pnalloc(order->pool, slen - 1 + sizeof("/cert.pem"));
-        schn  = ngx_pnalloc(order->pool, slen - 1 + sizeof("/chain.pem"));
-        if (scert == NULL || schn == NULL) {
-            ngx_autocert_order_rm_staging(staging);
-            return NGX_ERROR;
-        }
-        p = ngx_cpymem(scert, staging, slen - 1);
-        ngx_memcpy(p, "/cert.pem", sizeof("/cert.pem"));
-        p = ngx_cpymem(schn, staging, slen - 1);
-        ngx_memcpy(p, "/chain.pem", sizeof("/chain.pem"));
-
-        if (ngx_autocert_order_write_tmp(order, scert, &leaf, 0644) != NGX_OK
-            || ngx_autocert_order_write_tmp(order, schn, &rest, 0644) != NGX_OK)
+        if (ngx_autocert_order_write_tmp_at(order, sfd, "cert.pem", &leaf,
+                                            0644) != NGX_OK
+            || ngx_autocert_order_write_tmp_at(order, sfd, "chain.pem", &rest,
+                                               0644) != NGX_OK)
         {
-            ngx_autocert_order_rm_staging(staging);
-            return NGX_ERROR;
+            NGX_AUTOCERT_STORE_FAIL();
         }
     }
 
     /* fsync the staging dir so its new entries are durable before the swap. */
-    if (ngx_autocert_order_fsync_dir(order, (char *) staging) != NGX_OK) {
-        ngx_autocert_order_rm_staging(staging);
-        return NGX_ERROR;
+    if (ngx_autocert_order_fsync_dirfd(order, sfd, (char *) staging) != NGX_OK) {
+        NGX_AUTOCERT_STORE_FAIL();
     }
+    (void) close(sfd);
+    sfd = -1;
 
-    /* Commit. */
-    if (lstat((char *) dir, &st) == -1) {
+#undef NGX_AUTOCERT_STORE_FAIL
+
+    /* Commit, relative to the pinned container. fstatat NOFOLLOW so a planted
+     * symlink at "<seg>" is detected, not followed. */
+    if (fstatat(cfd, (char *) dir, &st, AT_SYMLINK_NOFOLLOW) == -1) {
 
         if (ngx_errno != NGX_ENOENT) {
             ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
                           "autocert: lstat(\"%s\") failed", dir);
-            ngx_autocert_order_rm_staging(staging);
+            ngx_autocert_order_rm_staging_at(cfd, (char *) staging);
+            (void) close(cfd);
             return NGX_ERROR;
         }
 
-        /* First issuance: no live dir -> move staging into place atomically. */
-        if (rename((char *) staging, (char *) dir) == -1) {
+        /* First issuance: no live dir -> move staging into place atomically,
+         * never replacing an existing entry that raced in (RENAME_NOREPLACE).
+         * We do NOT fall back to a plain renameat() when the flag is
+         * unsupported: without RENAME_NOREPLACE a destination that raced in
+         * after the fstatat would be clobbered. On an old kernel/fs (renameat2
+         * is Linux 3.15+) we defer and let renewal retry, same as the
+         * RENAME_EXCHANGE-unsupported renewal path. */
+        rc = ngx_autocert_renameat2(cfd, (char *) staging, cfd, (char *) dir,
+                                    RENAME_NOREPLACE);
+        if (rc == NGX_DECLINED) {
+            ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                          "autocert: RENAME_NOREPLACE unsupported; cannot "
+                          "atomically commit \"%s\" without risking a clobber; "
+                          "deferring", dir);
+            ngx_autocert_order_rm_staging_at(cfd, (char *) staging);
+            (void) close(cfd);
+            return NGX_ERROR;
+        }
+        if (rc != NGX_OK) {
             ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
                           "autocert: rename(\"%s\" -> \"%s\") failed",
                           staging, dir);
-            ngx_autocert_order_rm_staging(staging);
+            ngx_autocert_order_rm_staging_at(cfd, (char *) staging);
+            (void) close(cfd);
             return NGX_ERROR;
         }
-        return ngx_autocert_order_fsync_dir(order, (char *) store_dir);
+        rc = ngx_autocert_order_fsync_dirfd(order, cfd, (char *) cdir);
+        (void) close(cfd);
+        return rc;
     }
 
     /* Live path exists: it must be a real directory, not a file/symlink an
@@ -1997,19 +2083,24 @@ ngx_autocert_order_store(ngx_autocert_order_t *order)
     if (!S_ISDIR(st.st_mode)) {
         ngx_log_error(NGX_LOG_ERR, order->log, 0,
                       "autocert: store path \"%s\" is not a directory", dir);
-        ngx_autocert_order_rm_staging(staging);
+        ngx_autocert_order_rm_staging_at(cfd, (char *) staging);
+        (void) close(cfd);
         return NGX_ERROR;
     }
 
-    swap = ngx_autocert_order_swap_dirs(order, staging, dir);
+    swap = ngx_autocert_order_swap_dirs_at(order, cfd, (char *) staging,
+                                           (char *) dir);
 
     if (swap == NGX_OK) {
         /* staging now holds the OLD pair; drop it. */
-        ngx_autocert_order_rm_staging(staging);
-        return ngx_autocert_order_fsync_dir(order, (char *) store_dir);
+        ngx_autocert_order_rm_staging_at(cfd, (char *) staging);
+        rc = ngx_autocert_order_fsync_dirfd(order, cfd, (char *) cdir);
+        (void) close(cfd);
+        return rc;
     }
 
-    ngx_autocert_order_rm_staging(staging);
+    ngx_autocert_order_rm_staging_at(cfd, (char *) staging);
+    (void) close(cfd);
 
     if (swap == NGX_ERROR) {
         return NGX_ERROR;
@@ -2032,27 +2123,15 @@ ngx_autocert_order_store(ngx_autocert_order_t *order)
 }
 
 
-/* fsync a directory by path so a preceding rename/create in it is durable. */
+/* fsync an open directory fd so a preceding rename/create in it is durable.
+ * Does not close the fd (caller owns it). */
 static ngx_int_t
-ngx_autocert_order_fsync_dir(ngx_autocert_order_t *order, const char *dir)
+ngx_autocert_order_fsync_dirfd(ngx_autocert_order_t *order, int fd,
+    const char *label)
 {
-    int  fd;
-
-    fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (fd == -1) {
-        ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
-                      "autocert: open(\"%s\") for fsync failed", dir);
-        return NGX_ERROR;
-    }
     if (fsync(fd) == -1) {
         ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
-                      "autocert: fsync(\"%s\") failed", dir);
-        (void) close(fd);
-        return NGX_ERROR;
-    }
-    if (close(fd) == -1) {
-        ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
-                      "autocert: close(\"%s\") after fsync failed", dir);
+                      "autocert: fsync(\"%s\") failed", label);
         return NGX_ERROR;
     }
     return NGX_OK;
@@ -2060,106 +2139,97 @@ ngx_autocert_order_fsync_dir(ngx_autocert_order_t *order, const char *dir)
 
 
 /*
- * Best-effort removal of the staging dir and its two known files. Opened
- * O_NOFOLLOW so a planted symlink at "<domain>.tmp" is never followed: children
- * are unlinked relative to the verified directory fd (unlinkat), and if the path
- * is itself a symlink / non-directory it is unlinked as a plain entry so the
- * caller's mkdir can proceed.
+ * Best-effort removal of the staging dir <leaf> and its known files, all
+ * relative to the pinned container dir fd. The staging dir is opened
+ * O_NOFOLLOW via openat so a planted symlink at "<leaf>" is never followed:
+ * children are unlinked relative to the verified directory fd, and if the entry
+ * is itself a symlink / non-directory it is unlinkat'd as a plain entry so the
+ * caller's mkdirat can proceed.
  */
 static void
-ngx_autocert_order_rm_staging(u_char *staging)
+ngx_autocert_order_rm_staging_at(int cfd, const char *leaf)
 {
     int  fd;
 
-    fd = open((char *) staging,
-              O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    fd = openat(cfd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (fd == -1) {
         if (ngx_errno == NGX_ENOENT) {
             return;                     /* nothing there */
         }
         /* symlink (ELOOP), a file (ENOTDIR), etc. — remove the entry itself,
-         * without following it. */
-        (void) unlink((char *) staging);
+         * relative to the pinned dir, without following it. */
+        (void) unlinkat(cfd, leaf, 0);
         return;
     }
 
     /* Remove every file either layout can leave here: secure has privkey +
      * fullchain; certbot adds cert + chain. unlinkat on an absent name is a
      * harmless ENOENT, so always try all four (else a leftover cert.pem/
-     * chain.pem keeps rmdir failing and blocks the next renewal's mkdir). */
+     * chain.pem keeps rmdir failing and blocks the next renewal's mkdirat). */
     (void) unlinkat(fd, "privkey.pem", 0);
     (void) unlinkat(fd, "fullchain.pem", 0);
     (void) unlinkat(fd, "cert.pem", 0);
     (void) unlinkat(fd, "chain.pem", 0);
     (void) close(fd);
-    (void) rmdir((char *) staging);
+    (void) unlinkat(cfd, leaf, AT_REMOVEDIR);
 }
 
 
 /*
- * Atomically swap the staging dir with the live dir via
- * renameat2(RENAME_EXCHANGE). Returns NGX_OK on success, NGX_DECLINED when the
- * kernel/filesystem does not support the flag (caller falls back), NGX_ERROR on
- * any other failure.
+ * Atomically swap the staging leaf with the live leaf via
+ * renameat2(RENAME_EXCHANGE), both relative to the pinned container dir fd.
+ * Returns NGX_OK on success, NGX_DECLINED when the kernel/filesystem does not
+ * support the flag (caller falls back), NGX_ERROR on any other failure.
  */
 static ngx_int_t
-ngx_autocert_order_swap_dirs(ngx_autocert_order_t *order, u_char *staging,
-    u_char *dir)
+ngx_autocert_order_swap_dirs_at(ngx_autocert_order_t *order, int cfd,
+    const char *staging, const char *dir)
 {
-#if defined(__linux__) && defined(SYS_renameat2)
-    if (syscall(SYS_renameat2, AT_FDCWD, (char *) staging,
-                AT_FDCWD, (char *) dir, RENAME_EXCHANGE)
-        == 0)
-    {
-        return NGX_OK;
-    }
+    ngx_int_t  rc;
 
-    /* ENOSYS: kernel too old; EINVAL/ENOTTY/EOPNOTSUPP: filesystem lacks the
-     * flag. All mean "unsupported here" -> let the caller fall back. */
-    if (ngx_errno == NGX_ENOSYS || ngx_errno == EINVAL
-        || ngx_errno == ENOTTY || ngx_errno == EOPNOTSUPP)
-    {
-        ngx_log_debug1(NGX_LOG_DEBUG_CORE, order->log, 0,
-                       "autocert: RENAME_EXCHANGE unsupported (%d), "
-                       "falling back to sequential rename", (int) ngx_errno);
+    rc = ngx_autocert_renameat2(cfd, staging, cfd, dir, RENAME_EXCHANGE);
+
+    if (rc == NGX_DECLINED) {
+        ngx_log_debug0(NGX_LOG_DEBUG_CORE, order->log, 0,
+                       "autocert: RENAME_EXCHANGE unsupported, "
+                       "falling back to sequential rename");
         return NGX_DECLINED;
     }
-
-    ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
-                  "autocert: renameat2(RENAME_EXCHANGE \"%s\" <-> \"%s\") "
-                  "failed", staging, dir);
-    return NGX_ERROR;
-#else
-    return NGX_DECLINED;
-#endif
+    if (rc == NGX_ERROR) {
+        ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
+                      "autocert: renameat2(RENAME_EXCHANGE \"%s\" <-> \"%s\") "
+                      "failed", staging, dir);
+    }
+    return rc;
 }
 
 
-/* Write data to an already-built <tmp> path (mode), force perms, fsync, close.
- * Leaves the temp in place for the caller to rename; unlinks it on failure. */
+/* Write data to <leaf> inside the pinned staging dir fd (mode), force perms,
+ * fsync, close. Leaves the file in place for the caller; unlinks it on failure.
+ * O_NOFOLLOW guards the leaf component; the dir fd guards the parent chain. */
 static ngx_int_t
-ngx_autocert_order_write_tmp(ngx_autocert_order_t *order, u_char *tmp,
-    ngx_str_t *data, ngx_uint_t mode)
+ngx_autocert_order_write_tmp_at(ngx_autocert_order_t *order, int sfd,
+    const char *leaf, ngx_str_t *data, ngx_uint_t mode)
 {
     int      fd;
     size_t   off;
     ssize_t  n;
 
-    fd = open((char *) tmp,
-              O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,
-              (mode_t) mode);
+    fd = openat(sfd, leaf,
+                O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,
+                (mode_t) mode);
     if (fd == -1) {
         ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
-                      "autocert: open(\"%s\") failed", tmp);
+                      "autocert: open(\"%s\") failed", leaf);
         return NGX_ERROR;
     }
 
     /* O_CREAT honours umask; force the intended perms regardless. */
     if (fchmod(fd, (mode_t) mode) == -1) {
         ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
-                      "autocert: fchmod(\"%s\") failed", tmp);
+                      "autocert: fchmod(\"%s\") failed", leaf);
         (void) close(fd);
-        (void) unlink((char *) tmp);
+        (void) unlinkat(sfd, leaf, 0);
         return NGX_ERROR;
     }
 
@@ -2171,33 +2241,33 @@ ngx_autocert_order_write_tmp(ngx_autocert_order_t *order, u_char *tmp,
                 continue;
             }
             ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
-                          "autocert: write(\"%s\") failed", tmp);
+                          "autocert: write(\"%s\") failed", leaf);
             (void) close(fd);
-            (void) unlink((char *) tmp);
+            (void) unlinkat(sfd, leaf, 0);
             return NGX_ERROR;
         }
         if (n == 0) {
             /* zero progress on a non-empty remainder — fail rather than spin. */
             ngx_log_error(NGX_LOG_ERR, order->log, 0,
-                          "autocert: write(\"%s\") made no progress", tmp);
+                          "autocert: write(\"%s\") made no progress", leaf);
             (void) close(fd);
-            (void) unlink((char *) tmp);
+            (void) unlinkat(sfd, leaf, 0);
             return NGX_ERROR;
         }
     }
 
     if (fsync(fd) == -1) {
         ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
-                      "autocert: fsync(\"%s\") failed", tmp);
+                      "autocert: fsync(\"%s\") failed", leaf);
         (void) close(fd);
-        (void) unlink((char *) tmp);
+        (void) unlinkat(sfd, leaf, 0);
         return NGX_ERROR;
     }
 
     if (close(fd) == -1) {
         ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
-                      "autocert: close(\"%s\") failed", tmp);
-        (void) unlink((char *) tmp);
+                      "autocert: close(\"%s\") failed", leaf);
+        (void) unlinkat(sfd, leaf, 0);
         return NGX_ERROR;
     }
 

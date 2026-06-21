@@ -27,8 +27,10 @@
 #include <ngx_event.h>
 
 #include <sys/file.h>          /* flock(2) — interprocess singleton gate */
-#include <sys/stat.h>          /* mkdir(2) — M3 per-CA account dirs */
-#include <fcntl.h>             /* AT_FDCWD — M3 atomic key migration */
+#include <sys/stat.h>          /* mkdirat(2) — M3 per-CA account dirs */
+#include <fcntl.h>             /* openat/AT_* — M3 atomic key migration */
+#include <unistd.h>            /* close(2), renameat(2) */
+#include <errno.h>             /* EINVAL/ENOTTY/EOPNOTSUPP for renameat2 */
 
 /*
  * M3: migrate the legacy account key with RENAME_NOREPLACE so it can never
@@ -146,54 +148,64 @@ static ngx_event_t                  ngx_autocert_relock_timer;
 
 
 /*
- * M3: rename old->new without ever replacing an existing new (RENAME_NOREPLACE).
- * Returns NGX_OK on success; NGX_ERROR otherwise with ngx_errno set (EEXIST when
- * new already exists). Falls back to plain rename() only where renameat2 is
- * unavailable (old kernel) — the caller's prior ENOENT check bounds that race.
+ * M3 (TOCTOU-hardened): renameat2 between two pinned dir fds. Returns NGX_OK on
+ * success; NGX_DECLINED when the syscall/flag is unsupported (caller falls back
+ * to plain renameat); NGX_ERROR otherwise with ngx_errno set (incl. EEXIST when
+ * RENAME_NOREPLACE hits an existing destination — caller inspects).
  */
 static ngx_int_t
-ngx_autocert_rename_noreplace(u_char *oldp, u_char *newp)
+ngx_autocert_renameat2(int oldfd, const char *oldp, int newfd,
+    const char *newp, unsigned int flags)
 {
 #if defined(__linux__) && defined(SYS_renameat2)
-    if (syscall(SYS_renameat2, AT_FDCWD, (const char *) oldp,
-                AT_FDCWD, (const char *) newp, RENAME_NOREPLACE) == 0)
+    if (syscall(SYS_renameat2, oldfd, oldp, newfd, newp, flags) == 0) {
+        return NGX_OK;
+    }
+    if (ngx_errno == NGX_ENOSYS || ngx_errno == EINVAL
+        || ngx_errno == ENOTTY || ngx_errno == EOPNOTSUPP)
     {
-        return NGX_OK;
-    }
-    if (ngx_errno != NGX_ENOSYS && ngx_errno != EINVAL) {
-        return NGX_ERROR;       /* real error (incl. EEXIST) — caller inspects */
-    }
-    /* fall through: kernel/fs without renameat2 */
-#endif
-    if (rename((char *) oldp, (char *) newp) == 0) {
-        return NGX_OK;
+        return NGX_DECLINED;
     }
     return NGX_ERROR;
+#else
+    return NGX_DECLINED;
+#endif
 }
 
 
 /*
- * M3: mkdir a 0700 dir, tolerating an existing real directory (EEXIST) but
- * rejecting a planted symlink/non-dir. Mirrors the store writer's guard.
+ * M3 (TOCTOU-hardened): mkdir a 0700 sub-directory <leaf> inside the pinned
+ * parent dir fd, tolerating an existing real directory (EEXIST) but rejecting a
+ * planted symlink/non-dir. Returns an fd for the resulting directory (opened
+ * NOFOLLOW so a swapped <leaf> cannot redirect it), or -1 on failure. The leaf
+ * is a single path component, so it cannot itself traverse; pinning the parent
+ * inode means a swap of an ancestor component cannot redirect the mkdir/open.
  */
-static ngx_int_t
-ngx_autocert_mkdir_secure(ngx_cycle_t *cycle, u_char *dir)
+static int
+ngx_autocert_mkdirat_secure(ngx_cycle_t *cycle, int pfd, const char *leaf)
 {
+    int          fd;
     struct stat  st;
 
-    if (mkdir((char *) dir, 0700) == -1) {
-        if (ngx_errno != NGX_EEXIST) {
-            ngx_log_error(NGX_LOG_ERR, cycle->log, ngx_errno,
-                          "autocert: mkdir(\"%s\") failed", dir);
-            return NGX_ERROR;
-        }
-        if (lstat((char *) dir, &st) == -1 || !S_ISDIR(st.st_mode)) {
-            ngx_log_error(NGX_LOG_ERR, cycle->log, ngx_errno,
-                          "autocert: \"%s\" is not a directory", dir);
-            return NGX_ERROR;
-        }
+    if (mkdirat(pfd, leaf, 0700) == -1 && ngx_errno != NGX_EEXIST) {
+        ngx_log_error(NGX_LOG_ERR, cycle->log, ngx_errno,
+                      "autocert: mkdir(\"%s\") failed", leaf);
+        return -1;
     }
-    return NGX_OK;
+
+    fd = openat(pfd, leaf, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd == -1) {
+        ngx_log_error(NGX_LOG_ERR, cycle->log, ngx_errno,
+                      "autocert: \"%s\" is not a directory", leaf);
+        return -1;
+    }
+    if (fstat(fd, &st) == -1 || !S_ISDIR(st.st_mode)) {
+        ngx_log_error(NGX_LOG_ERR, cycle->log, ngx_errno,
+                      "autocert: \"%s\" is not a directory", leaf);
+        (void) close(fd);
+        return -1;
+    }
+    return fd;
 }
 
 
@@ -214,35 +226,44 @@ static u_char *
 ngx_autocert_prepare_account_key(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
     ngx_autocert_ca_entry_t *ca, ngx_uint_t migrate, ngx_pool_t *pool)
 {
-    u_char                   *accounts_dir, *ca_dir, *key_path, *old_flat, *p;
-    size_t                    alen;
+    u_char                   *key_path, *base, *p;
+    int                       bfd, accfd, cafd;
     struct stat               st;
+    char                      hash[NGX_AUTOCERT_CA_HASH_HEX + 1];
 
     key_path = ca->account_key_path.data;       /* config pool; outlives worker */
 
-    /* <path>/accounts (NUL-terminated) */
-    alen = acf->path.len + sizeof("/accounts") - 1;
-    accounts_dir = ngx_pnalloc(pool, alen + 1);
-    if (accounts_dir == NULL) {
+    /* Pin the base store dir <path> (created during driver lock acquire).
+     * NOFOLLOW: <path> itself must not be a planted symlink. All sub-dir
+     * creation + the migration rename are *at()-relative to fds derived here. */
+    base = ngx_pnalloc(pool, acf->path.len + 1);
+    if (base == NULL) {
         return NULL;
     }
-    p = ngx_cpymem(accounts_dir, acf->path.data, acf->path.len);
-    p = ngx_cpymem(p, "/accounts", sizeof("/accounts") - 1);
+    p = ngx_cpymem(base, acf->path.data, acf->path.len);
     *p = '\0';
 
-    /* <path>/accounts/<ca_hash> (NUL-terminated) */
-    ca_dir = ngx_pnalloc(pool, alen + 1 + NGX_AUTOCERT_CA_HASH_HEX + 1);
-    if (ca_dir == NULL) {
+    bfd = open((char *) base, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (bfd == -1) {
+        ngx_log_error(NGX_LOG_ERR, cycle->log, ngx_errno,
+                      "autocert: open store dir \"%s\" failed", base);
         return NULL;
     }
-    p = ngx_cpymem(ca_dir, accounts_dir, alen);
-    *p++ = '/';
-    p = ngx_cpymem(p, ca->ca_hash, NGX_AUTOCERT_CA_HASH_HEX);
-    *p = '\0';
 
-    if (ngx_autocert_mkdir_secure(cycle, accounts_dir) != NGX_OK
-        || ngx_autocert_mkdir_secure(cycle, ca_dir) != NGX_OK)
-    {
+    /* <path>/accounts then <path>/accounts/<ca_hash>, each pinned NOFOLLOW. */
+    accfd = ngx_autocert_mkdirat_secure(cycle, bfd, "accounts");
+    if (accfd == -1) {
+        (void) close(bfd);
+        return NULL;
+    }
+
+    ngx_memcpy(hash, ca->ca_hash, NGX_AUTOCERT_CA_HASH_HEX);
+    hash[NGX_AUTOCERT_CA_HASH_HEX] = '\0';
+
+    cafd = ngx_autocert_mkdirat_secure(cycle, accfd, hash);
+    (void) close(accfd);
+    if (cafd == -1) {
+        (void) close(bfd);
         return NULL;
     }
 
@@ -250,29 +271,43 @@ ngx_autocert_prepare_account_key(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
      * single-CA deploy's flat <path>/account.key belongs to the first CA; a
      * second CA must not claim it. */
     if (!migrate) {
+        (void) close(cafd);
+        (void) close(bfd);
         return key_path;
     }
 
-    old_flat = ngx_pnalloc(pool, acf->path.len + sizeof("/account.key"));
-    if (old_flat == NULL) {
-        return NULL;
-    }
-    p = ngx_cpymem(old_flat, acf->path.data, acf->path.len);
-    ngx_memcpy(p, "/account.key", sizeof("/account.key"));
-
-    if (stat((char *) key_path, &st) == -1) {
+    /* Migrate <path>/account.key -> <path>/accounts/<ca_hash>/account.key,
+     * both relative to pinned dir fds. RENAME_NOREPLACE never clobbers a key
+     * that raced into the destination after our absence check. */
+    if (fstatat(cafd, "account.key", &st, AT_SYMLINK_NOFOLLOW) == -1) {
         if (ngx_errno != NGX_ENOENT) {
-            /* unknown stat error — do NOT treat as "absent" and migrate over it */
+            /* unknown error — do NOT treat as "absent" and migrate over it */
             ngx_log_error(NGX_LOG_WARN, cycle->log, ngx_errno,
                           "autocert: stat(\"%s\") failed; skipping account-key "
                           "migration", key_path);
 
-        } else if (stat((char *) old_flat, &st) == 0) {
+        } else if (fstatat(bfd, "account.key", &st, AT_SYMLINK_NOFOLLOW) == 0) {
             /* new key absent + legacy key present: migrate atomically, once. */
-            if (ngx_autocert_rename_noreplace(old_flat, key_path) == NGX_OK) {
+            ngx_int_t  rc;
+
+            rc = ngx_autocert_renameat2(bfd, "account.key", cafd, "account.key",
+                                        RENAME_NOREPLACE);
+
+            if (rc == NGX_OK) {
                 ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
-                              "autocert: migrated account key \"%s\" -> \"%s\"",
-                              old_flat, key_path);
+                              "autocert: migrated account key -> \"%s\"",
+                              key_path);
+
+            } else if (rc == NGX_DECLINED) {
+                /* No RENAME_NOREPLACE on this kernel/fs. We do NOT fall back to a
+                 * plain renameat() — without the flag a destination that raced in
+                 * after the fstatat would be clobbered. Skip the migration; a
+                 * fresh per-CA key is generated at key_path instead (correct, and
+                 * the legacy flat key is left untouched). renameat2 is Linux
+                 * 3.15+ so this is effectively unreachable in practice. */
+                ngx_log_error(NGX_LOG_WARN, cycle->log, 0,
+                              "autocert: RENAME_NOREPLACE unsupported; skipping "
+                              "account-key migration (fresh key generated)");
 
             } else if (ngx_errno == NGX_EEXIST) {
                 /* a key raced into the destination — already migrated; fine */
@@ -281,11 +316,13 @@ ngx_autocert_prepare_account_key(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
                 /* non-fatal: a fresh per-CA key is generated at key_path */
                 ngx_log_error(NGX_LOG_WARN, cycle->log, ngx_errno,
                               "autocert: account key migration rename failed "
-                              "(\"%s\" -> \"%s\")", old_flat, key_path);
+                              "(-> \"%s\")", key_path);
             }
         }
     }
 
+    (void) close(cafd);
+    (void) close(bfd);
     return key_path;
 }
 
