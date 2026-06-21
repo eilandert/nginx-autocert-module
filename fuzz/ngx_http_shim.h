@@ -275,6 +275,8 @@ struct ngx_autocert_acme_request_s {
 
     ngx_str_t    url;
     ngx_str_t    host;
+    ngx_uint_t   host_is_ip;
+    ngx_uint_t   host_is_ipv6;
     in_port_t    port;
     ngx_str_t    uri;
 

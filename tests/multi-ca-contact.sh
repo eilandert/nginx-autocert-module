@@ -70,17 +70,37 @@ docker run -d --name "$DNS_NAME" \
 
 # ---- mock ACME CAs (two ports, identical state machine) ---------------------
 cat > "$PREFIX/mockca.py" <<PYEOF
-import json, ssl, itertools, base64, threading
+import json, ssl, itertools, base64, datetime, threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.x509.oid import NameOID
 
 HOST = "${CA_HOST}"
 PORTS = {${CA_PORT_A}: "A", ${CA_PORT_B}: "B"}
-LEAF = {
-    "${NAME_A}": open("${PREFIX}/leaf-${NAME_A}.pem", "rb").read(),
-    "${NAME_B}": open("${PREFIX}/leaf-${NAME_B}.pem", "rb").read(),
-}
+CA_KEY = serialization.load_pem_private_key(
+    open("${PREFIX}/ca-key.pem", "rb").read(), password=None)
+CA_CERT = x509.load_pem_x509_certificate(open("${PREFIX}/ca.pem", "rb").read())
 CONTACT_FILE = {"A": "${PREFIX}/contact-A", "B": "${PREFIX}/contact-B"}
 nonces = ("nonce-%d" % i for i in itertools.count())
+
+def b64url_dec(s):
+    s += "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s)
+
+def make_leaf(csr_der, name):
+    csr = x509.load_der_x509_csr(csr_der)
+    now = datetime.datetime.utcnow()
+    leaf = (x509.CertificateBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, name)]))
+            .issuer_name(CA_CERT.subject)
+            .public_key(csr.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(minutes=1))
+            .not_valid_after(now + datetime.timedelta(days=2))
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName(name)]), False)
+            .sign(CA_KEY, hashes.SHA256()))
+    return leaf.public_bytes(serialization.Encoding.PEM)
 
 def b64url(s):
     return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
@@ -170,6 +190,10 @@ class H(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"status": "valid"}).encode())
 
         elif self.path == "/finalize":
+            payload = json.loads(raw.decode())["payload"]
+            csr_der = b64url_dec(json.loads(b64url_dec(payload).decode())["csr"])
+            self.server.leaf = make_leaf(
+                csr_der, "${NAME_A}" if self.letter == "A" else "${NAME_B}")
             self._send(200, json.dumps({
                 "status": "valid",
                 "certificate": b + "/cert",
@@ -182,8 +206,7 @@ class H(BaseHTTPRequestHandler):
             }).encode())
 
         elif self.path == "/cert":
-            name = "${NAME_A}" if self.letter == "A" else "${NAME_B}"
-            self._send(200, LEAF[name],
+            self._send(200, self.server.leaf,
                        ctype="application/pem-certificate-chain")
 
         else:
@@ -194,6 +217,7 @@ def serve(port):
     ctx.load_cert_chain("${PREFIX}/ca.pem", "${PREFIX}/ca-key.pem")
     srv = HTTPServer(("0.0.0.0", port), H)
     srv.chal_done = False
+    srv.leaf = None
     srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
     srv.serve_forever()
 
@@ -207,8 +231,8 @@ python3 "$PREFIX/mockca.py" &
 MOCK_PID=$!
 for port in $CA_PORT_A $CA_PORT_B; do
     for i in $(seq 1 30); do
-        if curl -ksf --resolve ${CA_HOST}:${port}:127.0.0.1 \
-            --cacert "$PREFIX/ca.pem" https://${CA_HOST}:${port}/dir >/dev/null 2>&1; then
+        if curl -ksf --resolve "${CA_HOST}:${port}:127.0.0.1" \
+            --cacert "$PREFIX/ca.pem" "https://${CA_HOST}:${port}/dir" >/dev/null 2>&1; then
             break
         fi
         sleep 0.5

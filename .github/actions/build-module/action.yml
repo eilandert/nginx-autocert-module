@@ -162,7 +162,7 @@ runs:
         run_neg "bad store"            'autocert_store vault;'                                            'invalid store'
         run_neg "bad challenge"        'autocert_challenge dns-01;'                                       'invalid challenge'
         run_neg "duplicate key"        'autocert_key_type secp384r1; autocert_key_type secp256r1;'        'is duplicate'
-        run_neg "knob in server{}"     'server { listen 8080; autocert_ca http://x/; }'                   'directive is not allowed'
+        run_neg "knob in server{}"     'server { listen 8080; autocert_renew_before 10d; }'               'directive is not allowed'
         run_neg "staging+ca conflict"  'autocert_staging on; autocert_ca https://example.com/dir;'        'mutually exclusive'
         echo "✓ all negative cases rejected"
 
@@ -180,6 +180,7 @@ runs:
 
         run_pos "autocert_staging on"  'autocert_staging on; autocert_path /tmp/ac-stage;'
         run_pos "store certbot"        'autocert_store certbot; autocert_path /tmp/ac-cb;'
+        run_pos "server autocert_ca"   'server { listen 8080; autocert_ca https://example.com/dir; }'
         echo "✓ all positive cases accepted"
 
     - name: Worker-0 ACME driver lifecycle (P1)

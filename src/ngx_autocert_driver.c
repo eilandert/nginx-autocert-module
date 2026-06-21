@@ -222,7 +222,7 @@ ngx_autocert_prepare_account_key(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
     p = ngx_cpymem(base, acf->path.data, acf->path.len);
     *p = '\0';
 
-    bfd = open((char *) base, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    bfd = ngx_autocert_open_dir_path((char *) base, 0, 0);
     if (bfd == -1) {
         ngx_log_error(NGX_LOG_ERR, cycle->log, ngx_errno,
                       "autocert: open store dir \"%s\" failed", base);
@@ -1259,7 +1259,7 @@ ngx_autocert_driver_trylock(ngx_cycle_t *cycle)
 {
     ngx_autocert_conf_t  acf;
     u_char               path[NGX_MAX_PATH];
-    u_char              *p;
+    int                  bfd;
 
     if (ngx_autocert_lock_fd != -1) {
         return NGX_OK;                      /* already held */
@@ -1269,60 +1269,32 @@ ngx_autocert_driver_trylock(ngx_cycle_t *cycle)
         return NGX_ERROR;                   /* nothing configured; nothing to do */
     }
 
-    if (acf.path.len + sizeof("/.driver.lock") > NGX_MAX_PATH) {
+    if (acf.path.len >= NGX_MAX_PATH) {
         ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
-                      "autocert: store path too long for lock file");
+                      "autocert: store path too long");
         return NGX_ERROR;
     }
 
-    /*
-     * Ensure the store directory exists before we put the lock file (and later
-     * the account key + certs) in it. The old root helper relied on the dir
-     * pre-existing; the worker driver creates it (idempotent, EEXIST is fine) so
-     * a fresh deploy with a not-yet-created autocert_path works out of the box.
-     * ngx_create_full_path makes intermediate components too. 0700: only the
-     * worker user needs it (it holds private keys).
-     */
+    /* Create every missing store-path component relative to its already-pinned
+     * parent. A path-based mkdir/open would follow an attacker-planted ancestor
+     * symlink before the later fd-pinned store operations get a chance to help. */
     ngx_memcpy(path, acf.path.data, acf.path.len);
     path[acf.path.len] = '\0';
 
-    if (ngx_create_dir(path, 0700) == NGX_FILE_ERROR) {
-        ngx_err_t  err = ngx_errno;
-
-        if (err == NGX_ENOENT) {
-            /* A parent component is missing — create the whole chain (this makes
-             * the intermediates; ngx_create_full_path stops at the last '/', so
-             * retry the leaf mkdir afterwards). */
-            ngx_err_t  ferr = ngx_create_full_path(path, 0700);
-            if (ferr != 0 && ferr != NGX_EEXIST) {
-                ngx_log_error(NGX_LOG_ERR, cycle->log, ferr,
-                              "autocert: cannot create store path \"%s\"", path);
-                return NGX_ERROR;
-            }
-            if (ngx_create_dir(path, 0700) == NGX_FILE_ERROR
-                && ngx_errno != NGX_EEXIST)
-            {
-                ngx_log_error(NGX_LOG_ERR, cycle->log, ngx_errno,
-                              "autocert: cannot create store dir \"%s\"", path);
-                return NGX_ERROR;
-            }
-
-        } else if (err != NGX_EEXIST) {
-            ngx_log_error(NGX_LOG_ERR, cycle->log, err,
-                          "autocert: cannot create store dir \"%s\"", path);
-            return NGX_ERROR;
-        }
+    bfd = ngx_autocert_open_dir_path((char *) path, 1, 0700);
+    if (bfd == -1) {
+        ngx_log_error(NGX_LOG_ERR, cycle->log, ngx_errno,
+                      "autocert: cannot open/create store dir \"%s\"", path);
+        return NGX_ERROR;
     }
 
-    p = ngx_cpymem(path, acf.path.data, acf.path.len);
-    p = ngx_cpymem(p, "/.driver.lock", sizeof("/.driver.lock") - 1);
-    *p = '\0';
-
-    ngx_autocert_lock_fd = open((char *) path, O_RDWR | O_CREAT | O_CLOEXEC,
-                                0600);
+    ngx_autocert_lock_fd = openat(bfd, ".driver.lock",
+                                  O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC,
+                                  0600);
+    (void) close(bfd);
     if (ngx_autocert_lock_fd == -1) {
         ngx_log_error(NGX_LOG_ERR, cycle->log, ngx_errno,
-                      "autocert: open() lock file \"%s\" failed", path);
+                      "autocert: open lock file in store \"%s\" failed", path);
         return NGX_ERROR;
     }
 

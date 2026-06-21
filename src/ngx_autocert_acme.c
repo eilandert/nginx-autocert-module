@@ -13,6 +13,8 @@
 
 #include "ngx_autocert_acme.h"
 
+#include <openssl/x509v3.h>
+
 
 #define NGX_AUTOCERT_RECV_MAX   (256 * 1024)   /* cap a CA response */
 #define NGX_AUTOCERT_RECV_INIT  (16 * 1024)
@@ -214,13 +216,6 @@ ngx_autocert_acme_request(ngx_autocert_acme_request_t *r)
                    "autocert: parsed URL host %V port %d uri %V",
                    &r->host, (int) r->port, &r->uri);
 
-    if (r->client->resolver == NULL) {
-        ngx_log_error(NGX_LOG_ERR, r->log, 0,
-                      "autocert: no resolver configured (set autocert_resolver) "
-                      "- cannot reach the ACME server \"%V\"", &r->host);
-        return NGX_ERROR;
-    }
-
     r->content_length = -1;
 
     /*
@@ -230,15 +225,24 @@ ngx_autocert_acme_request(ngx_autocert_acme_request_t *r)
     {
         ngx_addr_t  addr;
 
+        r->host_is_ip = 0;
         if (ngx_parse_addr(r->pool, &addr, r->host.data, r->host.len)
             == NGX_OK)
         {
+            r->host_is_ip = 1;
             ngx_log_debug1(NGX_LOG_DEBUG_CORE, r->log, 0,
                            "autocert: host %V is a literal IP, skip resolve",
                            &r->host);
             ngx_inet_set_port(addr.sockaddr, r->port);
             return ngx_autocert_acme_connect(r, addr.sockaddr, addr.socklen);
         }
+    }
+
+    if (r->client->resolver == NULL) {
+        ngx_log_error(NGX_LOG_ERR, r->log, 0,
+                      "autocert: no resolver configured (set autocert_resolver) "
+                      "- cannot reach the ACME server \"%V\"", &r->host);
+        return NGX_ERROR;
     }
 
     ngx_log_debug1(NGX_LOG_DEBUG_CORE, r->log, 0,
@@ -323,8 +327,11 @@ ngx_autocert_acme_parse_url(ngx_autocert_acme_request_t *r)
 
     host_start = p;
 
+    r->host_is_ipv6 = 0;
+
     if (*p == '[') {
         /* IPv6 literal: host is everything up to and including ']' minus brackets */
+        r->host_is_ipv6 = 1;
         host_start = p + 1;
         host_end = ngx_strlchr(p, last, ']');
         if (host_end == NULL) {
@@ -618,10 +625,11 @@ ngx_autocert_acme_ssl_init(ngx_autocert_acme_request_t *r)
         return NGX_ERROR;
     }
 
-    /* SNI: required by most ACME front ends (and by Pebble). host is a
+    /* SNI is for DNS hostnames, never a literal IP address. host is a
      * NUL-terminated pool copy (see parse_url). */
-    if (SSL_set_tlsext_host_name(c->ssl->connection, (char *) r->host.data)
-        == 0)
+    if (!r->host_is_ip
+        && SSL_set_tlsext_host_name(c->ssl->connection, (char *) r->host.data)
+           == 0)
     {
         ngx_log_error(NGX_LOG_ERR, r->log, 0,
                       "autocert: SSL_set_tlsext_host_name(\"%V\") failed",
@@ -685,7 +693,25 @@ ngx_autocert_acme_ssl_handshake_handler(ngx_connection_t *c)
         return;
     }
 
-    if (ngx_ssl_check_host(c, &r->host) != NGX_OK) {
+    if (r->host_is_ip) {
+        X509  *cert;
+
+        cert = SSL_get_peer_certificate(c->ssl->connection);
+        if (cert == NULL
+            || X509_check_ip_asc(cert, (char *) r->host.data, 0) != 1)
+        {
+            if (cert != NULL) {
+                X509_free(cert);
+            }
+            ngx_log_error(NGX_LOG_ERR, r->log, 0,
+                          "autocert: ACME server \"%V\" certificate name mismatch",
+                          &r->host);
+            ngx_autocert_acme_finalize(r, NGX_ERROR);
+            return;
+        }
+        X509_free(cert);
+
+    } else if (ngx_ssl_check_host(c, &r->host) != NGX_OK) {
         ngx_log_error(NGX_LOG_ERR, r->log, 0,
                       "autocert: ACME server \"%V\" certificate name mismatch",
                       &r->host);
@@ -731,6 +757,7 @@ ngx_autocert_acme_build_request(ngx_autocert_acme_request_t *r)
      * subsequent URL point at :443 and fail to connect. */
     len = r->method.len + 1 + r->uri.len + sizeof(" HTTP/1.1" CRLF) - 1
         + sizeof("Host: ") - 1 + r->host.len
+        + (r->host_is_ipv6 ? 2 : 0)
         + (r->port != 443 ? sizeof(":65535") - 1 : 0)
         + sizeof(CRLF) - 1
         + sizeof("User-Agent: ngx-autocert" CRLF) - 1
@@ -755,7 +782,13 @@ ngx_autocert_acme_build_request(ngx_autocert_acme_request_t *r)
     p = ngx_cpymem(p, r->uri.data, r->uri.len);
     p = ngx_cpymem(p, " HTTP/1.1" CRLF, sizeof(" HTTP/1.1" CRLF) - 1);
     p = ngx_cpymem(p, "Host: ", sizeof("Host: ") - 1);
+    if (r->host_is_ipv6) {
+        *p++ = '[';
+    }
     p = ngx_cpymem(p, r->host.data, r->host.len);
+    if (r->host_is_ipv6) {
+        *p++ = ']';
+    }
     if (r->port != 443) {
         p = ngx_sprintf(p, ":%d", (int) r->port);
     }

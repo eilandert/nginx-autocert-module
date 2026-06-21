@@ -14,6 +14,9 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 
+#include <fcntl.h>
+#include <errno.h>
+
 
 typedef struct {
     ngx_uint_t       configured;     /* 0 => autocert not present in http{} */
@@ -77,8 +80,6 @@ ngx_int_t ngx_autocert_get_conf(ngx_cycle_t *cycle, ngx_autocert_conf_t *out);
  * (caller falls back or defers); NGX_ERROR otherwise with ngx_errno set (incl.
  * EEXIST for RENAME_NOREPLACE against an existing destination — caller inspects).
  */
-#include <fcntl.h>
-#include <errno.h>
 #if defined(__linux__)
 #include <sys/syscall.h>
 #ifndef RENAME_NOREPLACE
@@ -89,6 +90,150 @@ ngx_int_t ngx_autocert_get_conf(ngx_cycle_t *cycle, ngx_autocert_conf_t *out);
 #endif
 #endif
 
+
+/*
+ * Open a directory without trusting any component of `path`. O_NOFOLLOW on a
+ * single open(path) protects only the leaf; this walk pins every ancestor with
+ * openat() before descending into the next component. If `create` is set,
+ * missing components are made relative to the already-pinned parent. `path`
+ * must be NUL-terminated. Returns an owned directory fd, or -1 with errno set.
+ */
+static ngx_inline int
+ngx_autocert_open_dir_path(const char *path, ngx_uint_t create, mode_t mode)
+{
+    char         name[NGX_MAX_PATH];
+    const char  *p, *q;
+    size_t       len;
+    int          dfd, nfd, err;
+
+    if (path == NULL || path[0] == '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (path[0] == '/') {
+        dfd = open("/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        p = path + 1;
+    } else {
+        dfd = open(".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        p = path;
+    }
+    if (dfd == -1) {
+        return -1;
+    }
+
+    while (*p) {
+        q = p;
+        while (*q && *q != '/') {
+            q++;
+        }
+        len = q - p;
+
+        if (len == 0 || (len == 1 && p[0] == '.')) {
+            p = (*q == '/') ? q + 1 : q;
+            continue;
+        }
+        if ((len == 2 && p[0] == '.' && p[1] == '.')
+            || len >= sizeof(name))
+        {
+            err = (len >= sizeof(name)) ? ENAMETOOLONG : EINVAL;
+            (void) close(dfd);
+            errno = err;
+            return -1;
+        }
+
+        ngx_memcpy(name, p, len);
+        name[len] = '\0';
+        nfd = openat(dfd, name,
+                     O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (nfd == -1 && create && errno == ENOENT) {
+            if (mkdirat(dfd, name, mode) == -1 && errno != EEXIST) {
+                err = errno;
+                (void) close(dfd);
+                errno = err;
+                return -1;
+            }
+            nfd = openat(dfd, name,
+                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        }
+        if (nfd == -1) {
+            err = errno;
+            (void) close(dfd);
+            errno = err;
+            return -1;
+        }
+
+        (void) close(dfd);
+        dfd = nfd;
+        p = (*q == '/') ? q + 1 : q;
+    }
+
+    return dfd;
+}
+
+
+/*
+ * Open a regular leaf relative to a parent directory whose every component was
+ * pinned by ngx_autocert_open_dir_path(). The final leaf is also O_NOFOLLOW.
+ */
+static ngx_inline int
+ngx_autocert_open_file_path(const char *path, int flags)
+{
+    char         parent[NGX_MAX_PATH];
+    const char  *p, *slash, *leaf;
+    size_t       len;
+    int          dfd, fd, err;
+
+    if (path == NULL || path[0] == '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+
+    slash = NULL;
+    for (p = path; *p; p++) {
+        if (*p == '/') {
+            slash = p;
+        }
+    }
+
+    if (slash == NULL) {
+        dfd = ngx_autocert_open_dir_path(".", 0, 0);
+        leaf = path;
+    } else if (slash == path) {
+        dfd = ngx_autocert_open_dir_path("/", 0, 0);
+        leaf = slash + 1;
+    } else {
+        len = slash - path;
+        if (len >= sizeof(parent)) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        ngx_memcpy(parent, path, len);
+        parent[len] = '\0';
+        dfd = ngx_autocert_open_dir_path(parent, 0, 0);
+        leaf = slash + 1;
+    }
+
+    if (leaf[0] == '\0' || (leaf[0] == '.' && leaf[1] == '\0')
+        || (leaf[0] == '.' && leaf[1] == '.' && leaf[2] == '\0'))
+    {
+        if (dfd != -1) {
+            (void) close(dfd);
+        }
+        errno = EINVAL;
+        return -1;
+    }
+    if (dfd == -1) {
+        return -1;
+    }
+
+    fd = openat(dfd, leaf, flags | O_NOFOLLOW | O_CLOEXEC);
+    err = errno;
+    (void) close(dfd);
+    errno = err;
+
+    return fd;
+}
 static ngx_inline ngx_int_t
 ngx_autocert_renameat2(int oldfd, const char *oldp, int newfd,
     const char *newp, unsigned int flags)

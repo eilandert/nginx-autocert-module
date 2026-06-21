@@ -206,4 +206,23 @@ else
     echo "::error::mismatched pair was loaded ($good_serial -> $mismatch_serial)"; exit 1
 fi
 
+echo "== reload failure: wrong-SAN cert keeps the prior good cert =="
+# The current on-disk key is deliberate: make the new leaf MATCH that key so
+# only the certificate identity check can reject it.
+openssl req -x509 -new -key "$PREFIX/store/$DOMAIN/privkey.pem" \
+    -out "$TMPD/wrong-san.crt" -days 2 \
+    -subj '/CN=wrong.example.com' -addext 'subjectAltName=DNS:wrong.example.com' \
+    >/dev/null 2>&1
+wrong_san_serial=$(openssl x509 -in "$TMPD/wrong-san.crt" -noout -serial 2>/dev/null)
+[ "$wrong_san_serial" != "$good_serial" ] || { echo "::error::test bug: wrong-SAN serial collided with good"; exit 1; }
+cp "$TMPD/wrong-san.crt" "$PREFIX/store/$DOMAIN/fullchain.pem"
+touch "$PREFIX/store/$DOMAIN/fullchain.pem"
+sleep 1.2
+wrong_san_served=$(served_serial "$DOMAIN")
+if [ "$wrong_san_served" = "$good_serial" ]; then
+    echo "✓ wrong-SAN cert rejected, prior cert still served ($good_serial)"
+else
+    echo "::error::wrong-SAN cert was loaded ($good_serial -> $wrong_san_served)"; exit 1
+fi
+
 echo "✓ M7 per-SNI certificate serving verified"

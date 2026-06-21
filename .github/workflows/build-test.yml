@@ -953,7 +953,7 @@ jobs:
           sudo: "true"
 
   store-symlink-swap:
-    name: store TOCTOU: planted-symlink component refused [${{ matrix.flavor }}]
+    name: "store TOCTOU: planted-symlink component refused [${{ matrix.flavor }}]"
     needs: [resolve, build-nginx, build-angie]
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -977,10 +977,55 @@ jobs:
           sudo: "true"
 
   cert-validate-reject:
-    name: pre-store cert validation rejects key-mismatched leaf [${{ matrix.flavor }}]
+    name: pre-store cert validation rejects bad leaf (${{ matrix.cert_case }}) [${{ matrix.flavor }}]
     needs: [resolve, build-nginx, build-angie]
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: nginx
+            dir: ${{ needs.resolve.outputs.nginx_dir }}
+            cert_case: key-mismatch
+          - flavor: nginx
+            dir: ${{ needs.resolve.outputs.nginx_dir }}
+            cert_case: wrong-san
+          - flavor: nginx
+            dir: ${{ needs.resolve.outputs.nginx_dir }}
+            cert_case: expired
+          - flavor: nginx
+            dir: ${{ needs.resolve.outputs.nginx_dir }}
+            cert_case: future
+          - flavor: angie
+            dir: ${{ needs.resolve.outputs.angie_dir }}
+            cert_case: key-mismatch
+          - flavor: angie
+            dir: ${{ needs.resolve.outputs.angie_dir }}
+            cert_case: wrong-san
+          - flavor: angie
+            dir: ${{ needs.resolve.outputs.angie_dir }}
+            cert_case: expired
+          - flavor: angie
+            dir: ${{ needs.resolve.outputs.angie_dir }}
+            cert_case: future
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: invalid leaf is rejected and not stored
+        uses: ./.github/actions/run-e2e
+        with:
+          flavor: ${{ matrix.flavor }}
+          dir: ${{ matrix.dir }}
+          script: cert-validate-reject.sh
+          sudo: "true"
+          cert_case: ${{ matrix.cert_case }}
+
+  ipv6-directory:
+    name: IPv6-literal ACME directory [${{ matrix.flavor }}]
+    needs: [resolve, build-nginx, build-angie]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -992,13 +1037,35 @@ jobs:
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: a leaf whose key != the order key is rejected and not stored
+      - name: IPv6 IP-SAN endpoint sends bracketed Host authority
         uses: ./.github/actions/run-e2e
         with:
           flavor: ${{ matrix.flavor }}
           dir: ${{ matrix.dir }}
-          script: cert-validate-reject.sh
-          sudo: "true"
+          script: ipv6-directory.sh
+
+  ipv4-directory:
+    name: IPv4-literal ACME directory [${{ matrix.flavor }}]
+    needs: [resolve, build-nginx, build-angie]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: nginx
+            dir: ${{ needs.resolve.outputs.nginx_dir }}
+          - flavor: angie
+            dir: ${{ needs.resolve.outputs.angie_dir }}
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: IPv4 IP-SAN endpoint sends no SNI
+        uses: ./.github/actions/run-e2e
+        with:
+          flavor: ${{ matrix.flavor }}
+          dir: ${{ matrix.dir }}
+          script: ipv4-directory.sh
 
   config-rejects:
     name: config-time rejection of invalid directive values [${{ matrix.flavor }}]

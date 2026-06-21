@@ -80,7 +80,9 @@ struct ngx_autocert_acme_request_s {
     ngx_str_t                     content_type;
 
     /* parsed from url */
-    ngx_str_t                     host;     /* for SNI / Host header / verify */
+    ngx_str_t                     host;     /* bare DNS name or IP literal */
+    ngx_uint_t                    host_is_ip;   /* skip SNI; verify IP SAN */
+    ngx_uint_t                    host_is_ipv6; /* URL authority used [brackets] */
     in_port_t                     port;
     ngx_str_t                     uri;      /* path[?query], at least "/" */
 
@@ -146,17 +148,12 @@ void ngx_autocert_acme_cancel_inflight(void);
 
 /*
  * Start an async request. r must have client, pool, log, method (or "" => GET),
- * url, handler set; body/content_type for POST. Returns NGX_OK once started
- * (the handler fires later) or NGX_ERROR if it could not even start (bad URL,
- * no resolver) — in the NGX_ERROR case the handler is NOT called.
- *
- * Handler-fires-later guarantee: even when connect AND the TLS handshake both
- * complete synchronously (literal-IP host + immediate connect), the call chain
- * always stops at the response read — the HTTP reply cannot be in the socket
- * buffer before we have returned to the caller, so the first recv yields
- * NGX_AGAIN and unwinds. Thus the handler never fires before this function
- * returns NGX_OK, and callers may safely treat NGX_OK as "pending". See the
- * note at the synchronous ngx_ssl_handshake path in the .c.
+ * url, handler set; body/content_type for POST. Returns NGX_OK when setup
+ * started or completed inline, or NGX_ERROR if it could not even start (bad URL,
+ * no resolver) — in the NGX_ERROR case the handler is NOT called. A literal-IP
+ * loopback peer can complete the TLS/read path synchronously, so callers MUST
+ * treat the handler as the completion signal and must not touch `r` after an
+ * NGX_OK return unless their handler retains it safely.
  */
 ngx_int_t ngx_autocert_acme_request(ngx_autocert_acme_request_t *r);
 

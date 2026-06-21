@@ -6,6 +6,7 @@
 #include "ngx_autocert_serve.h"
 #include "ngx_autocert_alpn.h"
 #include "ngx_http_autocert_crypto.h"
+#include "ngx_autocert_shared.h"
 
 #include <ngx_http_ssl_module.h>
 #if (NGX_HTTP_V2)
@@ -18,6 +19,7 @@
 #include <openssl/ssl.h>
 #include <openssl/pem.h>
 #include <openssl/err.h>
+#include <openssl/x509v3.h>
 
 #include <fcntl.h>
 
@@ -102,7 +104,8 @@ static ngx_uint_t           ngx_autocert_names_failed;    /* give up building */
 
 static int ngx_http_autocert_cert_cb(SSL *ssl_conn, void *arg);
 static ngx_int_t ngx_http_autocert_cache_reload(ngx_autocert_cert_t *c,
-    ngx_str_t *host, ngx_autocert_serve_ctx_t *sctx, ngx_log_t *log);
+    ngx_str_t *host, ngx_str_t *verify, ngx_autocert_serve_ctx_t *sctx,
+    ngx_log_t *log);
 static ngx_int_t ngx_http_autocert_install_dummy(SSL_CTX *ctx, ngx_log_t *log);
 static ngx_int_t ngx_http_autocert_read_file(ngx_pool_t *pool,
     u_char *path, ngx_str_t *out, time_t *mtime);
@@ -646,9 +649,11 @@ ngx_http_autocert_cert_cb(SSL *ssl_conn, void *arg)
      * malformed) leaves the previously cached cert intact — we keep serving the
      * last-good cert rather than dropping to the bootstrap one, so a renewal
      * race or a momentary read error doesn't break live TLS. The store key is
-     * the wildcard segment for a wildcard match, so it reads the shared dir.
+     * the wildcard segment for a wildcard match, so it reads the shared dir;
+     * the identity check uses the concrete SNI (host) so a wildcard leaf is
+     * matched against the actual requested name.
      */
-    (void) ngx_http_autocert_cache_reload(cert, &store, sctx, c->log);
+    (void) ngx_http_autocert_cache_reload(cert, &store, &host, sctx, c->log);
 
     if (cert->cert == NULL || cert->key == NULL) {
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
@@ -686,13 +691,14 @@ ngx_http_autocert_cert_cb(SSL *ssl_conn, void *arg)
  */
 static ngx_int_t
 ngx_http_autocert_cache_reload(ngx_autocert_cert_t *c, ngx_str_t *host,
-    ngx_autocert_serve_ctx_t *sctx, ngx_log_t *log)
+    ngx_str_t *verify, ngx_autocert_serve_ctx_t *sctx, ngx_log_t *log)
 {
     u_char             chain_path[NGX_MAX_PATH], key_path[NGX_MAX_PATH];
     u_char            *p;
     size_t             base;
     ngx_str_t          chain_pem, key_pem, seg;
     ngx_file_info_t    fi;
+    ngx_fd_t           fd;
     time_t             now;
     BIO               *bio = NULL;
     X509              *leaf = NULL, *x;
@@ -763,11 +769,19 @@ ngx_http_autocert_cache_reload(ngx_autocert_cert_t *c, ngx_str_t *host,
     p = ngx_cpymem(p, host->data, host->len);
     ngx_memcpy(p, "/privkey.pem", sizeof("/privkey.pem"));
 
-    if (ngx_file_info(chain_path, &fi) == NGX_FILE_ERROR) {
+    /* Pin every store-path component before inspecting the certificate. A plain
+     * stat(path) would still follow an attacker-planted ancestor symlink. */
+    fd = ngx_autocert_open_file_path((const char *) chain_path, O_RDONLY);
+    if (fd == NGX_INVALID_FILE) {
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, log, ngx_errno,
                        "autocert: no stored fullchain for \"%V\"", host);
         return NGX_ERROR;                 /* no cert yet -> bootstrap */
     }
+    if (ngx_fd_info(fd, &fi) == NGX_FILE_ERROR) {
+        ngx_close_file(fd);
+        return NGX_ERROR;
+    }
+    ngx_close_file(fd);
 
     if (c->mtime == ngx_file_mtime(&fi)) {
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, log, 0,
@@ -850,6 +864,25 @@ ngx_http_autocert_cache_reload(ngx_autocert_cert_t *c, ngx_str_t *host,
         goto done;
     }
 
+    /* Verify against the REQUESTED SNI (verify), not the store key (host): for a
+     * wildcard match host is the shared "_wildcard_.<rest>" fs-segment, which is
+     * not a DNS name the leaf's "*.rest" SAN covers. X509_check_host matches the
+     * cert's wildcard SAN against the concrete SNI correctly. */
+    if (X509_check_host(leaf, (char *) verify->data, verify->len, 0, NULL) != 1) {
+        ngx_log_error(NGX_LOG_ERR, log, 0,
+                      "autocert: certificate identity mismatch for \"%V\" "
+                      "(store \"%V\")", verify, host);
+        goto done;
+    }
+    if (X509_cmp_current_time(X509_get0_notBefore(leaf)) > 0
+        || X509_cmp_current_time(X509_get0_notAfter(leaf)) < 0)
+    {
+        ngx_log_error(NGX_LOG_ERR, log, 0,
+                      "autocert: certificate for \"%V\" is not currently valid",
+                      host);
+        goto done;
+    }
+
     /* Commit: free the previous generation, adopt the new one. */
     if (c->cert != NULL) {
         X509_free(c->cert);
@@ -906,10 +939,8 @@ ngx_http_autocert_read_file(ngx_pool_t *pool, u_char *path, ngx_str_t *out,
     size_t           size;
     u_char          *buf;
 
-    /* O_NOFOLLOW: never read a cert/key through a planted symlink — consistent
-     * with the order writer (fd-pinned) and ngx_http_autocert_cert_not_after(),
-     * which already refuse symlinked store entries. */
-    fd = open((const char *) path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    /* Pin every ancestor and the final leaf before reading. */
+    fd = ngx_autocert_open_file_path((const char *) path, O_RDONLY);
     if (fd == NGX_INVALID_FILE) {
         return NGX_ERROR;
     }
