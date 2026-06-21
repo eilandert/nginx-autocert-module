@@ -106,7 +106,8 @@ CodeQL and static analysis.
 
 ### `autocert on | off [email];`
 
-The only directive valid inside `server{}`. Optional `email` is the ACME account
+The on/off switch (plus the [CA selector](#ca-selector-http-default-overridable-per-server)
+directives) may live inside `server{}`. Optional `email` is the ACME account
 contact. A `server{}` value overrides the `http{}` global.
 
 ```nginx
@@ -140,14 +141,27 @@ Two configs are rejected at parse time: a `listen ssl;` server with `autocert
 off` **and** no `ssl_certificate` (nothing would serve it), and `autocert on`
 together with a **variable** `ssl_certificate` (e.g. `ssl_certificate $var;`).
 
-### Global tuning knobs (`http{}` only)
+### CA selector (`http{}` default, overridable per `server{}`)
 
-One ACME policy per instance. All optional.
+Which CA signs, and the credentials/trust bound to it. Settable at `http{}` as
+the instance default **and** inside a `server{}` to pin that vhost to a different
+CA — see [Multiple CAs in one instance](#multiple-cas-in-one-instance). All
+optional.
 
 | Directive | Default | Purpose |
 |---|---|---|
 | `autocert_ca <url>;` | Let's Encrypt production | ACME directory URL |
 | `autocert_staging on\|off;` | `off` | use Let's Encrypt **staging** CA instead — see note |
+| `autocert_ca_certificate <file>;` | system trust store | PEM bundle to verify the CA |
+| `autocert_eab_kid <key-id>;` | *(none)* | EAB key identifier — see below |
+| `autocert_eab_hmac_key <base64url>;` | *(none)* | EAB HMAC key (base64url) — see below |
+
+### Global tuning knobs (`http{}` only)
+
+Instance-wide; one value per nginx instance. All optional.
+
+| Directive | Default | Purpose |
+|---|---|---|
 | `autocert_renew_before <time>;` | `7d` | renew this long before expiry |
 | `autocert_key_type secp384r1\|secp256r1;` | `secp384r1` | ECDSA curve (no RSA) |
 | `autocert_store secure\|certbot;` | `secure` | on-disk layout. `secure`: `<path>/<domain>/{privkey,fullchain}.pem`. `certbot`: `<path>/live/<domain>/{privkey,cert,chain,fullchain}.pem` (flat live/, real files — no archive/ + symlinks) |
@@ -155,9 +169,6 @@ One ACME policy per instance. All optional.
 | `autocert_challenge http-01\|tls-alpn-01\|dns-01;` | `http-01` | challenge type — `dns-01` needs the hook directives below |
 | `autocert_resolver <addr>...;` | the `http{}` `resolver` | DNS used to reach the CA |
 | `autocert_resolver_timeout <time>;` | `30s` | DNS query timeout |
-| `autocert_ca_certificate <file>;` | system trust store | PEM bundle to verify the CA |
-| `autocert_eab_kid <key-id>;` | *(none)* | EAB key identifier — see below |
-| `autocert_eab_hmac_key <base64url>;` | *(none)* | EAB HMAC key (base64url) — see below |
 | `autocert_dns_hook_add <path>;` | *(none)* | DNS-01 only: absolute path of the publish-TXT hook — see below |
 | `autocert_dns_hook_remove <path>;` | *(none)* | DNS-01 only: absolute path of the remove-TXT hook |
 | `autocert_dns_propagation_delay <time>;` | `10s` | DNS-01 only: wait after publishing before asking the CA to validate |
@@ -171,7 +182,8 @@ One ACME policy per instance. All optional.
 > **`autocert_staging on`** is a shorthand for
 > `autocert_ca https://acme-staging-v02.api.letsencrypt.org/directory`.
 > It is mutually exclusive with `autocert_ca` — nginx will refuse to start if
-> both appear in the same `http {}` block. Staging certificates are issued via
+> both appear in the same scope (`http{}` or one `server{}`). Staging
+> certificates are issued via
 > the real ACME protocol and follow the same flow as production, but they are
 > signed by the *Fake LE* intermediate and are **not trusted by browsers**.
 > They consume no production rate-limit quota, making them suitable for
@@ -197,6 +209,48 @@ The HMAC key is the value as the CA gives it — base64url-encoded (no padding).
 only one fails config. The binding is computed and sent **only** on account
 registration (`newAccount`); ordinary order/renewal requests are unaffected.
 Let's Encrypt does not use EAB — leave both unset for it.
+
+### Multiple CAs in one instance
+
+The CA selector directives (`autocert_ca`, `autocert_staging`,
+`autocert_ca_certificate`, `autocert_eab_kid`, `autocert_eab_hmac_key`) may be
+set inside a `server{}` block to pin that vhost to a different CA than the
+`http{}` default. Each distinct CA gets its own ACME account, account key
+(`<path>/accounts/<hash>/account.key`), and renewal engine; one instance can
+issue against several CAs at once.
+
+```nginx
+http {
+    autocert on admin@example.com;
+    autocert_ca https://acme-v02.api.letsencrypt.org/directory;   # default CA
+
+    server {                       # uses the http{} default (Let's Encrypt)
+        listen 443 ssl;
+        server_name a.example.com;
+    }
+
+    server {                       # pinned to a different CA + EAB
+        listen 443 ssl;
+        server_name b.example.com;
+        autocert_ca          https://acme.zerossl.com/v2/DV90;
+        autocert_eab_kid     "your-eab-key-id";
+        autocert_eab_hmac_key "base64url-hmac-key";
+    }
+}
+```
+
+**Inheritance rule (important).** A `server{}` that sets **either** `autocert_ca`
+**or** `autocert_staging` owns its entire CA selector and inherits **nothing**
+else from the `http{}` default — not the trust bundle, not the EAB credentials.
+This is deliberate: inheriting CA-A's pinned root or EAB key for CA-B would send
+the wrong credentials or pin the wrong root. So a vhost that overrides the CA
+**must also repeat** any `autocert_ca_certificate` / `autocert_eab_*` it needs,
+inside that same `server{}`. A vhost that does **not** override the CA inherits
+the whole `http{}` selector as usual.
+
+> A single `server_name` must not be claimed by two vhosts that resolve to
+> different CAs — there is one stored certificate per name. Keep each name under
+> one CA.
 
 ### DNS-01 challenge (wildcards)
 
@@ -317,14 +371,14 @@ user).
 
 **Works today:** full issuance + renewal on nginx mainline, HTTP-01,
 TLS-ALPN-01 and DNS-01 (incl. **wildcard** `*.x` via operator hooks), EAB for
-commercial CAs, per-SNI serving with bootstrap + zero-reload hot-swap, ECDSA
-P-384/P-256, worker-owned `secure` and `certbot` store layouts, `badNonce`
-retry, per-name backoff, and `429` / `Retry-After` awareness.
+commercial CAs, **per-vhost multiple CAs** (one ACME account + engine per CA),
+per-SNI serving with bootstrap + zero-reload hot-swap, ECDSA P-384/P-256,
+worker-owned `secure` and `certbot` store layouts, `badNonce` retry, per-name
+backoff, and `429` / `Retry-After` awareness.
 
-**Not yet:** multiple CAs per instance (one ACME policy at a time), and a
-packaged Debian sub-package. Both nginx and Angie are fully supported and run the
-same end-to-end test suite; on Angie the `autocert` directive coexists with
-Angie's own native `acme` (pick whichever you prefer).
+**Not yet:** a packaged Debian sub-package. Both nginx and Angie are fully
+supported and run the same end-to-end test suite; on Angie the `autocert`
+directive coexists with Angie's own native `acme` (pick whichever you prefer).
 
 ---
 

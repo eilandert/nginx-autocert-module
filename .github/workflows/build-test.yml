@@ -664,6 +664,29 @@ jobs:
           dir: ${{ matrix.dir }}
           script: multi-ca-srv-scope.sh
 
+  multi-ca:
+    name: multi-CA full issuance (M5, #15) [${{ matrix.flavor }}]
+    needs: [resolve, build-nginx, build-angie]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: nginx
+            dir: ${{ needs.resolve.outputs.nginx_dir }}
+          - flavor: angie
+            dir: ${{ needs.resolve.outputs.angie_dir }}
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: two CAs, two accounts, both vhosts issue (EAB on CA-B)
+        uses: ./.github/actions/run-e2e
+        with:
+          flavor: ${{ matrix.flavor }}
+          dir: ${{ matrix.dir }}
+          script: multi-ca.sh
+
   account-migration:
     name: per-CA account path + legacy migration (M3, #15) [${{ matrix.flavor }}]
     needs: [resolve, build-nginx, build-angie]

@@ -81,22 +81,13 @@ ngx_autocert_get_conf(ngx_cycle_t *cycle, ngx_autocert_conf_t *out)
                    amcf->challenge,
                    amcf->names ? amcf->names->nelts : (ngx_uint_t) 0);
     /*
-     * M4 bridge: the CA knobs moved to SRV scope (srv_conf.ca_conf) and the
-     * directives no longer populate amcf->ca_conf. postconfig resolves each
-     * server's effective ca_conf and groups names by CA into ca_list. The
-     * worker-0 driver is still single-CA until M5, so source the flat CA fields
-     * from the first ca_list entry (the resolved, validated primary CA). With
-     * no enabled names ca_list is empty -> CA fields stay "" and the driver
-     * idles, which is correct (nothing to issue).
+     * M5: the CA knobs (directory URL, trust bundle, EAB) are per-CA in
+     * ca_list[*].ca_conf; the driver iterates ca_list and reads each entry's
+     * ca_conf directly. No flat-CA copy here anymore (the M4 ca_list[0] bridge
+     * is gone). postconfig resolved + validated each effective ca_conf and
+     * grouped names by CA into ca_list; an empty ca_list (no enabled names)
+     * leaves the driver idle, which is correct (nothing to issue).
      */
-    if (amcf->ca_list != NULL && amcf->ca_list->nelts > 0) {
-        ngx_autocert_ca_entry_t  *ce0 = amcf->ca_list->elts;
-
-        out->ca = ce0->ca_conf.ca;
-        out->ca_certificate = ce0->ca_conf.ca_certificate;
-        out->eab_kid = ce0->ca_conf.eab_kid;
-        out->eab_hmac_key = ce0->ca_conf.eab_hmac_key;
-    }
 
     out->email = amcf->email;
     out->resolver = amcf->resolver;

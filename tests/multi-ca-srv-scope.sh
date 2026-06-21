@@ -162,4 +162,58 @@ if grep -q "mutually exclusive" "$PREFIX/logs/stg.err"; then
 fi
 echo "✓ server staging overrides global autocert_ca cleanly (no selector collision)"
 
+# --- negative: same name under two different CAs must fail config (M5 LOW) -----
+# One server_name issues ONE certificate from ONE CA. Two vhosts that both list
+# the same name but pin different CAs is ambiguous (which CA signs the single
+# cert?) — reject at parse instead of silently keeping the first CA.
+echo "== negative: same server_name under two different CAs must fail config =="
+cat > "$PREFIX/conf/dup.conf" <<EOF
+load_module $HTTP_SO;
+error_log $PREFIX/logs/dup.log notice;
+events {}
+http {
+    autocert on admin@example.com;
+    autocert_path $PREFIX/store;
+    server {
+        listen 8086;
+        server_name dup.example.com;
+        autocert on;
+        autocert_ca https://127.0.0.1:1/ca-a;
+    }
+    server {
+        listen 8087;
+        server_name dup.example.com;
+        autocert on;
+        autocert_ca https://127.0.0.1:2/ca-b;
+    }
+}
+EOF
+
+if "$SERVER_BIN" -t -p "$PREFIX" -c "$PREFIX/conf/dup.conf" 2>"$PREFIX/logs/dup.err"; then
+    echo "::error::same name under two CAs was accepted"; cat "$PREFIX/logs/dup.err"; exit 1
+fi
+grep -q "claimed by two vhosts with different CAs" "$PREFIX/logs/dup.err" \
+    || { echo "::error::expected 'claimed by two vhosts with different CAs'"; \
+         cat "$PREFIX/logs/dup.err"; exit 1; }
+echo "✓ same name under conflicting CAs rejected at config time"
+
+# --- positive: same name under the SAME CA across two vhosts is fine -----------
+echo "== positive: same server_name under the SAME CA is the harmless dup =="
+cat > "$PREFIX/conf/same.conf" <<EOF
+load_module $HTTP_SO;
+error_log $PREFIX/logs/same.log notice;
+events {}
+http {
+    autocert on admin@example.com;
+    autocert_ca https://127.0.0.1:1/ca-a;
+    autocert_path $PREFIX/store;
+    server { listen 8088; server_name sds.example.com; autocert on; }
+    server { listen 8089; server_name sds.example.com; autocert on; }
+}
+EOF
+if ! "$SERVER_BIN" -t -p "$PREFIX" -c "$PREFIX/conf/same.conf" 2>"$PREFIX/logs/same.err"; then
+    echo "::error::same name under the same CA was rejected"; cat "$PREFIX/logs/same.err"; exit 1
+fi
+echo "✓ same name under one CA accepted (deduped, no false conflict)"
+
 echo "ALL MULTI-CA SRV-SCOPE CHECKS PASSED"
