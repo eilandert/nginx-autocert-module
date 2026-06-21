@@ -113,7 +113,15 @@ ngx_autocert_acme_client_create(ngx_autocert_acme_client_t *client,
      * path does not), so verification has roots to chain to (Let's Encrypt prod).
      */
     SSL_CTX_set_verify(client->ssl.ctx, SSL_VERIFY_PEER, NULL);
-    SSL_CTX_set_verify_depth(client->ssl.ctx, 2);
+    /*
+     * Generous chain depth. The chain length an ACME CA presents is outside our
+     * control and changes without notice (cross-signed roots, extra
+     * intermediates); a tight cap (was 2) would reject a perfectly valid CA with
+     * a confusing "verify failed". Depth only bounds pathological chains — peer
+     * identity is still enforced by SSL_VERIFY_PEER + the trust store + the host
+     * check below — so a high value does not weaken security.
+     */
+    SSL_CTX_set_verify_depth(client->ssl.ctx, 100);
 
     if (trusted_cert->len == 0) {
         if (SSL_CTX_set_default_verify_paths(client->ssl.ctx) == 0) {
@@ -405,6 +413,7 @@ ngx_autocert_acme_resolve_handler(ngx_resolver_ctx_t *ctx)
     struct sockaddr              *sockaddr;
     socklen_t                     socklen;
     socklen_t                     len;
+    ngx_uint_t                    naddr;
 
     if (ctx->state) {
         ngx_log_error(NGX_LOG_ERR, r->log, 0,
@@ -431,8 +440,15 @@ ngx_autocert_acme_resolve_handler(ngx_resolver_ctx_t *ctx)
                    "autocert: resolve \"%V\" returned %ui address(es)",
                    &r->host, ctx->naddrs);
 
-    /* Use the first address; copy it out before releasing the resolver ctx. */
-    socklen = ctx->addrs[0].socklen;
+    /*
+     * Pick a random address (like nginx upstream does) rather than always
+     * addrs[0]: a multi-homed ACME CA whose first record points at a dead/stale
+     * PoP would otherwise fail every order on the same address. Spreading the
+     * choice lets the scheduled retry land on a different PoP. Copy it out
+     * before releasing the resolver ctx.
+     */
+    naddr = (ngx_uint_t) ngx_random() % ctx->naddrs;
+    socklen = ctx->addrs[naddr].socklen;
 
     sockaddr = ngx_palloc(r->pool, socklen);
     if (sockaddr == NULL) {
@@ -442,7 +458,7 @@ ngx_autocert_acme_resolve_handler(ngx_resolver_ctx_t *ctx)
         return;
     }
 
-    ngx_memcpy(sockaddr, ctx->addrs[0].sockaddr, socklen);
+    ngx_memcpy(sockaddr, ctx->addrs[naddr].sockaddr, socklen);
     ngx_inet_set_port(sockaddr, r->port);
     len = socklen;
 

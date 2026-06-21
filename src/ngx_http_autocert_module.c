@@ -432,6 +432,19 @@ ngx_http_autocert_init_main_conf(ngx_conf_t *cf, void *conf)
     ngx_conf_init_value(amcf->dns_hook_timeout, 30);        /* M16 hook exec */
 
     /*
+     * A non-positive dns_hook_timeout reaches the driver as 0, which makes the
+     * wait loop SIGKILL the hook on the first poll tick — silently breaking ALL
+     * dns-01 issuance. Reject it at config time rather than fail mysteriously at
+     * runtime. (resolver_timeout / dns_propagation_delay tolerate 0 = "no wait",
+     * but a 0 hook timeout is never meaningful.)
+     */
+    if (amcf->dns_hook_timeout <= 0) {
+        ngx_log_error(NGX_LOG_EMERG, cf->log, 0,
+                      "autocert_dns_hook_timeout must be greater than 0");
+        return NGX_CONF_ERROR;
+    }
+
+    /*
      * M16 dns-01: the publish/remove hooks are exec'd by the driver. A hook
      * path must be absolute — the driver's CWD is undefined, so a relative path
      * would resolve unpredictably (mirrors the autocert_path reasoning above).
@@ -1140,6 +1153,15 @@ ngx_http_autocert_challenge_handler(ngx_http_request_t *r)
     }
 
     if (!(r->method & (NGX_HTTP_GET | NGX_HTTP_HEAD))) {
+        /* RFC 9110 §15.5.6: a 405 MUST carry an Allow header. */
+        ngx_table_elt_t  *allow;
+
+        allow = ngx_list_push(&r->headers_out.headers);
+        if (allow != NULL) {
+            allow->hash = 1;
+            ngx_str_set(&allow->key, "Allow");
+            ngx_str_set(&allow->value, "GET, HEAD");
+        }
         return NGX_HTTP_NOT_ALLOWED;
     }
 
@@ -1235,6 +1257,15 @@ ngx_http_autocert_init_zone(ngx_shm_zone_t *shm_zone, void *data)
     for (i = 0; i < nelts; i++) {
         p = ngx_slab_alloc(shpool, src[i].len);
         if (p == NULL) {
+            /* Slab is mmap-backed and survives a failed reload, so free what we
+             * already allocated before bailing — otherwise a repeatedly-failing
+             * reload permanently wastes slab space. */
+            ngx_uint_t  j;
+
+            for (j = 0; j < i; j++) {
+                ngx_slab_free(shpool, sh->elts[j].data);
+            }
+            ngx_slab_free(shpool, sh);
             return NGX_ERROR;
         }
 

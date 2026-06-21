@@ -531,7 +531,7 @@ ngx_autocert_account_nonce_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
     if (rc == NGX_OK && (req->status == 200 || req->status == 204)) {
         nonce = ngx_autocert_acme_header(req, "Replay-Nonce");
         if (nonce != NULL && nonce->len > 0
-            && ngx_autocert_account_dup(acct, &acct->nonce, nonce) == NGX_OK)
+            && ngx_autocert_account_set_nonce(acct, nonce) == NGX_OK)
         {
             ok = NGX_OK;
         }
@@ -890,7 +890,7 @@ ngx_autocert_account_register_renonce_done(ngx_autocert_acme_request_t *req,
     if (rc == NGX_OK && (req->status == 200 || req->status == 204)) {
         nonce = ngx_autocert_acme_header(req, "Replay-Nonce");
         if (nonce != NULL && nonce->len > 0
-            && ngx_autocert_account_dup(acct, &acct->nonce, nonce) == NGX_OK)
+            && ngx_autocert_account_set_nonce(acct, nonce) == NGX_OK)
         {
             ok = NGX_OK;
         }

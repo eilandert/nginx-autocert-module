@@ -1000,6 +1000,30 @@ jobs:
           script: cert-validate-reject.sh
           sudo: "true"
 
+  config-rejects:
+    name: config-time rejection of invalid directive values [${{ matrix.flavor }}]
+    needs: [resolve, build-nginx, build-angie]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: nginx
+            dir: ${{ needs.resolve.outputs.nginx_dir }}
+          - flavor: angie
+            dir: ${{ needs.resolve.outputs.angie_dir }}
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: autocert_dns_hook_timeout 0 (and negative) rejected at config time
+        uses: ./.github/actions/run-e2e
+        with:
+          flavor: ${{ matrix.flavor }}
+          dir: ${{ matrix.dir }}
+          script: config-rejects.sh
+          sudo: "false"
+
   slowloris-read:
     name: Slow-drip total-read budget (#37) [${{ matrix.flavor }}]
     needs: [resolve]

@@ -974,12 +974,24 @@ ngx_autocert_order_dns_hook(ngx_autocert_order_t *order, ngx_str_t *hook,
          * plus any children it spawns), not just the direct process. */
         (void) setpgid(0, 0);
 
-        maxfd = sysconf(_SC_OPEN_MAX);
-        if (maxfd < 0) {
-            maxfd = 1024;
-        }
-        for (fd = 3; fd < maxfd; fd++) {
-            (void) close((int) fd);
+        /* Close every inherited fd above stderr so the hook can't touch worker
+         * sockets/cert fds. Prefer close_range(2) (Linux 5.9+): one syscall vs.
+         * a loop that, with a soft RLIMIT_NOFILE of ~1M on systemd/containers,
+         * would otherwise issue ~1M close() calls in the child. Fall back to the
+         * bounded loop only when close_range is unavailable. */
+#if defined(__linux__) && defined(SYS_close_range)
+        if (syscall(SYS_close_range, 3, ~0U, 0) == 0) {
+            /* done */
+        } else
+#endif
+        {
+            maxfd = sysconf(_SC_OPEN_MAX);
+            if (maxfd < 0) {
+                maxfd = 1024;
+            }
+            for (fd = 3; fd < maxfd; fd++) {
+                (void) close((int) fd);
+            }
         }
 
         (void) execve((char *) hook_cstr, argv, environ);
@@ -2339,7 +2351,7 @@ ngx_autocert_order_write_tmp_at(ngx_autocert_order_t *order, int sfd,
     for (off = 0; off < data->len; off += n) {
         n = write(fd, data->data + off, data->len - off);
         if (n == -1) {
-            if (errno == EINTR) {
+            if (ngx_errno == EINTR) {
                 n = 0;
                 continue;
             }
