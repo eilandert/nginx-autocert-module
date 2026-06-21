@@ -78,6 +78,8 @@ static void ngx_autocert_order_rm_staging(u_char *staging);
 static ngx_int_t ngx_autocert_order_swap_dirs(ngx_autocert_order_t *order,
     u_char *staging, u_char *dir);
 static ngx_int_t ngx_autocert_order_publish_alpn(ngx_autocert_order_t *order);
+static ngx_int_t ngx_autocert_order_publish_dns(ngx_autocert_order_t *order);
+static void ngx_autocert_order_dns_delay_timer(ngx_event_t *ev);
 static void ngx_autocert_order_unpublish(ngx_autocert_order_t *order);
 static void ngx_autocert_order_finish(ngx_autocert_order_t *order,
     ngx_int_t rc);
@@ -213,6 +215,7 @@ ngx_autocert_order_start(ngx_autocert_order_t *order)
     order->done = 0;
     order->challenge_set = 0;
     order->alpn_set = 0;
+    order->dns_set = 0;
     order->poll_tries = 0;
     order->order_poll_tries = 0;
     order->finalize_retried = 0;
@@ -529,6 +532,8 @@ ngx_autocert_order_authz_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
 
         if (order->challenge == NGX_AUTOCERT_CHALLENGE_TLS_ALPN_01) {
             ngx_str_set(&want, "tls-alpn-01");
+        } else if (order->challenge == NGX_AUTOCERT_CHALLENGE_DNS_01) {
+            ngx_str_set(&want, "dns-01");
         } else {
             ngx_str_set(&want, "http-01");
         }
@@ -633,6 +638,18 @@ ngx_autocert_order_authz_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
             ngx_autocert_order_finish(order, NGX_ERROR);
             return;
         }
+    } else if (order->challenge == NGX_AUTOCERT_CHALLENGE_DNS_01) {
+        /*
+         * dns-01 publishes a TXT record out-of-band (an operator exec hook,
+         * D3) and must then WAIT for DNS propagation before asking the CA to
+         * validate. publish_dns arms the propagation-delay timer, whose handler
+         * calls ngx_autocert_order_respond — so do NOT fall through to the
+         * synchronous respond below.
+         */
+        if (ngx_autocert_order_publish_dns(order) != NGX_OK) {
+            ngx_autocert_order_finish(order, NGX_ERROR);
+        }
+        return;
     } else {
         if (ngx_autocert_challenge_set(order->challenge_zone, &order->token,
                                        &order->keyauth)
@@ -731,6 +748,80 @@ done:
 }
 
 
+/*
+ * M16: publish the dns-01 challenge. The TXT record value is
+ * base64url(SHA-256(keyauth)) (RFC 8555 §8.4), published at
+ * _acme-challenge.<domain>. Publishing is out-of-band via an operator exec
+ * hook (wired in D3); here in D2 it is a stub that computes + logs the value
+ * (tests pre-seed the record). Either way it sets dns_set and arms the
+ * propagation-delay timer, whose handler then POSTs the challenge response.
+ */
+static ngx_int_t
+ngx_autocert_order_publish_dns(ngx_autocert_order_t *order)
+{
+    ngx_msec_t  delay;
+
+    if (ngx_http_autocert_dns01_txt(order->pool, &order->keyauth,
+                                    &order->dns_txt_value)
+        != NGX_OK)
+    {
+        ngx_log_error(NGX_LOG_ERR, order->log, 0,
+                      "autocert: dns-01 TXT value computation failed for "
+                      "\"%V\"", &order->domain);
+        return NGX_ERROR;
+    }
+
+    /* D3 will exec dns_hook_add here; D2 stub just records + logs. */
+    order->dns_set = 1;
+
+    ngx_log_error(NGX_LOG_NOTICE, order->log, 0,
+                  "autocert: dns-01 challenge for \"%V\": publish TXT "
+                  "_acme-challenge.%V = \"%V\"",
+                  &order->domain, &order->domain, &order->dns_txt_value);
+
+    /* Wait for DNS propagation before asking the CA to validate. Clamp the
+     * seconds→ms conversion so a negative or absurd configured delay can't wrap
+     * the time_t multiply (esp. 32-bit time_t) into a tiny/huge ngx_msec_t.
+     * A propagation wait beyond an hour is nonsensical, so cap there. */
+    if (order->dns_propagation_delay < 0) {
+        delay = 0;
+    } else if (order->dns_propagation_delay > 3600) {
+        delay = (ngx_msec_t) 3600 * 1000;
+    } else {
+        delay = (ngx_msec_t) order->dns_propagation_delay * 1000;
+    }
+
+    ngx_memzero(&order->dns_delay_timer, sizeof(ngx_event_t));
+    order->dns_delay_timer.handler = ngx_autocert_order_dns_delay_timer;
+    order->dns_delay_timer.data = order;
+    order->dns_delay_timer.log = order->log;
+    /* cancelable: a pending ACME timer must not pin a gracefully-exiting worker
+     * 0 open (which would retain .driver.lock and block driver hand-off on
+     * reload). The in-flight order is abandoned on exit — ACME is idempotent, it
+     * re-orders next sweep. */
+    order->dns_delay_timer.cancelable = 1;
+    ngx_add_timer(&order->dns_delay_timer, delay);
+
+    return NGX_OK;
+}
+
+
+/* M16: propagation delay elapsed — POST the challenge response to the CA. */
+static void
+ngx_autocert_order_dns_delay_timer(ngx_event_t *ev)
+{
+    ngx_autocert_order_t  *order = ev->data;
+
+    ngx_log_debug1(NGX_LOG_DEBUG_CORE, order->log, 0,
+                   "autocert: dns-01 propagation wait elapsed for \"%V\", "
+                   "responding", &order->domain);
+
+    if (ngx_autocert_order_respond(order) != NGX_OK) {
+        ngx_autocert_order_finish(order, NGX_ERROR);
+    }
+}
+
+
 /* Step 4: POST the challenge URL with {} to tell the CA we are ready. */
 static ngx_int_t
 ngx_autocert_order_respond(ngx_autocert_order_t *order)
@@ -797,6 +888,10 @@ ngx_autocert_order_respond_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
     order->poll_timer.handler = ngx_autocert_order_poll_timer;
     order->poll_timer.data = order;
     order->poll_timer.log = order->log;
+    /* cancelable: never pin a gracefully-exiting worker 0 (driver-lock handoff
+     * on reload — see audit MED). The bare re-arm in the handler reuses this
+     * event, so the flag persists across re-arms. */
+    order->poll_timer.cancelable = 1;
     ngx_add_timer(&order->poll_timer, NGX_AUTOCERT_ORDER_POLL_DELAY);
     ngx_log_debug1(NGX_LOG_DEBUG_CORE, order->log, 0,
                    "autocert: authz poll armed in %M ms",
@@ -1030,6 +1125,7 @@ ngx_autocert_order_finalize_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
             order->order_timer.handler = ngx_autocert_order_poll_order_timer;
             order->order_timer.data = order;
             order->order_timer.log = order->log;
+            order->order_timer.cancelable = 1;   /* don't pin exiting worker 0 */
             ngx_add_timer(&order->order_timer, NGX_AUTOCERT_ORDER_FIN_DELAY);
             return;
         }
@@ -1048,6 +1144,7 @@ ngx_autocert_order_finalize_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
     order->order_timer.handler = ngx_autocert_order_poll_order_timer;
     order->order_timer.data = order;
     order->order_timer.log = order->log;
+    order->order_timer.cancelable = 1;   /* don't pin exiting worker 0 */
     ngx_add_timer(&order->order_timer, NGX_AUTOCERT_ORDER_FIN_DELAY);
     ngx_log_debug1(NGX_LOG_DEBUG_CORE, order->log, 0,
                    "autocert: order poll armed in %M ms",
@@ -1821,6 +1918,13 @@ ngx_autocert_order_unpublish(ngx_autocert_order_t *order)
         (void) ngx_autocert_alpn_remove(order->alpn_zone, &order->domain);
         order->alpn_set = 0;
     }
+
+    /* M16 dns-01: remove the published TXT (D3 execs dns_hook_remove here; D2
+     * stub just clears the flag). Cleanup failure is non-fatal — the record
+     * expires by TTL. */
+    if (order->dns_set) {
+        order->dns_set = 0;
+    }
 }
 
 
@@ -1837,6 +1941,9 @@ ngx_autocert_order_finish(ngx_autocert_order_t *order, ngx_int_t rc)
     }
     if (order->order_timer.timer_set) {
         ngx_del_timer(&order->order_timer);
+    }
+    if (order->dns_delay_timer.timer_set) {
+        ngx_del_timer(&order->dns_delay_timer);
     }
 
     /* Drop the published challenge answer now the authz is settled. It is no
@@ -1859,6 +1966,9 @@ ngx_autocert_order_free(ngx_autocert_order_t *order)
     }
     if (order->order_timer.timer_set) {
         ngx_del_timer(&order->order_timer);
+    }
+    if (order->dns_delay_timer.timer_set) {
+        ngx_del_timer(&order->dns_delay_timer);
     }
     if (order->cert_key != NULL) {
         ngx_http_autocert_key_free(order->cert_key);

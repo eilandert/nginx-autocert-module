@@ -64,6 +64,11 @@ struct ngx_autocert_order_s {
     ngx_uint_t                       challenge;
     ngx_shm_zone_t                  *alpn_zone;      /* M10b tls-alpn cert store */
 
+    /* M16 dns-01: publish a TXT via the exec hooks, wait, then validate. */
+    ngx_str_t                        dns_hook_add;     /* publish-TXT exec, "" */
+    ngx_str_t                        dns_hook_remove;  /* remove-TXT exec, "" */
+    time_t                           dns_propagation_delay;  /* seconds */
+
     ngx_autocert_order_handler_pt    handler;
     void                            *data;
 
@@ -89,9 +94,12 @@ struct ngx_autocert_order_s {
     ngx_uint_t                       finalize_retried; /* re-finalized after ready? */
     ngx_uint_t                       challenge_set;    /* token in store? */
     ngx_uint_t                       alpn_set;         /* M10c: cert in alpn store? */
+    ngx_uint_t                       dns_set;          /* M16: TXT published? */
+    ngx_str_t                        dns_txt_value;    /* M16: base64url digest */
     ngx_uint_t                       done;
     ngx_event_t                      poll_timer;       /* authz polling */
     ngx_event_t                      order_timer;      /* order polling (M6b) */
+    ngx_event_t                      dns_delay_timer;  /* M16 propagation wait */
 
     /* M6b issuance state */
     EVP_PKEY                        *cert_key;        /* fresh cert key */

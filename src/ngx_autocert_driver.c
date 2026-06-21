@@ -760,8 +760,11 @@ ngx_autocert_start_order_for(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
     order->directory_url = acf->ca;
     order->domain = *name;
     order->challenge_zone = acf->challenge_zone;
-    order->challenge = acf->challenge;          /* M10c: http-01 / tls-alpn-01 */
+    order->challenge = acf->challenge;          /* M10c/M16: http/alpn/dns */
     order->alpn_zone = acf->alpn_zone;          /* M10b store, used when alpn */
+    order->dns_hook_add = acf->dns_hook_add;            /* M16 dns-01 */
+    order->dns_hook_remove = acf->dns_hook_remove;
+    order->dns_propagation_delay = acf->dns_propagation_delay;
     order->key_type = acf->key_type;
     order->store = acf->store;
     order->store_path = acf->path;

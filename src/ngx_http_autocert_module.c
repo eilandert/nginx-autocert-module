@@ -305,6 +305,9 @@ ngx_http_autocert_create_main_conf(ngx_conf_t *cf)
     /* resolver pointer + ca_certificate zeroed by pcalloc */
     amcf->resolver_timeout = NGX_CONF_UNSET;
 
+    /* dns_hook_add/remove zeroed by pcalloc; delay defaulted in init. */
+    amcf->dns_propagation_delay = NGX_CONF_UNSET;
+
     return amcf;
 }
 
@@ -367,6 +370,7 @@ ngx_http_autocert_init_main_conf(ngx_conf_t *cf, void *conf)
     }
 
     ngx_conf_init_value(amcf->resolver_timeout, 30);
+    ngx_conf_init_value(amcf->dns_propagation_delay, 10);   /* M16 dns-01 */
 
     /* EAB: a key-id without an HMAC key (or vice versa) is meaningless and
      * would silently fall back to an unbound newAccount the CA rejects, so
@@ -957,10 +961,13 @@ ngx_http_autocert_challenge(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     } else if (ngx_strcmp(value[1].data, "tls-alpn-01") == 0) {
         amcf->challenge = NGX_HTTP_AUTOCERT_CHALLENGE_TLS_ALPN_01;
 
+    } else if (ngx_strcmp(value[1].data, "dns-01") == 0) {
+        amcf->challenge = NGX_HTTP_AUTOCERT_CHALLENGE_DNS_01;
+
     } else {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            "invalid challenge \"%V\" in \"autocert_challenge\", "
-                           "expected \"http-01\" or \"tls-alpn-01\"",
+                           "expected \"http-01\", \"tls-alpn-01\" or \"dns-01\"",
                            &value[1]);
         return NGX_CONF_ERROR;
     }

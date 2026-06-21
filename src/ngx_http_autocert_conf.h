@@ -32,7 +32,8 @@ typedef enum {
 
 typedef enum {
     NGX_HTTP_AUTOCERT_CHALLENGE_HTTP_01 = 0,
-    NGX_HTTP_AUTOCERT_CHALLENGE_TLS_ALPN_01
+    NGX_HTTP_AUTOCERT_CHALLENGE_TLS_ALPN_01,
+    NGX_HTTP_AUTOCERT_CHALLENGE_DNS_01
 } ngx_http_autocert_challenge_e;
 
 
@@ -67,6 +68,13 @@ typedef struct {
      * the CA (decoded to raw bytes at registration time). */
     ngx_str_t    eab_kid;           /* CA-issued key identifier, "" if unset */
     ngx_str_t    eab_hmac_key;      /* base64url HMAC key, "" if unset */
+
+    /* M16: dns-01 challenge. The driver publishes a TXT record by exec'ing an
+     * operator hook (D3), waits dns_propagation_delay, then asks the CA to
+     * validate. Hooks "" until set; delay defaults at init_main_conf. */
+    ngx_str_t    dns_hook_add;      /* exec to publish the TXT, "" if unset */
+    ngx_str_t    dns_hook_remove;   /* exec to remove the TXT, "" if unset */
+    time_t       dns_propagation_delay;  /* seconds to wait after publish */
 
     ngx_shm_zone_t  *shm_zone;      /* published enabled-name set (for M4) */
     ngx_array_t     *names;         /* ngx_str_t, collected at postconfig */

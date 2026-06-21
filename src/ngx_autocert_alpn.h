@@ -48,6 +48,7 @@
  */
 #define NGX_AUTOCERT_CHALLENGE_HTTP_01       0
 #define NGX_AUTOCERT_CHALLENGE_TLS_ALPN_01   1
+#define NGX_AUTOCERT_CHALLENGE_DNS_01        2
 
 
 /* Upper bounds (defensive). A DNS name is <= 255; a P-256/P-384 self-signed
