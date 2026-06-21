@@ -531,6 +531,17 @@ ngx_http_autocert_postconfig(ngx_conf_t *cf)
             continue;
         }
 
+        /*
+         * Account contact: the ACME account is a single per-instance object, but
+         * the email is configured per-vhost (`autocert on <email>`). Policy:
+         * the FIRST enabled vhost with a non-empty email supplies the account
+         * contact; later/other emails are ignored (documented in README). It is
+         * emitted as contact:["mailto:<email>"] in newAccount.
+         */
+        if (amcf->email.len == 0 && ascf->email.len != 0) {
+            amcf->email = ascf->email;
+        }
+
         sn = cscf->server_names.elts;
 
         for (n = 0; n < cscf->server_names.nelts; n++) {

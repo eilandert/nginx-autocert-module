@@ -663,31 +663,63 @@ ngx_autocert_account_post_account(ngx_autocert_account_t *acct)
         return NGX_ERROR;
     }
 
-    /* M15: if EAB is configured, build the externalAccountBinding JWS and fold
-     * it into the newAccount payload (RFC 8555 §7.3.4). EAB is sent ONLY on
-     * newAccount — kid-signed POSTs (newOrder etc.) never carry it. The
-     * new_account_url must already be json_safe (checked above) since it goes
-     * into the EAB protected header too. */
-    if (acct->eab_kid.len != 0) {
-        u_char  *p;
-        size_t   size;
+    /*
+     * The newAccount payload carries ToS agreement plus two optional members:
+     *  - contact:["mailto:<email>"] (audit LOW) when an account email is set;
+     *  - externalAccountBinding:<JWS> (M15, RFC 8555 §7.3.4) when EAB is set.
+     * EAB is sent ONLY on newAccount — kid-signed POSTs never carry it. Both
+     * the email and new_account_url (json_safe above) land in signed JSON, so
+     * the email is json_safe-checked too. Build the payload once with whichever
+     * members are present:
+     *   {"termsOfServiceAgreed":true[,"contact":[...]][,"externalAccountBinding":...]}
+     */
+    if (acct->email.len != 0 || acct->eab_kid.len != 0) {
+        ngx_str_t  contact = ngx_null_string;
+        size_t     size;
 
-        if (ngx_autocert_account_build_eab(acct, &jwk, &eab) != NGX_OK) {
-            return NGX_ERROR;
+        if (acct->email.len != 0) {
+            if (!ngx_autocert_account_json_safe(&acct->email)) {
+                ngx_log_error(NGX_LOG_ERR, acct->log, 0,
+                              "autocert: unsafe character in account email");
+                return NGX_ERROR;
+            }
+            contact.data = ngx_pnalloc(acct->pool,
+                sizeof(",\"contact\":[\"mailto:\"]") - 1 + acct->email.len);
+            if (contact.data == NULL) {
+                return NGX_ERROR;
+            }
+            p = ngx_cpymem(contact.data, ",\"contact\":[\"mailto:",
+                           sizeof(",\"contact\":[\"mailto:") - 1);
+            p = ngx_cpymem(p, acct->email.data, acct->email.len);
+            p = ngx_cpymem(p, "\"]", sizeof("\"]") - 1);
+            contact.len = p - contact.data;
         }
 
-        size = sizeof("{\"termsOfServiceAgreed\":true,"
-                      "\"externalAccountBinding\":}") - 1 + eab.len;
+        if (acct->eab_kid.len != 0) {
+            if (ngx_autocert_account_build_eab(acct, &jwk, &eab) != NGX_OK) {
+                return NGX_ERROR;
+            }
+        } else {
+            ngx_str_null(&eab);
+        }
+
+        size = sizeof("{\"termsOfServiceAgreed\":true}") - 1 + contact.len
+               + (eab.len ? sizeof(",\"externalAccountBinding\":") - 1 + eab.len
+                          : 0);
         payload.data = ngx_pnalloc(acct->pool, size);
         if (payload.data == NULL) {
             return NGX_ERROR;
         }
-        p = ngx_cpymem(payload.data,
-                       "{\"termsOfServiceAgreed\":true,"
-                       "\"externalAccountBinding\":",
-                       sizeof("{\"termsOfServiceAgreed\":true,"
-                              "\"externalAccountBinding\":") - 1);
-        p = ngx_cpymem(p, eab.data, eab.len);
+        p = ngx_cpymem(payload.data, "{\"termsOfServiceAgreed\":true",
+                       sizeof("{\"termsOfServiceAgreed\":true") - 1);
+        if (contact.len) {
+            p = ngx_cpymem(p, contact.data, contact.len);
+        }
+        if (eab.len) {
+            p = ngx_cpymem(p, ",\"externalAccountBinding\":",
+                           sizeof(",\"externalAccountBinding\":") - 1);
+            p = ngx_cpymem(p, eab.data, eab.len);
+        }
         *p++ = '}';
         payload.len = p - payload.data;
     }

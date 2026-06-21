@@ -51,6 +51,7 @@ typedef struct {
  */
 typedef struct {
     ngx_str_t    ca;                /* ACME directory URL */
+    ngx_str_t    email;             /* account contact (1st enabled vhost), "" */
     ngx_flag_t   staging;          /* autocert_staging on|off */
     time_t       renew_before;      /* seconds before notAfter to renew */
     ngx_uint_t   key_type;          /* ngx_http_autocert_key_type_e */
