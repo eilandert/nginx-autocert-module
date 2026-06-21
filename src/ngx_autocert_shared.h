@@ -26,6 +26,7 @@ typedef struct {
     ngx_str_t        dns_hook_add;     /* M16 dns-01 publish-TXT exec, "" */
     ngx_str_t        dns_hook_remove;  /* M16 dns-01 remove-TXT exec, "" */
     time_t           dns_propagation_delay;  /* M16 seconds after publish */
+    time_t           dns_hook_timeout;  /* M16 seconds to wait for a hook exec */
     ngx_uint_t       key_type;       /* ngx_http_autocert_key_type_e (acct key) */
     ngx_uint_t       store;          /* ngx_http_autocert_store_e (disk layout) */
     ngx_str_t        path;           /* cert store dir (holds the account key) */

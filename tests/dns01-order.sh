@@ -90,6 +90,10 @@ http {
     autocert_ca_certificate $PREFIX/ca.pem;
     autocert_path $PREFIX/store;
     autocert_challenge dns-01;
+    # D3 requires both hooks for dns-01; /bin/true is a no-op stub so the order
+    # still reaches (and logs) the publish-TXT step without a real DNS provider.
+    autocert_dns_hook_add /bin/true;
+    autocert_dns_hook_remove /bin/true;
     server {
         listen 8080;
         server_name ${ORDER_DOMAIN};
