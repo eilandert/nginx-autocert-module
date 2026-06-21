@@ -104,7 +104,7 @@ static ngx_command_t  ngx_http_autocert_commands[] = {
       NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_str_slot,
       NGX_HTTP_MAIN_CONF_OFFSET,
-      offsetof(ngx_http_autocert_main_conf_t, ca),
+      offsetof(ngx_http_autocert_main_conf_t, ca_conf.ca),
       NULL },
 
     /* Shorthand for the LE staging directory URL; mutually exclusive with
@@ -114,7 +114,7 @@ static ngx_command_t  ngx_http_autocert_commands[] = {
       NGX_HTTP_MAIN_CONF|NGX_CONF_FLAG,
       ngx_conf_set_flag_slot,
       NGX_HTTP_MAIN_CONF_OFFSET,
-      offsetof(ngx_http_autocert_main_conf_t, staging),
+      offsetof(ngx_http_autocert_main_conf_t, ca_conf.staging),
       NULL },
 
     { ngx_string("autocert_renew_before"),
@@ -172,7 +172,7 @@ static ngx_command_t  ngx_http_autocert_commands[] = {
       NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_str_slot,
       NGX_HTTP_MAIN_CONF_OFFSET,
-      offsetof(ngx_http_autocert_main_conf_t, ca_certificate),
+      offsetof(ngx_http_autocert_main_conf_t, ca_conf.ca_certificate),
       NULL },
 
     /* M15: External Account Binding (RFC 8555 §7.3.4) for commercial CAs
@@ -183,14 +183,14 @@ static ngx_command_t  ngx_http_autocert_commands[] = {
       NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_str_slot,
       NGX_HTTP_MAIN_CONF_OFFSET,
-      offsetof(ngx_http_autocert_main_conf_t, eab_kid),
+      offsetof(ngx_http_autocert_main_conf_t, ca_conf.eab_kid),
       NULL },
 
     { ngx_string("autocert_eab_hmac_key"),
       NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_str_slot,
       NGX_HTTP_MAIN_CONF_OFFSET,
-      offsetof(ngx_http_autocert_main_conf_t, eab_hmac_key),
+      offsetof(ngx_http_autocert_main_conf_t, ca_conf.eab_hmac_key),
       NULL },
 
     /* M16: dns-01 operator exec hooks (D3). Both required when
@@ -329,7 +329,7 @@ ngx_http_autocert_create_main_conf(ngx_conf_t *cf)
     }
 
     /* ca, path zeroed by pcalloc; set in init_main_conf. */
-    amcf->staging = NGX_CONF_UNSET;
+    amcf->ca_conf.staging = NGX_CONF_UNSET;
     amcf->renew_before = NGX_CONF_UNSET;
     amcf->key_type = NGX_CONF_UNSET_UINT;
     amcf->store = NGX_CONF_UNSET_UINT;
@@ -351,19 +351,19 @@ ngx_http_autocert_init_main_conf(ngx_conf_t *cf, void *conf)
 {
     ngx_http_autocert_main_conf_t  *amcf = conf;
 
-    ngx_conf_init_value(amcf->staging, 0);
+    ngx_conf_init_value(amcf->ca_conf.staging, 0);
 
-    if (amcf->staging) {
-        if (amcf->ca.data != NULL) {
+    if (amcf->ca_conf.staging) {
+        if (amcf->ca_conf.ca.data != NULL) {
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                 "\"autocert_staging\" and \"autocert_ca\" are mutually "
                 "exclusive");
             return NGX_CONF_ERROR;
         }
-        ngx_str_set(&amcf->ca, NGX_HTTP_AUTOCERT_STAGING_CA);
+        ngx_str_set(&amcf->ca_conf.ca, NGX_HTTP_AUTOCERT_STAGING_CA);
 
-    } else if (amcf->ca.data == NULL) {
-        ngx_str_set(&amcf->ca, NGX_HTTP_AUTOCERT_DEFAULT_CA);
+    } else if (amcf->ca_conf.ca.data == NULL) {
+        ngx_str_set(&amcf->ca_conf.ca, NGX_HTTP_AUTOCERT_DEFAULT_CA);
     }
 
     /* User spec: 7d default (industry-safer 30d noted but honoring request). */
@@ -397,8 +397,8 @@ ngx_http_autocert_init_main_conf(ngx_conf_t *cf, void *conf)
      * the cycle's SSL cache via cf->cycle->old_cycle and faults in a worker), so
      * the path must already be absolute by the time the worker uses it.
      */
-    if (amcf->ca_certificate.len != 0
-        && ngx_conf_full_name(cf->cycle, &amcf->ca_certificate, 1) != NGX_OK)
+    if (amcf->ca_conf.ca_certificate.len != 0
+        && ngx_conf_full_name(cf->cycle, &amcf->ca_conf.ca_certificate, 1) != NGX_OK)
     {
         return NGX_CONF_ERROR;
     }
@@ -412,9 +412,9 @@ ngx_http_autocert_init_main_conf(ngx_conf_t *cf, void *conf)
      * fail config rather than surprise the operator at registration time.
      * Presence is "directive given" (data != NULL after str_slot); an explicit
      * empty value ("") is given-but-useless and must also fail. */
-    if ((amcf->eab_kid.data != NULL) != (amcf->eab_hmac_key.data != NULL)
-        || (amcf->eab_kid.data != NULL
-            && (amcf->eab_kid.len == 0 || amcf->eab_hmac_key.len == 0)))
+    if ((amcf->ca_conf.eab_kid.data != NULL) != (amcf->ca_conf.eab_hmac_key.data != NULL)
+        || (amcf->ca_conf.eab_kid.data != NULL
+            && (amcf->ca_conf.eab_kid.len == 0 || amcf->ca_conf.eab_hmac_key.len == 0)))
     {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
             "\"autocert_eab_kid\" and \"autocert_eab_hmac_key\" must both be "
@@ -476,6 +476,11 @@ ngx_http_autocert_create_srv_conf(ngx_conf_t *cf)
 
     /* ascf->email is zeroed by pcalloc */
     ascf->enable = NGX_CONF_UNSET;
+
+    /* M1 prep: per-server CA knobs unset until M4 wires SRV-scope directives +
+     * merge. ca_conf str fields are zeroed by pcalloc (= unset); only the flag
+     * needs an explicit UNSET so a future merge_value can detect "not set". */
+    ascf->ca_conf.staging = NGX_CONF_UNSET;
 
     return ascf;
 }

@@ -80,13 +80,13 @@ ngx_autocert_get_conf(ngx_cycle_t *cycle, ngx_autocert_conf_t *out)
                    "autocert: resolved http conf, challenge:%ui names:%ui",
                    amcf->challenge,
                    amcf->names ? amcf->names->nelts : (ngx_uint_t) 0);
-    out->ca = amcf->ca;
+    out->ca = amcf->ca_conf.ca;
     out->email = amcf->email;
     out->resolver = amcf->resolver;
     out->resolver_timeout = amcf->resolver_timeout;
-    out->ca_certificate = amcf->ca_certificate;
-    out->eab_kid = amcf->eab_kid;
-    out->eab_hmac_key = amcf->eab_hmac_key;
+    out->ca_certificate = amcf->ca_conf.ca_certificate;
+    out->eab_kid = amcf->ca_conf.eab_kid;
+    out->eab_hmac_key = amcf->ca_conf.eab_hmac_key;
     out->dns_hook_add = amcf->dns_hook_add;
     out->dns_hook_remove = amcf->dns_hook_remove;
     out->dns_propagation_delay = amcf->dns_propagation_delay;
