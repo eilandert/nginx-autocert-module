@@ -66,25 +66,64 @@
 #define NGX_AUTOCERT_HTTP_TIMEOUT 30000   /* ms; per-request transport timeout */
 
 
+/*
+ * M5 per-name failure backoff slot. Defined up here (was below the scheduler
+ * section) because each CA's state now carries its own per-name backoff array.
+ */
+typedef struct {
+    time_t      next_eligible;   /* don't retry before this (0 = ready) */
+    ngx_uint_t  fails;           /* consecutive failures */
+} ngx_autocert_backoff_t;
+
+
+/*
+ * M5 multi-engine driver: one ACME engine per distinct CA the instance issues
+ * against (ngx_autocert_conf.ca_list, an ngx_autocert_ca_entry_t array grouped
+ * by effective CA at postconfig). Each CA gets its own outbound client, its own
+ * registered account (with that CA's directory URL + EAB), and its own per-name
+ * backoff array. A SINGLE order is in flight across all CAs at any time
+ * (ngx_autocert_order below) and the renewal scheduler walks CAs × names with a
+ * (ca, name) cursor, so the ACME flows never overlap. Account bootstrap is
+ * SEQUENTIAL: CA[i]'s registration terminal starts CA[i+1]'s; when the last
+ * account is live (or skipped) the scheduler is armed.
+ */
+typedef struct {
+    ngx_autocert_ca_entry_t     *entry;        /* &ca_list[i]: ca_conf,names,hash,key */
+    ngx_autocert_acme_client_t   client;       /* per-CA outbound client */
+    ngx_uint_t                   client_ready;
+    ngx_autocert_account_t      *account;      /* per-CA registered account */
+    ngx_pool_t                  *account_pool;
+    ngx_uint_t                   account_live;  /* registration succeeded */
+    ngx_autocert_backoff_t      *backoff;      /* per-name, [entry->names->nelts] */
+    ngx_uint_t                   backoff_n;
+} ngx_autocert_ca_state_t;
+
+
 static void ngx_autocert_kick_handler(ngx_event_t *ev);
 static ngx_int_t ngx_autocert_driver_trylock(ngx_cycle_t *cycle);
 static void ngx_autocert_relock_handler(ngx_event_t *ev);
 static void ngx_autocert_account_done(ngx_autocert_account_t *acct,
     ngx_int_t rc);
+static void ngx_autocert_bootstrap_ca(ngx_cycle_t *cycle, ngx_uint_t ca_idx);
 static void ngx_autocert_start_order(ngx_cycle_t *cycle);
 static void ngx_autocert_order_complete(ngx_autocert_order_t *order,
     ngx_int_t rc);
 
 
 /*
- * The outbound ACME client, owned by the driver for its lifetime, built once
- * and reused for every request. The account bootstrap (M4d-2) runs once at
- * startup: directory -> newNonce -> newAccount.
+ * The per-CA engines (clients + accounts + backoff), allocated once from the
+ * cycle pool at the first kick, one entry per ca_list CA. NULL until the kick
+ * builds them.
  */
-static ngx_autocert_acme_client_t  ngx_autocert_client;
-static ngx_uint_t                   ngx_autocert_client_ready;
-static ngx_autocert_account_t      *ngx_autocert_account;
-static ngx_pool_t                  *ngx_autocert_account_pool;
+static ngx_autocert_ca_state_t     *ngx_autocert_ca_states;
+static ngx_uint_t                   ngx_autocert_ca_states_n;
+static ngx_cycle_t                 *ngx_autocert_cycle;     /* for account_done */
+
+/*
+ * A single ACME order is in flight at a time across every CA — serialised by
+ * the scheduler's (ca, name) cursor. The order carries its CA's account +
+ * directory URL, so one global order slot suffices.
+ */
 static ngx_autocert_order_t        *ngx_autocert_order;
 static ngx_pool_t                  *ngx_autocert_order_pool;
 static ngx_uint_t                   ngx_autocert_test_seeded;
@@ -159,34 +198,27 @@ ngx_autocert_mkdir_secure(ngx_cycle_t *cycle, u_char *dir)
 
 
 /*
- * M3: ensure the per-CA account dir <path>/accounts/<ca_hash>/ exists (0700) and
- * migrate the legacy flat <path>/account.key into it ONCE (rename only if the
- * new key is absent and the old one is present). Returns the per-CA key path
- * (aliases the config-pool string), or NULL on a hard failure. With no ca_list
- * (defensive) falls back to the flat <path>/account.key.
+ * M3/M5: ensure the per-CA account dir <path>/accounts/<ca_hash>/ exists (0700)
+ * and migrate the legacy flat <path>/account.key into it ONCE (rename only if
+ * the new key is absent and the old one is present). `ca` is the ca_list entry
+ * this engine drives. Returns the per-CA key path (aliases the config-pool
+ * string ca->account_key_path), or NULL on a hard failure.
+ *
+ * M5: the legacy-flat migration only makes sense for the PRIMARY CA (the one a
+ * single-CA deploy used). `migrate` gates it so the second+ CA never tries to
+ * rename the one shared flat key into its own dir (it would migrate to the wrong
+ * CA's account dir, or — once the primary already took it — find it absent and
+ * silently generate a fresh per-CA key, which is the correct behavior anyway).
  */
 static u_char *
 ngx_autocert_prepare_account_key(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
-    ngx_pool_t *pool)
+    ngx_autocert_ca_entry_t *ca, ngx_uint_t migrate, ngx_pool_t *pool)
 {
-    ngx_autocert_ca_entry_t  *ca;
     u_char                   *accounts_dir, *ca_dir, *key_path, *old_flat, *p;
     size_t                    alen;
     struct stat               st;
 
-    if (acf->ca_list == NULL || acf->ca_list->nelts == 0) {
-        key_path = ngx_pnalloc(pool, acf->path.len + sizeof("/account.key"));
-        if (key_path == NULL) {
-            return NULL;
-        }
-        p = ngx_cpymem(key_path, acf->path.data, acf->path.len);
-        ngx_memcpy(p, "/account.key", sizeof("/account.key"));
-        return key_path;
-    }
-
-    /* M3: one account at ca_list[0]; M5 iterates per CA. */
-    ca = acf->ca_list->elts;
-    key_path = ca[0].account_key_path.data;     /* config pool; outlives worker */
+    key_path = ca->account_key_path.data;       /* config pool; outlives worker */
 
     /* <path>/accounts (NUL-terminated) */
     alen = acf->path.len + sizeof("/accounts") - 1;
@@ -205,7 +237,7 @@ ngx_autocert_prepare_account_key(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
     }
     p = ngx_cpymem(ca_dir, accounts_dir, alen);
     *p++ = '/';
-    p = ngx_cpymem(p, ca[0].ca_hash, 8);
+    p = ngx_cpymem(p, ca->ca_hash, 8);
     *p = '\0';
 
     if (ngx_autocert_mkdir_secure(cycle, accounts_dir) != NGX_OK
@@ -214,7 +246,13 @@ ngx_autocert_prepare_account_key(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
         return NULL;
     }
 
-    /* One-time migration of the legacy flat key. */
+    /* One-time migration of the legacy flat key — PRIMARY CA only (M5). A
+     * single-CA deploy's flat <path>/account.key belongs to the first CA; a
+     * second CA must not claim it. */
+    if (!migrate) {
+        return key_path;
+    }
+
     old_flat = ngx_pnalloc(pool, acf->path.len + sizeof("/account.key"));
     if (old_flat == NULL) {
         return NULL;
@@ -262,9 +300,7 @@ static void
 ngx_autocert_kick_handler(ngx_event_t *ev)
 {
     ngx_cycle_t              *cycle = ev->data;
-    ngx_pool_t               *pool;
     ngx_autocert_conf_t       acf;
-    ngx_autocert_account_t   *acct;
 
     if (ngx_quit || ngx_terminate || ngx_exiting) {
         return;
@@ -277,8 +313,9 @@ ngx_autocert_kick_handler(ngx_event_t *ev)
     }
 
     ngx_log_debug3(NGX_LOG_DEBUG_CORE, cycle->log, 0,
-                   "autocert: kick config ca \"%V\" names:%ui challenge:%ui",
-                   &acf.ca, acf.names ? acf.names->nelts : 0,
+                   "autocert: kick config CAs:%ui names:%ui challenge:%ui",
+                   acf.ca_list ? acf.ca_list->nelts : 0,
+                   acf.names ? acf.names->nelts : 0,
                    (ngx_uint_t) acf.challenge);
 
     /* TEST-ONLY: seed the configured challenge into the shared store once, so
@@ -348,134 +385,242 @@ ngx_autocert_kick_handler(ngx_event_t *ev)
     }
 
     /*
-     * M4 (Codex #4): no issuable names => nothing to order, so do NOT build the
-     * ACME client or bootstrap an account. With per-vhost multi-CA an empty
-     * ca_list leaves acf.ca == "" (the flat bridge has no [0] entry); proceeding
-     * would register an account against an empty directory URL. The test seeds
-     * above are intentionally exempt (they exercise the serve path without an
-     * order flow). The renewal scheduler already guards on names; this guards
-     * the one-time account bootstrap on the same condition.
+     * M4 (Codex #4) / M5: no issuable names => nothing to order, so do NOT build
+     * any ACME client or bootstrap any account. With per-vhost multi-CA an empty
+     * ca_list means no enabled vhost groups under any CA. The test seeds above
+     * are intentionally exempt (they exercise the serve path without an order
+     * flow). The renewal scheduler already guards on names; this guards the
+     * account bootstrap on the same condition.
      */
-    if (acf.names == NULL || acf.names->nelts == 0) {
+    if (acf.names == NULL || acf.names->nelts == 0
+        || acf.ca_list == NULL || acf.ca_list->nelts == 0)
+    {
         ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
                       "autocert: no issuable names; driver idle (no account)");
         return;
     }
 
-    if (!ngx_autocert_client_ready) {
-        if (ngx_autocert_acme_client_create(&ngx_autocert_client, cycle,
-                                            &acf.ca_certificate, acf.resolver,
-                                            NGX_AUTOCERT_HTTP_TIMEOUT)
-            != NGX_OK)
-        {
+    /* Build the per-CA engine array once (idempotent across kick retries). */
+    if (ngx_autocert_ca_states == NULL) {
+        ngx_autocert_ca_entry_t  *entries = acf.ca_list->elts;
+        ngx_uint_t                n = acf.ca_list->nelts;
+        ngx_uint_t                i;
+
+        if (n > NGX_MAX_SIZE_T_VALUE / sizeof(ngx_autocert_ca_state_t)) {
             ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
-                          "autocert: failed to build ACME client");
-            ngx_add_timer(ev, NGX_AUTOCERT_KICK_RETRY);   /* retry, don't idle */
+                          "autocert: implausible CA count");
             return;
         }
-        ngx_autocert_client.resolver_timeout = acf.resolver_timeout * 1000;
-        ngx_autocert_client_ready = 1;
 
-        ngx_log_debug1(NGX_LOG_DEBUG_CORE, cycle->log, 0,
-                       "autocert: ACME client ready, resolver timeout %M ms",
-                       ngx_autocert_client.resolver_timeout);
+        ngx_autocert_ca_states = ngx_pcalloc(cycle->pool,
+            n * sizeof(ngx_autocert_ca_state_t));
+        if (ngx_autocert_ca_states == NULL) {
+            ngx_add_timer(ev, NGX_AUTOCERT_KICK_RETRY);
+            return;
+        }
+        for (i = 0; i < n; i++) {
+            ngx_autocert_ca_states[i].entry = &entries[i];
+        }
+        ngx_autocert_ca_states_n = n;
+        ngx_autocert_cycle = cycle;
+
+        ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
+                      "autocert: %ui CA engine(s) to bootstrap", n);
     }
 
-    /* Run the account bootstrap once. */
-    if (ngx_autocert_account != NULL) {
-        ngx_log_debug0(NGX_LOG_DEBUG_CORE, cycle->log, 0,
-                       "autocert: account bootstrap already in progress/live");
-        return;                         /* already registering / registered */
-    }
+    /* Kick the SEQUENTIAL account bootstrap from the first CA (idempotent: if
+     * CA[0] is already live/in-flight, bootstrap_ca short-circuits). The chain
+     * (account_done -> next CA -> ... -> arm scheduler) takes it from here. */
+    ngx_autocert_bootstrap_ca(cycle, 0);
+}
 
-    pool = ngx_create_pool(NGX_MIN_POOL_SIZE, cycle->log);
-    if (pool == NULL) {
-        ngx_add_timer(ev, NGX_AUTOCERT_KICK_RETRY);
+
+/*
+ * M5: bootstrap (build client + register account) for one CA engine, then chain.
+ * Skips a CA that is already live or already has an in-flight bootstrap. On a
+ * transient failure to START this CA's bootstrap, SKIPS to the next CA (a single
+ * bad CA must not wedge the others); the scheduler is armed once the chain
+ * reaches the end with at least one live account, else the kick is re-armed.
+ */
+static void
+ngx_autocert_bootstrap_ca(ngx_cycle_t *cycle, ngx_uint_t ca_idx)
+{
+    ngx_autocert_conf_t       acf;
+    ngx_autocert_ca_state_t  *state;
+    ngx_autocert_account_t   *acct;
+    ngx_pool_t               *pool;
+    ngx_uint_t                i, any_live, any_dead;
+
+    if (ngx_quit || ngx_terminate || ngx_exiting) {
         return;
     }
 
-    ngx_autocert_account = ngx_pcalloc(pool,
-                                       sizeof(ngx_autocert_account_t));
-    if (ngx_autocert_account == NULL) {
-        ngx_destroy_pool(pool);
-        ngx_add_timer(ev, NGX_AUTOCERT_KICK_RETRY);
+    if (ngx_autocert_get_conf(cycle, &acf) != NGX_OK || !acf.configured) {
         return;
     }
-    ngx_autocert_account_pool = pool;
 
-    acct = ngx_autocert_account;
-    acct->client = &ngx_autocert_client;
-    acct->cycle = cycle;
-    acct->log = cycle->log;
-    acct->directory_url = acf.ca;
-    acct->key_type = acf.key_type;
-    acct->email = acf.email;
-    acct->eab_kid = acf.eab_kid;
-    acct->eab_hmac_key = acf.eab_hmac_key;
-    acct->handler = ngx_autocert_account_done;
-    acct->data = cycle;                 /* used to chain into the order flow */
+    while (ca_idx < ngx_autocert_ca_states_n) {
+        state = &ngx_autocert_ca_states[ca_idx];
 
-    /* M3: per-CA account key path <path>/accounts/<ca_hash>/account.key; the
-     * helper mkdir's the dirs and migrates the legacy flat key once. */
-    acct->key_path.data = ngx_autocert_prepare_account_key(cycle, &acf, pool);
-    if (acct->key_path.data == NULL) {
-        ngx_destroy_pool(pool);
-        ngx_autocert_account = NULL;
-        ngx_autocert_account_pool = NULL;
-        ngx_add_timer(ev, NGX_AUTOCERT_KICK_RETRY);
+        /* Already live, or bootstrap already in flight: move past it. */
+        if (state->account != NULL) {
+            ca_idx++;
+            continue;
+        }
+
+        /* Build this CA's outbound client lazily. */
+        if (!state->client_ready) {
+            if (ngx_autocert_acme_client_create(&state->client, cycle,
+                    &state->entry->ca_conf.ca_certificate, acf.resolver,
+                    NGX_AUTOCERT_HTTP_TIMEOUT)
+                != NGX_OK)
+            {
+                ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
+                              "autocert: failed to build ACME client for %V; "
+                              "skipping this CA", &state->entry->ca_conf.ca);
+                ca_idx++;
+                continue;
+            }
+            state->client.resolver_timeout = acf.resolver_timeout * 1000;
+            state->client_ready = 1;
+        }
+
+        pool = ngx_create_pool(NGX_MIN_POOL_SIZE, cycle->log);
+        if (pool == NULL) {
+            ca_idx++;
+            continue;
+        }
+
+        acct = ngx_pcalloc(pool, sizeof(ngx_autocert_account_t));
+        if (acct == NULL) {
+            ngx_destroy_pool(pool);
+            ca_idx++;
+            continue;
+        }
+
+        acct->client = &state->client;
+        acct->cycle = cycle;
+        acct->log = cycle->log;
+        acct->directory_url = state->entry->ca_conf.ca;
+        acct->key_type = acf.key_type;
+        acct->email = acf.email;
+        acct->eab_kid = state->entry->ca_conf.eab_kid;
+        acct->eab_hmac_key = state->entry->ca_conf.eab_hmac_key;
+        acct->handler = ngx_autocert_account_done;
+        acct->data = state;             /* chain key: which CA engine this is */
+
+        /* M3/M5: per-CA account key <path>/accounts/<ca_hash>/account.key. Only
+         * the first CA (ca_idx 0) migrates the legacy flat key into its dir. */
+        acct->key_path.data = ngx_autocert_prepare_account_key(cycle, &acf,
+                                  state->entry, ca_idx == 0, pool);
+        if (acct->key_path.data == NULL) {
+            ngx_destroy_pool(pool);
+            ca_idx++;
+            continue;
+        }
+        acct->key_path.len = ngx_strlen(acct->key_path.data);
+
+        state->account = acct;
+        state->account_pool = pool;
+
+        ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
+                      "autocert: registering ACME account via %V",
+                      &state->entry->ca_conf.ca);
+
+        if (ngx_autocert_account_register(acct) != NGX_OK) {
+            ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
+                          "autocert: could not start ACME account registration "
+                          "for %V; skipping this CA", &state->entry->ca_conf.ca);
+            ngx_destroy_pool(pool);
+            state->account = NULL;
+            state->account_pool = NULL;
+            ca_idx++;
+            continue;
+        }
+
+        /* Registration started; its terminal (account_done) resumes the chain. */
         return;
     }
-    acct->key_path.len = ngx_strlen(acct->key_path.data);
 
-    ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
-                  "autocert: registering ACME account via %V", &acf.ca);
+    /*
+     * Chain reached the end. Arm the renewal scheduler if at least one account
+     * came up. Independently, if ANY CA is still dead (transient client-build /
+     * OOM / register-start / registration failure), re-arm the kick timer so the
+     * dead CA(s) are retried — even when the scheduler is already armed for the
+     * live ones (Codex M5 MED: a transient failure for one CA must not be
+     * permanent just because another CA succeeded). The retry re-enters
+     * bootstrap_ca(0): live accounts short-circuit, and start_order() /
+     * sched arming are both idempotent.
+     */
+    any_live = 0;
+    any_dead = 0;
+    for (i = 0; i < ngx_autocert_ca_states_n; i++) {
+        if (ngx_autocert_ca_states[i].account_live) {
+            any_live = 1;
+        } else {
+            any_dead = 1;
+        }
+    }
 
-    if (ngx_autocert_account_register(acct) != NGX_OK) {
-        ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
-                      "autocert: could not start ACME account registration");
-        ngx_destroy_pool(pool);
-        ngx_autocert_account = NULL;
-        ngx_autocert_account_pool = NULL;
-        ngx_add_timer(ev, NGX_AUTOCERT_KICK_RETRY);
+    if (any_live) {
+        ngx_autocert_start_order(cycle);
+    }
+
+    if (any_dead && !ngx_quit && !ngx_terminate && !ngx_exiting
+        && ngx_autocert_kick_timer.handler != NULL
+        && !ngx_autocert_kick_timer.timer_set)
+    {
+        ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
+                      "autocert: %s; retrying bootstrap for the dead CA(s)",
+                      any_live ? "some ACME accounts did not come up"
+                               : "no ACME account came up");
+        ngx_add_timer(&ngx_autocert_kick_timer, NGX_AUTOCERT_KICK_RETRY);
     }
 }
 
 
 /*
- * Terminal callback of the account bootstrap. On failure the account is freed.
- * On success the account is kept ALIVE as the ACME session (it owns the kid,
- * key and current nonce that every later POST is signed with — M6a) and the
- * order flow is started for the first collected name. The CI asserts on the
- * success line emitted by the account module.
+ * Terminal callback of a CA's account bootstrap (M5: data == that CA's engine
+ * state). On failure the account is freed and the CA is left dead (account_live
+ * stays 0). On success the account is kept ALIVE as the ACME session for that CA
+ * (it owns the kid, key and current nonce that every later kid-signed POST is
+ * signed with). Either way the SEQUENTIAL bootstrap chain resumes at the NEXT CA
+ * (bootstrap_ca), which arms the renewal scheduler once the last CA is handled
+ * with >=1 live account. The CI asserts on the success line emitted by the
+ * account module.
  */
 static void
 ngx_autocert_account_done(ngx_autocert_account_t *acct, ngx_int_t rc)
 {
-    ngx_cycle_t  *cycle = acct->data;
+    ngx_autocert_ca_state_t  *state = acct->data;
+    ngx_cycle_t              *cycle = ngx_autocert_cycle;
+    ngx_uint_t                next;
+
+    /* Recover this CA's index to resume the chain at the next one. */
+    next = (ngx_uint_t) (state - ngx_autocert_ca_states) + 1;
 
     if (rc != NGX_OK) {
         ngx_log_error(NGX_LOG_ERR, acct->log, 0,
-                      "autocert: ACME account registration failed");
+                      "autocert: ACME account registration failed for %V",
+                      &state->entry->ca_conf.ca);
         ngx_autocert_account_free(acct);            /* key + bootstrap pool */
-        ngx_autocert_account = NULL;
-        if (ngx_autocert_account_pool) {
-            ngx_destroy_pool(ngx_autocert_account_pool);
-            ngx_autocert_account_pool = NULL;
+        state->account = NULL;
+        if (state->account_pool) {
+            ngx_destroy_pool(state->account_pool);
+            state->account_pool = NULL;
         }
-        if (!ngx_quit && !ngx_terminate && !ngx_exiting
-            && ngx_autocert_kick_timer.handler != NULL
-            && !ngx_autocert_kick_timer.timer_set)
-        {
-            ngx_add_timer(&ngx_autocert_kick_timer, NGX_AUTOCERT_KICK_RETRY);
-        }
+        /* Leave this CA dead; the chain continues with the rest. */
+        ngx_autocert_bootstrap_ca(cycle, next);
         return;
     }
 
+    state->account_live = 1;
     ngx_log_debug1(NGX_LOG_DEBUG_CORE, acct->log, 0,
                    "autocert: ACME account ready, kid \"%V\"", &acct->kid);
 
-    /* Keep the account alive; chain into the order flow. */
-    ngx_autocert_start_order(cycle);
+    /* Account kept alive; resume the bootstrap chain at the next CA (the last
+     * CA arms the renewal scheduler in bootstrap_ca). */
+    ngx_autocert_bootstrap_ca(cycle, next);
 }
 
 
@@ -506,31 +651,31 @@ ngx_autocert_account_done(ngx_autocert_account_t *acct, ngx_int_t rc)
  * Per-name failure backoff: after a failed order for a name, hold off
  * retrying it for BASE << min(fails-1, MAXSHIFT) seconds, capped at CAP, so a
  * persistently failing name (bad DNS, ACME rate limit) doesn't get hammered
- * every sweep. A success clears it.
+ * every sweep. A success clears it. (ngx_autocert_backoff_t is defined near the
+ * top; each CA engine owns its own per-name array in ngx_autocert_ca_state_t.)
  */
 #define NGX_AUTOCERT_BACKOFF_BASE    60          /* 60s first retry hold */
 #define NGX_AUTOCERT_BACKOFF_MAXSHIFT 6          /* 60s..3840s growth */
 #define NGX_AUTOCERT_BACKOFF_CAP     (60 * 60)   /* 1h ceiling, seconds */
 
-typedef struct {
-    time_t      next_eligible;   /* don't retry before this (0 = ready) */
-    ngx_uint_t  fails;           /* consecutive failures */
-} ngx_autocert_backoff_t;
-
 static ngx_event_t              ngx_autocert_sched_timer;
-static ngx_uint_t               ngx_autocert_sched_index;  /* next name to scan */
+static ngx_uint_t               ngx_autocert_sched_ca;     /* next CA to scan */
+static ngx_uint_t               ngx_autocert_sched_index;  /* next name in that CA */
+static ngx_uint_t               ngx_autocert_sched_cur_ca; /* CA index in flight */
 static ngx_uint_t               ngx_autocert_sched_cur;    /* name index in flight */
-static ngx_autocert_backoff_t  *ngx_autocert_backoff;      /* per-name, [n] */
-static ngx_uint_t               ngx_autocert_backoff_n;    /* array length */
 
 static void ngx_autocert_sched_handler(ngx_event_t *ev);
 static void ngx_autocert_sched_pump(ngx_cycle_t *cycle);
 static ngx_int_t ngx_autocert_name_due(ngx_cycle_t *cycle,
     ngx_autocert_conf_t *acf, ngx_str_t *name);
 static ngx_int_t ngx_autocert_start_order_for(ngx_cycle_t *cycle,
-    ngx_autocert_conf_t *acf, ngx_str_t *name);
-static void ngx_autocert_backoff_record(ngx_uint_t index, ngx_uint_t success);
-static void ngx_autocert_backoff_hold(ngx_uint_t index, time_t when);
+    ngx_autocert_conf_t *acf, ngx_autocert_ca_state_t *state, ngx_str_t *name);
+static ngx_int_t ngx_autocert_ca_backoff_ensure(ngx_cycle_t *cycle,
+    ngx_autocert_ca_state_t *state);
+static void ngx_autocert_backoff_record(ngx_autocert_ca_state_t *state,
+    ngx_uint_t index, ngx_uint_t success);
+static void ngx_autocert_backoff_hold(ngx_autocert_ca_state_t *state,
+    ngx_uint_t index, time_t when);
 
 
 /*
@@ -574,6 +719,10 @@ ngx_autocert_sched_handler(ngx_event_t *ev)
 {
     ngx_cycle_t  *cycle = ev->data;
 
+    if (ngx_quit || ngx_terminate || ngx_exiting) {
+        return;                         /* retiring worker: don't start a sweep */
+    }
+
     if (ngx_autocert_order != NULL) {
         /* An order is still in flight from a previous tick; let its completion
          * drive the scan. Rearm so we don't lose the periodic beat. */
@@ -585,23 +734,78 @@ ngx_autocert_sched_handler(ngx_event_t *ev)
 
     ngx_log_debug0(NGX_LOG_DEBUG_CORE, cycle->log, 0,
                    "autocert: scheduler sweep starting");
+    ngx_autocert_sched_ca = 0;
     ngx_autocert_sched_index = 0;
     ngx_autocert_sched_pump(cycle);
 }
 
 
 /*
- * Advance through the name set from ngx_autocert_sched_index, launching an
- * order for the first name that needs one. If none remain, rearm the periodic
- * timer for the next sweep.
+ * M5: lazily size a CA engine's per-name backoff array to its name count.
+ * Allocated from the cycle pool; the name set is stable for the worker's life
+ * (a reload spawns fresh workers), so a realloc-on-mismatch is enough. Returns
+ * NGX_OK with state->backoff valid, or NGX_ERROR (skip this CA this sweep).
+ */
+static ngx_int_t
+ngx_autocert_ca_backoff_ensure(ngx_cycle_t *cycle,
+    ngx_autocert_ca_state_t *state)
+{
+    ngx_uint_t  n;
+
+    n = (state->entry->names != NULL) ? state->entry->names->nelts : 0;
+
+    if (n == 0) {
+        return NGX_ERROR;
+    }
+
+    if (state->backoff != NULL && state->backoff_n == n) {
+        return NGX_OK;
+    }
+
+    /* Guard the size multiply against wrap (nelts is operator-controlled). */
+    if (n > NGX_MAX_SIZE_T_VALUE / sizeof(ngx_autocert_backoff_t)) {
+        ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
+                      "autocert: implausible server name count");
+        state->backoff_n = 0;
+        return NGX_ERROR;
+    }
+
+    state->backoff = ngx_pcalloc(cycle->pool,
+                                 n * sizeof(ngx_autocert_backoff_t));
+    if (state->backoff == NULL) {
+        state->backoff_n = 0;
+        return NGX_ERROR;
+    }
+    state->backoff_n = n;
+    return NGX_OK;
+}
+
+
+/*
+ * Advance the (CA, name) cursor from (sched_ca, sched_index), launching an order
+ * for the first due name under a live CA engine. One order in flight across all
+ * CAs. If the whole CAs×names space is exhausted with nothing to do, rearm the
+ * periodic timer.
  */
 static void
 ngx_autocert_sched_pump(ngx_cycle_t *cycle)
 {
-    ngx_autocert_conf_t   acf;
-    ngx_str_t            *names, *name;
+    ngx_autocert_conf_t       acf;
+    ngx_autocert_ca_state_t  *state;
+    ngx_str_t                *names, *name;
 
     ngx_memzero(&acf, sizeof(ngx_autocert_conf_t));
+
+    /* Don't launch new orders once the worker is retiring (Codex M5 MED): a
+     * graceful QUIT must let the order in flight finish and then STOP — pumping
+     * the next due name here would keep issuing and pin the singleton lock open,
+     * blocking the next generation's worker 0 from taking over. The sched timer
+     * is cancelable, so simply not rearming lets the worker exit promptly. */
+    if (ngx_quit || ngx_terminate || ngx_exiting) {
+        ngx_log_debug0(NGX_LOG_DEBUG_CORE, cycle->log, 0,
+                       "autocert: worker exiting; scheduler pump stops");
+        return;
+    }
 
     if (ngx_autocert_order != NULL) {
         ngx_log_debug0(NGX_LOG_DEBUG_CORE, cycle->log, 0,
@@ -612,75 +816,62 @@ ngx_autocert_sched_pump(ngx_cycle_t *cycle)
     if (ngx_autocert_get_conf(cycle, &acf) != NGX_OK || !acf.configured) {
         goto rearm;
     }
-
-    if (acf.names == NULL || acf.names->nelts == 0) {
-        ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
-                      "autocert: no server names collected; nothing to order");
-        goto rearm;
-    }
     if (acf.challenge_zone == NULL) {
         ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
                       "autocert: no challenge zone; cannot run order");
         goto rearm;
     }
 
-    names = acf.names->elts;
-
-    /* Lazily size the per-name backoff array to the (stable, postconfig) name
-     * set. Allocated from the cycle pool; if the count ever changes across a
-     * reload spawns fresh workers, so a simple realloc-on-mismatch is
-     * enough. */
-    if (ngx_autocert_backoff == NULL
-        || ngx_autocert_backoff_n != acf.names->nelts)
+    /* Outer cursor: CA engine. Inner cursor: name within that CA. */
+    for ( ; ngx_autocert_sched_ca < ngx_autocert_ca_states_n;
+         ngx_autocert_sched_ca++, ngx_autocert_sched_index = 0)
     {
-        /* Guard the size multiply against wrap before allocating (nelts is
-         * operator-controlled). A wrap would underallocate and later
-         * backoff[i] would read/write out of bounds. */
-        if (acf.names->nelts
-            > NGX_MAX_SIZE_T_VALUE / sizeof(ngx_autocert_backoff_t))
-        {
-            ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
-                          "autocert: implausible server name count");
-            ngx_autocert_backoff_n = 0;
-            goto rearm;
+        state = &ngx_autocert_ca_states[ngx_autocert_sched_ca];
+
+        /* A CA whose account never came up is skipped (its names can't issue). */
+        if (!state->account_live || state->account == NULL) {
+            continue;
         }
-
-        ngx_autocert_backoff = ngx_pcalloc(cycle->pool,
-            acf.names->nelts * sizeof(ngx_autocert_backoff_t));
-        if (ngx_autocert_backoff == NULL) {
-            ngx_autocert_backoff_n = 0;
-            goto rearm;
+        if (state->entry->names == NULL || state->entry->names->nelts == 0) {
+            continue;
         }
-        ngx_autocert_backoff_n = acf.names->nelts;
-    }
-
-    while (ngx_autocert_sched_index < acf.names->nelts) {
-        ngx_uint_t  i = ngx_autocert_sched_index++;
-
-        name = &names[i];
-
-        /* Honour the per-name failure backoff before any disk/clock check. */
-        if (ngx_autocert_backoff[i].next_eligible > ngx_time()) {
-            ngx_log_debug2(NGX_LOG_DEBUG_CORE, cycle->log, 0,
-                           "autocert: name \"%V\" held by backoff until %T",
-                           name, ngx_autocert_backoff[i].next_eligible);
+        if (ngx_autocert_ca_backoff_ensure(cycle, state) != NGX_OK) {
             continue;
         }
 
-        if (!ngx_autocert_name_due(cycle, &acf, name)) {
-            ngx_log_debug1(NGX_LOG_DEBUG_CORE, cycle->log, 0,
-                           "autocert: name \"%V\" not due", name);
-            continue;
-        }
+        names = state->entry->names->elts;
 
-        ngx_autocert_sched_cur = i;     /* record which name is in flight */
+        while (ngx_autocert_sched_index < state->entry->names->nelts) {
+            ngx_uint_t  i = ngx_autocert_sched_index++;
 
-        if (ngx_autocert_start_order_for(cycle, &acf, name) == NGX_OK) {
-            return;                     /* order_complete will pump again */
+            name = &names[i];
+
+            /* Honour the per-name failure backoff before any disk/clock check. */
+            if (state->backoff[i].next_eligible > ngx_time()) {
+                ngx_log_debug2(NGX_LOG_DEBUG_CORE, cycle->log, 0,
+                               "autocert: name \"%V\" held by backoff until %T",
+                               name, state->backoff[i].next_eligible);
+                continue;
+            }
+
+            if (!ngx_autocert_name_due(cycle, &acf, name)) {
+                ngx_log_debug1(NGX_LOG_DEBUG_CORE, cycle->log, 0,
+                               "autocert: name \"%V\" not due", name);
+                continue;
+            }
+
+            ngx_autocert_sched_cur_ca = ngx_autocert_sched_ca;
+            ngx_autocert_sched_cur = i;     /* (CA, name) in flight */
+
+            if (ngx_autocert_start_order_for(cycle, &acf, state, name)
+                == NGX_OK)
+            {
+                return;                 /* order_complete will pump again */
+            }
+            /* Launch failed (transient: pool/OOM) — treat as a failure for the
+             * backoff so we don't spin on it, then try the next name. */
+            ngx_autocert_backoff_record(state, i, 0);
         }
-        /* Launch failed (transient: pool/OOM) — treat as a failure for backoff
-         * so we don't spin on it, then try the next name this sweep. */
-        ngx_autocert_backoff_record(i, 0);
     }
 
 rearm:
@@ -695,7 +886,7 @@ rearm:
         ngx_msec_t  interval = NGX_AUTOCERT_SCHED_INTERVAL;
         time_t      now = ngx_time();
         time_t      soonest = 0;
-        ngx_uint_t  i;
+        ngx_uint_t  c, i;
 
         if (acf.configured && acf.renew_before > 0) {
             /* Compute in 64-bit: renew_before is time_t seconds; a large
@@ -708,12 +899,15 @@ rearm:
             }
         }
 
-        /* If any name is backing off, wake when its hold expires (so a 60s
-         * backoff isn't stuck behind a 12h sweep). */
-        for (i = 0; i < ngx_autocert_backoff_n; i++) {
-            time_t  e = ngx_autocert_backoff[i].next_eligible;
-            if (e > now && (soonest == 0 || e < soonest)) {
-                soonest = e;
+        /* If any name under any CA is backing off, wake when the soonest hold
+         * expires (so a 60s backoff isn't stuck behind a 12h sweep). */
+        for (c = 0; c < ngx_autocert_ca_states_n; c++) {
+            ngx_autocert_ca_state_t  *s = &ngx_autocert_ca_states[c];
+            for (i = 0; i < s->backoff_n; i++) {
+                time_t  e = s->backoff[i].next_eligible;
+                if (e > now && (soonest == 0 || e < soonest)) {
+                    soonest = e;
+                }
             }
         }
         if (soonest != 0) {
@@ -738,17 +932,18 @@ rearm:
  * name is retried with increasing delay instead of every sweep.
  */
 static void
-ngx_autocert_backoff_record(ngx_uint_t index, ngx_uint_t success)
+ngx_autocert_backoff_record(ngx_autocert_ca_state_t *state, ngx_uint_t index,
+    ngx_uint_t success)
 {
     ngx_autocert_backoff_t  *b;
     ngx_uint_t               shift;
     time_t                   delay;
 
-    if (ngx_autocert_backoff == NULL || index >= ngx_autocert_backoff_n) {
+    if (state->backoff == NULL || index >= state->backoff_n) {
         return;
     }
 
-    b = &ngx_autocert_backoff[index];
+    b = &state->backoff[index];
 
     if (success) {
         ngx_log_debug1(NGX_LOG_DEBUG_CORE, ngx_cycle->log, 0,
@@ -784,15 +979,16 @@ ngx_autocert_backoff_record(ngx_uint_t index, ngx_uint_t success)
  * failure path set it.
  */
 static void
-ngx_autocert_backoff_hold(ngx_uint_t index, time_t when)
+ngx_autocert_backoff_hold(ngx_autocert_ca_state_t *state, ngx_uint_t index,
+    time_t when)
 {
     ngx_autocert_backoff_t  *b;
 
-    if (ngx_autocert_backoff == NULL || index >= ngx_autocert_backoff_n) {
+    if (state->backoff == NULL || index >= state->backoff_n) {
         return;
     }
 
-    b = &ngx_autocert_backoff[index];
+    b = &state->backoff[index];
     if (when > b->next_eligible) {
         b->next_eligible = when;
         ngx_log_debug2(NGX_LOG_DEBUG_CORE, ngx_cycle->log, 0,
@@ -915,13 +1111,15 @@ ngx_autocert_name_due(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
 
 
 /*
- * Launch the M6a/M6b order flow for one name, reusing the live account as the
- * ACME session. Returns NGX_OK if the order started (ngx_autocert_order set);
- * NGX_ERROR otherwise (caller moves on to the next name).
+ * Launch the M6a/M6b order flow for one name under a given CA engine, reusing
+ * that CA's live account as the ACME session and its directory URL. Returns
+ * NGX_OK if the order started (ngx_autocert_order set); NGX_ERROR otherwise
+ * (caller moves on to the next name). EAB is on the account (set at register),
+ * so the order needs none.
  */
 static ngx_int_t
 ngx_autocert_start_order_for(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
-    ngx_str_t *name)
+    ngx_autocert_ca_state_t *state, ngx_str_t *name)
 {
     ngx_pool_t            *pool;
     ngx_autocert_order_t  *order;
@@ -943,9 +1141,9 @@ ngx_autocert_start_order_for(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
 
     /* The domain string aliases the HTTP main-conf pool, which outlives the
      * order; the order copies what it needs into its own pool internally. */
-    order->account = ngx_autocert_account;
+    order->account = state->account;
     order->log = cycle->log;
-    order->directory_url = acf->ca;
+    order->directory_url = state->entry->ca_conf.ca;
     order->domain = *name;
     order->challenge_zone = acf->challenge_zone;
     order->challenge = acf->challenge;          /* M10c/M16: http/alpn/dns */
@@ -987,7 +1185,8 @@ ngx_autocert_start_order_for(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
 static void
 ngx_autocert_order_complete(ngx_autocert_order_t *order, ngx_int_t rc)
 {
-    ngx_cycle_t  *cycle = order->data;
+    ngx_cycle_t              *cycle = order->data;
+    ngx_autocert_ca_state_t  *state;
 
     if (rc == NGX_OK) {
         ngx_log_error(NGX_LOG_NOTICE, order->log, 0,
@@ -998,14 +1197,18 @@ ngx_autocert_order_complete(ngx_autocert_order_t *order, ngx_int_t rc)
                       "autocert: ACME order failed for \"%V\"", &order->domain);
     }
 
-    /* Record the outcome for the in-flight name's backoff: success clears it,
-     * failure grows the per-name retry delay (don't hammer a failing name). */
-    ngx_autocert_backoff_record(ngx_autocert_sched_cur, rc == NGX_OK);
+    /* The in-flight (CA, name) was recorded at launch. Record the outcome into
+     * THAT CA's per-name backoff: success clears it, failure grows the per-name
+     * retry delay (don't hammer a failing name). */
+    state = &ngx_autocert_ca_states[ngx_autocert_sched_cur_ca];
+
+    ngx_autocert_backoff_record(state, ngx_autocert_sched_cur, rc == NGX_OK);
 
     /* If the CA rate-limited us (429), honour its Retry-After: hold this name
      * at least until then, on top of the exponential backoff just recorded. */
     if (rc != NGX_OK && order->retry_after > 0) {
-        ngx_autocert_backoff_hold(ngx_autocert_sched_cur, order->retry_after);
+        ngx_autocert_backoff_hold(state, ngx_autocert_sched_cur,
+                                  order->retry_after);
     }
 
     ngx_autocert_order_free(order);     /* drops token, frees order pool... */
@@ -1245,18 +1448,29 @@ ngx_autocert_driver_exit_process(ngx_cycle_t *cycle)
         ngx_autocert_order_pool = NULL;
     }
 
-    if (ngx_autocert_account != NULL) {
-        ngx_autocert_account_free(ngx_autocert_account);
-        ngx_autocert_account = NULL;
-    }
-    if (ngx_autocert_account_pool != NULL) {
-        ngx_destroy_pool(ngx_autocert_account_pool);
-        ngx_autocert_account_pool = NULL;
-    }
+    /* M5: tear down every per-CA engine (account + bootstrap pool + client). */
+    if (ngx_autocert_ca_states != NULL) {
+        ngx_uint_t  i;
 
-    if (ngx_autocert_client_ready) {
-        ngx_autocert_acme_client_destroy(&ngx_autocert_client);
-        ngx_autocert_client_ready = 0;
+        for (i = 0; i < ngx_autocert_ca_states_n; i++) {
+            ngx_autocert_ca_state_t  *state = &ngx_autocert_ca_states[i];
+
+            if (state->account != NULL) {
+                ngx_autocert_account_free(state->account);
+                state->account = NULL;
+            }
+            if (state->account_pool != NULL) {
+                ngx_destroy_pool(state->account_pool);
+                state->account_pool = NULL;
+            }
+            if (state->client_ready) {
+                ngx_autocert_acme_client_destroy(&state->client);
+                state->client_ready = 0;
+            }
+        }
+        /* ca_states itself is in the cycle pool; nginx frees it. */
+        ngx_autocert_ca_states = NULL;
+        ngx_autocert_ca_states_n = 0;
     }
 
     /* Release the singleton lock (kernel drops it on close) so the next

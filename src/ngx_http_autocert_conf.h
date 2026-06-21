@@ -39,11 +39,10 @@ typedef enum {
 
 /*
  * multi-CA M1 (#15 residual): the CA-identifying knobs grouped into one struct
- * so they can later live per-server (autocert_ca / _staging / _ca_certificate /
- * _eab_kid / _eab_hmac_key). M1 only extracts the struct — NO behavior change:
- * the directives stay http{}-global and write main_conf.ca_conf. M4 gives
- * srv_conf its own ca_conf and merges global→server; M2/M5 group names+driver
- * state by CA.
+ * so they live per-server (autocert_ca / _staging / _ca_certificate / _eab_kid /
+ * _eab_hmac_key). M4 gives srv_conf its own ca_conf and merges global→server;
+ * M2 groups names by effective CA into main_conf.ca_list; M5's driver iterates
+ * ca_list and drives one ACME engine per CA from each entry's ca_conf.
  */
 typedef struct {
     ngx_str_t    ca;                /* ACME directory URL */
@@ -91,12 +90,6 @@ typedef struct {
  * occurrence of create_main_conf, read by every server.
  */
 typedef struct {
-    /* M4: vestigial. The CA knobs moved to SRV scope (srv_conf.ca_conf); the
-     * directives no longer write this. Kept only so the flat-conf accessor
-     * (ngx_autocert_conf.c) compiles against a stable layout — it now sources
-     * the primary CA from ca_list[0]. Remove when M5 drops the flat bridge. */
-    ngx_autocert_ca_conf_t  ca_conf;
-
     ngx_str_t    email;             /* account contact (1st enabled vhost), "" */
     time_t       renew_before;      /* seconds before notAfter to renew */
     ngx_uint_t   key_type;          /* ngx_http_autocert_key_type_e */

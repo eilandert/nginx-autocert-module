@@ -336,9 +336,9 @@ ngx_http_autocert_create_main_conf(ngx_conf_t *cf)
         return NULL;
     }
 
-    /* path zeroed by pcalloc; set in init_main_conf. M4: the CA knobs are SRV
-     * scope now (srv_conf.ca_conf); amcf->ca_conf is unused (kept for the M2/M3
-     * flat-accessor bridge, which reads ca_list[0] instead). */
+    /* path zeroed by pcalloc; set in init_main_conf. The CA knobs are SRV scope
+     * (srv_conf.ca_conf); postconfig groups names by effective CA into ca_list,
+     * which the worker-0 driver iterates per CA (M5). No flat amcf->ca_conf. */
     amcf->renew_before = NGX_CONF_UNSET;
     amcf->key_type = NGX_CONF_UNSET_UINT;
     amcf->store = NGX_CONF_UNSET_UINT;

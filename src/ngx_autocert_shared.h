@@ -17,13 +17,16 @@
 
 typedef struct {
     ngx_uint_t       configured;     /* 0 => autocert not present in http{} */
-    ngx_str_t        ca;             /* ACME directory URL */
     ngx_str_t        email;          /* account contact email, "" if none */
     ngx_resolver_t  *resolver;       /* may be NULL if autocert_resolver unset */
     time_t           resolver_timeout;
-    ngx_str_t        ca_certificate; /* PEM trust bundle path, "" => system */
-    ngx_str_t        eab_kid;        /* EAB key id (RFC 8555 §7.3.4), "" */
-    ngx_str_t        eab_hmac_key;   /* base64url EAB HMAC key, "" */
+    /*
+     * M5: the CA-identifying knobs (directory URL, trust bundle, EAB) are no
+     * longer flat — they live per-CA in each ca_list entry's ca_conf. The driver
+     * iterates ca_list and reads entry->ca_conf directly (see driver.c). The flat
+     * `ca`/`ca_certificate`/`eab_*` fields the M4 bridge populated from ca_list[0]
+     * are gone.
+     */
     ngx_str_t        dns_hook_add;     /* M16 dns-01 publish-TXT exec, "" */
     ngx_str_t        dns_hook_remove;  /* M16 dns-01 remove-TXT exec, "" */
     time_t           dns_propagation_delay;  /* M16 seconds after publish */
