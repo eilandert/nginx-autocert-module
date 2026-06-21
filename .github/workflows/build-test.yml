@@ -691,6 +691,7 @@ jobs:
           flavor: ${{ matrix.flavor }}
           dir: ${{ matrix.dir }}
           script: multi-ca.sh
+          sudo: "true"
 
   multi-ca-contact:
     name: per-CA account contact (one mailto per CA) [${{ matrix.flavor }}]
@@ -714,6 +715,7 @@ jobs:
           flavor: ${{ matrix.flavor }}
           dir: ${{ matrix.dir }}
           script: multi-ca-contact.sh
+          sudo: "true"
 
   single-process-reload:
     name: master_process off reload (driver + serve rebind) [${{ matrix.flavor }}]
