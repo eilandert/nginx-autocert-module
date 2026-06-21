@@ -19,6 +19,8 @@
 #include <openssl/pem.h>
 #include <openssl/err.h>
 
+#include <fcntl.h>
+
 
 /*
  * The RFC 8737 application protocol the ACME validation client negotiates. We
@@ -904,7 +906,10 @@ ngx_http_autocert_read_file(ngx_pool_t *pool, u_char *path, ngx_str_t *out,
     size_t           size;
     u_char          *buf;
 
-    fd = ngx_open_file(path, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
+    /* O_NOFOLLOW: never read a cert/key through a planted symlink — consistent
+     * with the order writer (fd-pinned) and ngx_http_autocert_cert_not_after(),
+     * which already refuse symlinked store entries. */
+    fd = open((const char *) path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (fd == NGX_INVALID_FILE) {
         return NGX_ERROR;
     }
