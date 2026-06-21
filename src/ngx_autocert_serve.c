@@ -346,6 +346,72 @@ ngx_autocert_serve_name_match(ngx_autocert_serve_ctx_t *sctx, ngx_str_t *name,
 }
 
 
+/*
+ * Free the OpenSSL objects held by every cert-cache node, in-order over the
+ * rbtree. The nodes themselves (ngx_autocert_cert_t) live in the cache pool and
+ * are reclaimed when the caller destroys it; only the X509/EVP_PKEY/chain are
+ * refcounted heap objects the pool would otherwise leak. Recursion depth is
+ * O(log n) for a balanced rbtree (the issuable-name set is small).
+ */
+static void
+ngx_autocert_serve_free_cache_certs(ngx_rbtree_node_t *node,
+    ngx_rbtree_node_t *sentinel)
+{
+    ngx_autocert_cert_t  *c;
+
+    if (node == sentinel) {
+        return;
+    }
+
+    ngx_autocert_serve_free_cache_certs(node->left, sentinel);
+    ngx_autocert_serve_free_cache_certs(node->right, sentinel);
+
+    c = (ngx_autocert_cert_t *) node;     /* sn.node is first member */
+    if (c->cert != NULL) {
+        X509_free(c->cert);
+    }
+    if (c->chain != NULL) {
+        sk_X509_pop_free(c->chain, X509_free);
+    }
+    if (c->key != NULL) {
+        EVP_PKEY_free(c->key);
+    }
+}
+
+
+/*
+ * `master_process off` reload of the per-worker serve state. In single-process
+ * mode the worker survives a SIGHUP, so the lazily-built configured-name gate
+ * and the cert cache stay bound to the old config — a removed name would remain
+ * servable, and stale cert nodes would linger. Drop the whole cache pool (it
+ * holds both the cert nodes and the name-index nodes) after freeing the cert
+ * objects it references, and clear the build latches so the next handshake
+ * rebuilds the gate and cache from the new config. Called from init_module on
+ * the single-process path only.
+ */
+void
+ngx_autocert_serve_reload(void)
+{
+    ngx_log_error(NGX_LOG_NOTICE, ngx_cycle->log, 0,
+                  "autocert: reload (master_process off) — dropping per-worker "
+                  "cert cache and name gate for rebuild");
+
+    if (ngx_autocert_cache_pool != NULL) {
+        ngx_autocert_serve_free_cache_certs(ngx_autocert_cache_rbtree.root,
+                                            &ngx_autocert_cache_sentinel);
+        ngx_destroy_pool(ngx_autocert_cache_pool);
+        ngx_autocert_cache_pool = NULL;
+    }
+
+    /* Both rbtrees lived in the now-freed pool; drop the dangling roots. The
+     * lazy rebuild re-inits them into a fresh pool on the next handshake. */
+    ngx_memzero(&ngx_autocert_cache_rbtree, sizeof(ngx_rbtree_t));
+    ngx_memzero(&ngx_autocert_names_rbtree, sizeof(ngx_rbtree_t));
+    ngx_autocert_names_built = 0;
+    ngx_autocert_names_failed = 0;
+}
+
+
 static int
 ngx_http_autocert_cert_cb(SSL *ssl_conn, void *arg)
 {

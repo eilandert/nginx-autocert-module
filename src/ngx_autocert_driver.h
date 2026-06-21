@@ -20,5 +20,9 @@ void ngx_autocert_driver_init_process(ngx_cycle_t *cycle);
 /* Tear the ACME engine state down on worker exit (best-effort frees). */
 void ngx_autocert_driver_exit_process(ngx_cycle_t *cycle);
 
+/* `master_process off` reload: tear down old-cycle engine state and re-arm
+ * against the new cycle (single-process mode has no exit/init_process on SIGHUP). */
+void ngx_autocert_driver_reload(ngx_cycle_t *cycle);
+
 
 #endif /* NGX_AUTOCERT_DRIVER_H_INCLUDED */

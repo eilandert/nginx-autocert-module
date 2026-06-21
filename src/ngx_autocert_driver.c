@@ -1484,3 +1484,108 @@ ngx_autocert_driver_exit_process(ngx_cycle_t *cycle)
                       "autocert: released driver lock, pid %P", ngx_pid);
     }
 }
+
+
+/*
+ * `master_process off` reload. In single-process mode the same process survives
+ * a SIGHUP: ngx_single_process_cycle() runs ngx_init_cycle() (which re-reads the
+ * config and re-runs every module's init_module) but never calls exit_process /
+ * init_process again. Without this, the driver keeps timers, per-CA engines, the
+ * in-flight order, and the test-seed latches all bound to the dead cycle and its
+ * pool, so a reload silently ignores new autocert config and can touch freed
+ * cycle memory. init_module calls this on the single-process path to tear the
+ * engine state down and re-arm it against the NEW cycle. The interprocess lock
+ * is intentionally kept open: this process is still the sole driver, so there is
+ * no peer to hand it to and re-flock'ing would only add a failure mode.
+ *
+ * Must run inside the worker event loop (true on reload — init_module fires from
+ * ngx_init_cycle() while the loop is live), since it re-arms a timer.
+ */
+void
+ngx_autocert_driver_reload(ngx_cycle_t *cycle)
+{
+    /* Cancel every driver timer bound to the old cycle. The handlers carry the
+     * old cycle in ev->data, so they must not fire after the cycle is gone. */
+    if (ngx_autocert_kick_timer.timer_set) {
+        ngx_del_timer(&ngx_autocert_kick_timer);
+    }
+    if (ngx_autocert_sched_timer.timer_set) {
+        ngx_del_timer(&ngx_autocert_sched_timer);
+    }
+    if (ngx_autocert_relock_timer.timer_set) {
+        ngx_del_timer(&ngx_autocert_relock_timer);
+    }
+
+    /* Detach any pending ACME resolver/socket event BEFORE freeing the pools its
+     * request lives in: the process keeps running across this reload, so a live
+     * event would otherwise fire on freed memory (and its handler would touch the
+     * dead-cycle driver state we are about to drop). */
+    ngx_autocert_acme_cancel_inflight();
+
+    /* Drop the in-flight order (its pool is independent of the cycle pool). */
+    if (ngx_autocert_order != NULL) {
+        ngx_autocert_order_free(ngx_autocert_order);
+        ngx_autocert_order = NULL;
+    }
+    if (ngx_autocert_order_pool != NULL) {
+        ngx_destroy_pool(ngx_autocert_order_pool);
+        ngx_autocert_order_pool = NULL;
+    }
+
+    /* Tear down every per-CA engine. ca_states itself was allocated from the OLD
+     * cycle pool (freed by ngx_clean_old_cycles once the old cycle retires), so
+     * just drop the pointer — the kick rebuilds it from the new cycle's ca_list. */
+    if (ngx_autocert_ca_states != NULL) {
+        ngx_uint_t  i;
+
+        for (i = 0; i < ngx_autocert_ca_states_n; i++) {
+            ngx_autocert_ca_state_t  *state = &ngx_autocert_ca_states[i];
+
+            if (state->account != NULL) {
+                ngx_autocert_account_free(state->account);
+                state->account = NULL;
+            }
+            if (state->account_pool != NULL) {
+                ngx_destroy_pool(state->account_pool);
+                state->account_pool = NULL;
+            }
+            if (state->client_ready) {
+                ngx_autocert_acme_client_destroy(&state->client);
+                state->client_ready = 0;
+            }
+        }
+        ngx_autocert_ca_states = NULL;
+        ngx_autocert_ca_states_n = 0;
+    }
+
+    /* Reset the scheduler cursor and the one-shot test-seed latches so the new
+     * config is scanned and (re)seeded from scratch. */
+    ngx_autocert_sched_ca = 0;
+    ngx_autocert_sched_index = 0;
+    ngx_autocert_sched_cur_ca = 0;
+    ngx_autocert_sched_cur = 0;
+    ngx_memzero(&ngx_autocert_sched_timer, sizeof(ngx_event_t));
+    ngx_autocert_test_seeded = 0;
+    ngx_autocert_test_alpn_seeded = 0;
+
+    ngx_autocert_cycle = cycle;
+
+    /*
+     * Release the old lock and re-acquire from scratch. The lock file lives in
+     * the store dir, so a reload that changes autocert_path (or disables autocert
+     * entirely) would otherwise leave us holding the OLD store's lock while the
+     * new store runs unlocked. Closing here + going back through init_process
+     * makes trylock() derive the lock path from the NEW cycle's config: it
+     * re-locks the same path when unchanged, moves to the new path when changed,
+     * and stays unlocked (idle) when the new config has no issuable names. */
+    if (ngx_autocert_lock_fd != -1) {
+        (void) close(ngx_autocert_lock_fd);
+        ngx_autocert_lock_fd = -1;
+    }
+
+    ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
+                  "autocert: reload (master_process off) — re-arming driver "
+                  "against new cycle, pid %P", ngx_pid);
+
+    ngx_autocert_driver_init_process(cycle);
+}

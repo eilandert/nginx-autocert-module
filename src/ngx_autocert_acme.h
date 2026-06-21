@@ -136,6 +136,13 @@ ngx_int_t ngx_autocert_acme_client_create(ngx_autocert_acme_client_t *client,
 
 void ngx_autocert_acme_client_destroy(ngx_autocert_acme_client_t *client);
 
+/*
+ * Cancel the single in-flight request (if any) WITHOUT calling its handler:
+ * detach its pending resolver/socket event so it can't fire on memory the caller
+ * is about to free. For the `master_process off` reload teardown. No-op if idle.
+ */
+void ngx_autocert_acme_cancel_inflight(void);
+
 
 /*
  * Start an async request. r must have client, pool, log, method (or "" => GET),
