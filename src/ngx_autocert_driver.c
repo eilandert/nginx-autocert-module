@@ -231,13 +231,13 @@ ngx_autocert_prepare_account_key(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
     *p = '\0';
 
     /* <path>/accounts/<ca_hash> (NUL-terminated) */
-    ca_dir = ngx_pnalloc(pool, alen + 1 + 8 + 1);
+    ca_dir = ngx_pnalloc(pool, alen + 1 + NGX_AUTOCERT_CA_HASH_HEX + 1);
     if (ca_dir == NULL) {
         return NULL;
     }
     p = ngx_cpymem(ca_dir, accounts_dir, alen);
     *p++ = '/';
-    p = ngx_cpymem(p, ca->ca_hash, 8);
+    p = ngx_cpymem(p, ca->ca_hash, NGX_AUTOCERT_CA_HASH_HEX);
     *p = '\0';
 
     if (ngx_autocert_mkdir_secure(cycle, accounts_dir) != NGX_OK

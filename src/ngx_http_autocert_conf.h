@@ -57,15 +57,18 @@ typedef struct {
  * multi-CA M2: one entry per distinct CA the instance issues against. Built at
  * postconfig by grouping enabled server_names by their effective CA. In the M1/M2
  * world (directives still http{}-global) there is exactly ONE entry holding every
- * name; M4 (SRV-scope) makes per-vhost CAs produce several. ca_hash is crc32 of
- * the canonical CA URL as 8 lowercase hex + NUL, used by M3 for the per-CA
- * account dir (<path>/accounts/<hash>/account.key). account_key_path is filled
- * by M3; "" in M2.
+ * name; M4 (SRV-scope) makes per-vhost CAs produce several. ca_hash is the leading
+ * 64 bits of SHA-256(canonical CA URL) as 16 lowercase hex + NUL, used by M3 for
+ * the per-CA account dir (<path>/accounts/<hash>/account.key). account_key_path
+ * is filled by M3; "" in M2. (Was crc32/hex8 — too short to rule out two distinct
+ * CA URLs aliasing onto one account.key, which would break per-CA key isolation.)
  */
+#define NGX_AUTOCERT_CA_HASH_HEX  16
 typedef struct {
     ngx_autocert_ca_conf_t  ca_conf;          /* resolved CA config */
     ngx_array_t            *names;             /* ngx_str_t under this CA */
-    u_char                  ca_hash[9];        /* crc32(ca url) hex8 + NUL */
+    u_char                  ca_hash[NGX_AUTOCERT_CA_HASH_HEX + 1];
+                                              /* sha256(ca url)[:8] hex16 + NUL */
     ngx_str_t               account_key_path;  /* M3 fills; "" in M2 */
     /*
      * Per-CA account contact. Each CA has its own ACME account, so each gets its
