@@ -488,11 +488,24 @@ ngx_autocert_acme_connect(ngx_autocert_acme_request_t *r,
     c->write->handler = ngx_autocert_acme_connect_handler;
     c->read->handler = ngx_autocert_acme_connect_handler;
 
+    /*
+     * Publish the inflight pointer NOW, before any call chain that can complete
+     * the request. On the fully-synchronous connect+handshake path
+     * ngx_autocert_acme_ssl_init() may drive the handshake (and, on a loopback /
+     * same-host CA, even the write + first read) inline, reaching
+     * ngx_autocert_acme_finalize() on this very stack; finalize clears the
+     * inflight pointer and the caller's handler may then destroy r->pool. So we
+     * must NOT write `r` into the global pointer AFTER such a chain returns
+     * (that was a use-after-free: the old code set it at the bottom of this
+     * function). Set it once here; finalize clears it; the sync-fail path below
+     * clears it explicitly before the caller frees the pool.
+     */
+    ngx_autocert_acme_inflight = r;       /* armed; cancelable on reload */
+
     if (rc == NGX_AGAIN) {
         ngx_log_debug1(NGX_LOG_DEBUG_CORE, r->log, 0,
                        "autocert: connect to \"%V\" in progress", &r->host);
         ngx_add_timer(c->write, r->client->connect_timeout);
-        ngx_autocert_acme_inflight = r;   /* connect armed; cancelable on reload */
         return NGX_OK;
     }
 
@@ -504,9 +517,13 @@ ngx_autocert_acme_connect(ngx_autocert_acme_request_t *r,
      * here (before any event is pending), tear the connection down ourselves
      * and report start-failure: the caller (request/resolve path) destroys the
      * request pool on NGX_ERROR, so no live event handler may reference r after
-     * we return. (The async paths finalize instead, which also closes c.)
+     * we return — clear the inflight pointer first so it never dangles.
+     * (The async + sync-finalize paths clear it via finalize instead.)
      */
     if (ngx_autocert_acme_ssl_init(r) != NGX_OK) {
+        if (r == ngx_autocert_acme_inflight) {
+            ngx_autocert_acme_inflight = NULL;
+        }
         if (r->peer.connection) {
             ngx_close_connection(r->peer.connection);
             r->peer.connection = NULL;
@@ -514,7 +531,9 @@ ngx_autocert_acme_connect(ngx_autocert_acme_request_t *r,
         return NGX_ERROR;
     }
 
-    ngx_autocert_acme_inflight = r;       /* TLS handshake armed; cancelable */
+    /* ssl_init returned NGX_OK: either the handshake is pending (inflight stays
+     * set, handler fires later) or it finalized inline (finalize already cleared
+     * inflight). Either way do NOT touch the pointer here. */
     return NGX_OK;
 }
 
@@ -604,12 +623,16 @@ ngx_autocert_acme_ssl_init(ngx_autocert_acme_request_t *r)
 
     /*
      * Synchronous handshake (rc == NGX_OK): drive the handshake handler inline.
-     * This runs build_request + write_handler synchronously, but write_handler
-     * always ends by waiting for the response read (read_handler returns on the
-     * first NGX_AGAIN — the reply can't be buffered before we unwind), so the
-     * completion handler (finalize) is NOT reached on this stack. The "handler
-     * fires later" contract (see ngx_autocert_acme.h) therefore holds even on
-     * the fully-synchronous connect+handshake path; no defer-to-loop needed.
+     * This runs build_request + write_handler synchronously. Usually the reply
+     * is not yet readable (a remote RTT away), so read_handler returns on the
+     * first NGX_AGAIN and finalize fires later from the event loop. But on a
+     * loopback / same-host CA the response CAN already be buffered, in which
+     * case read_handler reads it to completion and ngx_autocert_acme_finalize()
+     * runs on THIS stack. That is why ngx_autocert_acme_connect() publishes the
+     * inflight pointer BEFORE calling ssl_init and never writes it afterward
+     * (finalize clears it) — otherwise the inline-finalize path would leave a
+     * dangling global. Callers must therefore treat completion as signalled by
+     * the handler, not by the return value of ngx_autocert_acme_request().
      */
     ngx_autocert_acme_ssl_handshake_handler(c);
     return NGX_OK;
