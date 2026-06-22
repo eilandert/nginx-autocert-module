@@ -8,18 +8,51 @@
 
 **Automatic TLS certificates for NGINX — built into the server.**
 
-`nginx-autocert-module` is an in-server [ACME](https://datatracker.ietf.org/doc/html/rfc8555)
-client. Write `autocert on;` on a vhost and NGINX itself obtains, serves, and
-renews an ECDSA certificate from an ACME CA (Let's Encrypt by default) for that
-vhost's `server_name`s. There is no external client, no certbot, no cron job, no
-deploy hook, and no reload — the whole flow runs inside worker process 0, and the
-certificate is served straight out of the same worker on the next TLS handshake.
-**Your existing `server_name` list *is* the domain list.** Works with both NGINX
-and Angie (coexists with Angie's native `acme`).
+`nginx-autocert-module` is an [ACME](https://datatracker.ietf.org/doc/html/rfc8555)
+client that lives *inside* NGINX. Add `autocert on;` to a vhost and NGINX itself
+obtains, serves, and renews an ECDSA certificate from Let's Encrypt (or any ACME
+CA) for that vhost's `server_name`s — no certbot, no cron job, no deploy hook, no
+reload. The whole flow runs inside the worker, and the new certificate is served
+on the very next TLS handshake. **Your existing `server_name` list *is* the domain
+list.** Works on both NGINX and Angie (coexists with Angie's native `acme`).
 
 > 📖 New here? Start with the walkthrough:
 > **[Automatic TLS Certs, No Certbot](https://deb.myguard.nl/2026/06/nginx-autocert-module/)**
 > on deb.myguard.nl.
+
+---
+
+## Quick start — set and forget
+
+**One directive.** Add `autocert on;` to a vhost, make sure NGINX can reach the CA
+(a `resolver`), and you are done — issuance and renewal then happen on their own,
+forever.
+
+```nginx
+load_module modules/ngx_http_autocert_module.so;
+
+http {
+    resolver 1.1.1.1;                  # so NGINX can reach the ACME CA
+
+    server {
+        listen 80;                     # CA validates here over HTTP-01
+        listen 443 ssl;
+        server_name example.com www.example.com;
+
+        autocert on;                   # ← the whole feature. Nothing else needed.
+        # no ssl_certificate / ssl_certificate_key — autocert supplies them
+    }
+}
+```
+
+That is a complete, production-ready config. The first handshake triggers issuance
+from Let's Encrypt; a self-signed placeholder is served for the few seconds until
+the real certificate lands, after which the module renews it on its own (by default
+7 days before expiry). Add a vhost, set `autocert on;`, reload once — that's the
+whole workflow.
+
+Everything below is for when you want *more* — LE staging, wildcards, DNS-01, a
+different CA, EAB. **None of it is needed for the common case above.**
 
 ---
 
