@@ -54,14 +54,16 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
     -keyout "$PREFIX/ca-key.pem" -out "$PREFIX/ca.pem" -days 2 -nodes \
     -subj "/CN=$CA_HOST" -addext "subjectAltName=DNS:$CA_HOST" >/dev/null 2>&1
 
-# dnsmasq so the helper's resolver maps the mock CA name to the host (the mock
+# challtestsrv so the helper's resolver maps the mock CA name to the host (the mock
 # listens on 0.0.0.0:$CA_PORT on the host).
 docker network ls >/dev/null
 HOST_IP="127.0.0.1"
 docker run -d --name "$DNS_NAME" \
     -p ${DNS_PORT}:53/udp -p ${DNS_PORT}:53/tcp \
-    --entrypoint dnsmasq andyshinn/dnsmasq:2.83 \
-    -k --address=/${CA_HOST}/${HOST_IP} >/dev/null
+    ghcr.io/letsencrypt/pebble-challtestsrv:latest \
+    -dnsserver :53 -management :8055 \
+    -http01 "" -https01 "" -tlsalpn01 "" -doh "" \
+    -defaultIPv4 ${HOST_IP} -defaultIPv6 "" >/dev/null
 
 # ---- mock ACME server -------------------------------------------------------
 cat > "$PREFIX/mockca.py" <<PYEOF

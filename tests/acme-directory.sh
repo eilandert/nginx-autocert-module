@@ -2,7 +2,7 @@
 #
 # ACME end-to-end test (M4b transport + M4c parse + M4d account bootstrap).
 #
-# Brings up a Pebble ACME server + a tiny dnsmasq (so the helper's ngx_resolver
+# Brings up a Pebble ACME server + a tiny challtestsrv (so the helper's ngx_resolver
 # can resolve the Pebble hostname), points the helper at it with Pebble's CA in
 # the trust store, starts nginx, and asserts the helper registered an ACME
 # account over a *verified* TLS connection — exercising the directory fetch,
@@ -46,10 +46,12 @@ docker run -d --name "$PEBBLE_NAME" -p 14000:14000 -p 15000:15000 \
     -e PEBBLE_VA_NOSLEEP=1 \
     ghcr.io/letsencrypt/pebble:latest >/dev/null
 
-echo "== starting dnsmasq (resolves 'pebble' -> 127.0.0.1) =="
+echo "== starting challtestsrv (resolves 'pebble' -> 127.0.0.1) =="
 docker run -d --name "$DNS_NAME" -p ${DNS_PORT}:53/udp -p ${DNS_PORT}:53/tcp \
-    --entrypoint dnsmasq andyshinn/dnsmasq:2.83 \
-    -k --address=/pebble/127.0.0.1 >/dev/null
+    ghcr.io/letsencrypt/pebble-challtestsrv:latest \
+    -dnsserver :53 -management :8055 \
+    -http01 "" -https01 "" -tlsalpn01 "" -doh "" \
+    -defaultIPv4 127.0.0.1 -defaultIPv6 "" >/dev/null
 
 # Wait for Pebble's ACME endpoint to answer.
 for i in $(seq 1 30); do
