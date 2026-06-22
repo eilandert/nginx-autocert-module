@@ -1294,8 +1294,9 @@ ngx_autocert_acme_parse_response(ngx_autocert_acme_request_t *r)
 static ngx_int_t
 ngx_autocert_acme_chunk_size(u_char *p, u_char *eol, size_t *out)
 {
-    size_t   size = 0;
-    u_char  *q;
+    size_t      size = 0;
+    u_char     *q;
+    ngx_uint_t  ndigits = 0;
 
     if (p == eol) {
         return NGX_ERROR;                   /* empty size line */
@@ -1315,6 +1316,15 @@ ngx_autocert_acme_chunk_size(u_char *p, u_char *eol, size_t *out)
             return NGX_ERROR;               /* would overflow size_t */
         }
         size = (size << 4) | (size_t) d;
+        ndigits++;
+    }
+
+    /* A chunk-size line must carry at least one hex digit before any extension
+     * (";"), padding, or CRLF. Reject a digit-less line (e.g. ";ext" or " ")
+     * rather than silently treat malformed CA input as a 0-size (terminating)
+     * chunk, which could truncate the body. */
+    if (ndigits == 0) {
+        return NGX_ERROR;
     }
 
     *out = size;

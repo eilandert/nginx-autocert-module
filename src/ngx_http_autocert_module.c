@@ -909,13 +909,38 @@ ngx_http_autocert_wildcard(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
 
 /* D5: a sole, leading-label wildcard "*.rest" (the only wildcard ACME issues).
- * Same shape gate the server_name path applies to a wildcard server_name. */
+ * Beyond the shape gate, reject a malformed "rest" — empty labels (".."), a
+ * leading or trailing dot, or any other '*'. Without this, garbage like
+ * "*..example.com" would pass config, suppress a concrete name, and only fail
+ * later at issuance, leaving that name with no certificate. (Codex LOW.) */
 static ngx_int_t
 ngx_http_autocert_is_wildcard(ngx_str_t *name)
 {
-    return name->len >= 3
-           && name->data[0] == '*' && name->data[1] == '.'
-           && ngx_strlchr(name->data + 2, name->data + name->len, '*') == NULL;
+    u_char  *p, *end;
+
+    if (name->len < 3 || name->data[0] != '*' || name->data[1] != '.') {
+        return 0;
+    }
+
+    end = name->data + name->len;
+
+    /* "rest" starts at data+2; must be a non-empty dotted name with no empty
+     * label and no further '*'. data[1] is the separating '.', so the byte at
+     * data+2 must not be another '.' (that would be a leading empty label). */
+    if (name->data[2] == '.' || end[-1] == '.') {
+        return 0;                                   /* leading/trailing empty label */
+    }
+
+    for (p = name->data + 2; p < end; p++) {
+        if (*p == '*') {
+            return 0;                               /* only the leading-label '*' */
+        }
+        if (*p == '.' && p[1] == '.') {
+            return 0;                               /* consecutive dots = empty label */
+        }
+    }
+
+    return 1;
 }
 
 
@@ -1674,15 +1699,18 @@ ngx_http_autocert_key_type(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     /* Accept friendly aliases alongside the OpenSSL curve names: operators
      * think "P-384"/"P-256", not "secp384r1"/"secp256r1". */
-    if (ngx_strcmp(value[1].data, "secp384r1") == 0
-        || ngx_strcmp(value[1].data, "p384") == 0
-        || ngx_strcmp(value[1].data, "ecdsa-p384") == 0)
+    if (ngx_strcasecmp(value[1].data, (u_char *) "secp384r1") == 0
+        || ngx_strcasecmp(value[1].data, (u_char *) "p384") == 0
+        || ngx_strcasecmp(value[1].data, (u_char *) "p-384") == 0
+        || ngx_strcasecmp(value[1].data, (u_char *) "ecdsa-p384") == 0)
     {
         amcf->key_type = NGX_HTTP_AUTOCERT_KEY_P384;
 
-    } else if (ngx_strcmp(value[1].data, "secp256r1") == 0
-               || ngx_strcmp(value[1].data, "p256") == 0
-               || ngx_strcmp(value[1].data, "ecdsa-p256") == 0)
+    } else if (ngx_strcasecmp(value[1].data, (u_char *) "secp256r1") == 0
+               || ngx_strcasecmp(value[1].data, (u_char *) "prime256v1") == 0
+               || ngx_strcasecmp(value[1].data, (u_char *) "p256") == 0
+               || ngx_strcasecmp(value[1].data, (u_char *) "p-256") == 0
+               || ngx_strcasecmp(value[1].data, (u_char *) "ecdsa-p256") == 0)
     {
         amcf->key_type = NGX_HTTP_AUTOCERT_KEY_P256;
 

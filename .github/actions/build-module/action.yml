@@ -181,6 +181,10 @@ runs:
 
         run_pos "autocert_staging on"  'autocert_staging on; autocert_store_path /tmp/ac-stage;'
         run_pos "store certbot"        'autocert_store_layout certbot; autocert_store_path /tmp/ac-cb;'
+        run_pos "store default"        'autocert_store_layout default;'
+        run_pos "key_type p-256 alias" 'autocert_key_type p-256;'
+        run_pos "key_type prime256v1"  'autocert_key_type prime256v1;'
+        run_pos "contact email"        'autocert_contact ops@example.com;'
         run_pos "server autocert_ca"   'server { listen 8080; autocert_ca https://example.com/dir; }'
         echo "✓ all positive cases accepted"
 

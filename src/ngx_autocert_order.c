@@ -972,6 +972,16 @@ ngx_autocert_order_dns_hook(ngx_autocert_order_t *order, ngx_str_t *hook,
     }
 
     /*
+     * Parent ALSO sets the child's pgid (the canonical double-setpgid): the
+     * child runs setpgid(0,0), but if the timeout fires before it does, the
+     * later kill(-pid) would hit a non-existent group and the hook would keep
+     * running. Setting it here too makes the group exist regardless of which
+     * side wins the race. EACCES (child already exec'd) / ESRCH (already gone)
+     * are benign.
+     */
+    (void) setpgid(pid, pid);
+
+    /*
      * Parent: bounded wait. A blocking waitpid() would pin the worker forever
      * on a wedged hook, so poll with WNOHANG against a CLOCK_MONOTONIC deadline
      * (immune to oversleep / EINTR drift) and a short pacing sleep. On timeout
@@ -1015,7 +1025,12 @@ ngx_autocert_order_dns_hook(ngx_autocert_order_t *order, ngx_str_t *hook,
             ngx_log_error(NGX_LOG_ERR, order->log, 0,
                           "autocert: dns-01 hook \"%V\" timed out after %T s, "
                           "killing", hook, order->dns_hook_timeout);
-            (void) kill(-pid, SIGKILL);
+            /* Kill the whole group; if the group kill fails (e.g. the child
+             * lost the setpgid race and is still in its own inherited group),
+             * fall back to killing the direct child so it never lingers. */
+            if (kill(-pid, SIGKILL) != 0) {
+                (void) kill(pid, SIGKILL);
+            }
 
             /* bounded grace reap (~1s) so a stuck child can't pin the worker */
             for (grace = 0; grace < 50; grace++) {
