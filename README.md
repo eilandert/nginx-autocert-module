@@ -8,10 +8,14 @@
 
 **Automatic TLS certificates for NGINX — built into the server.**
 
-Write `autocert on;` on a vhost and NGINX obtains, serves, and renews a
-certificate from an ACME CA (Let's Encrypt by default) for that vhost's
-`server_name`s. No certbot, no cron, no deploy hook, no reload. **Your existing
-`server_name` list *is* the domain list** — there is nothing else to maintain.
+`nginx-autocert-module` is an in-server [ACME](https://datatracker.ietf.org/doc/html/rfc8555)
+client. Write `autocert on;` on a vhost and NGINX itself obtains, serves, and
+renews an ECDSA certificate from an ACME CA (Let's Encrypt by default) for that
+vhost's `server_name`s. There is no external client, no certbot, no cron job, no
+deploy hook, and no reload — the whole flow runs inside worker process 0, and the
+certificate is served straight out of the same worker on the next TLS handshake.
+**Your existing `server_name` list *is* the domain list.** Works with both NGINX
+and Angie (coexists with Angie's native `acme`).
 
 > 📖 New here? Start with the walkthrough:
 > **[Automatic TLS Certs, No Certbot](https://deb.myguard.nl/2026/06/nginx-autocert-module/)**
@@ -21,29 +25,310 @@ certificate from an ACME CA (Let's Encrypt by default) for that vhost's
 
 ## Why
 
-- **No certbot, no cron, no deploy hook** — a complete [RFC 8555](https://datatracker.ietf.org/doc/html/rfc8555)
-  ACME client runs inside NGINX itself.
-- **No reload on renewal** — certificates load per-SNI at the TLS handshake and
-  hot-swap the instant a renewal rewrites the file. Zero downtime.
-- **Keys stay in the worker** — the ACME engine runs on a worker-0 timer, not a
-  privileged helper; private keys never leave the worker process pool.
-- **Three challenge types** — HTTP-01, TLS-ALPN-01 (validates with **no port
-  80**), and DNS-01 (issues **wildcards**, needs **no inbound port**).
-- **Multiple CAs at once** — pin different vhosts to different CAs, each with its
-  own account and renewal engine.
-- **ECDSA only** — P-384 (default) or P-256, no RSA.
-- **nginx *and* Angie** — both are fully supported and run the same end-to-end
-  test suite. (On Angie this coexists with Angie's own native `acme`; pick
-  whichever you prefer.)
-
-Verified end-to-end against [Pebble](https://github.com/letsencrypt/pebble) in
-CI, plus fuzzing, Valgrind, CodeQL, and static analysis.
+- **No moving parts.** Issuance, renewal, and serving all happen inside the
+  running server. Nothing to install alongside, nothing to schedule.
+- **Three challenge types:** `http-01` (default), `tls-alpn-01`
+  ([RFC 8737](https://datatracker.ietf.org/doc/html/rfc8737)), and `dns-01`.
+- **Wildcards** via `dns-01` and an operator-supplied DNS hook (the only challenge
+  type the ACME spec allows for `*.example.com`).
+- **External Account Binding (EAB)** for commercial CAs (ZeroSSL, Sectigo, Google)
+  that gate `newAccount` behind a key-id + HMAC key.
+- **Certbot-compatible store** option — drop-in `live/<domain>/` layout — alongside
+  the module's own hardened default.
+- **Multiple CAs per instance**, selected per-vhost; each CA gets its own account
+  and account key.
+- **Per-SNI serving** — the right certificate is chosen in the TLS handshake from
+  the requested SNI, with a self-signed bootstrap cert served until issuance lands.
 
 ---
 
-## Quick start
+## Full syntax — one annotated config
 
-**1. Build** the module against your nginx source (OpenSSL ≥ 3.0.0 required):
+Every production directive below, with realistic values. Each line carries a
+`# context | default: …` comment. `http{}`-only directives live in `http{}`;
+the rest may also appear per-`server{}`.
+
+```nginx
+http {
+    resolver 127.0.0.1 [::1] valid=300s;        # core nginx; autocert falls back to this if autocert_resolver is unset
+
+    # ---- instance-wide defaults (folded into every server) ----
+    autocert            on  admin@example.com;  # http,server | default: off          (2nd arg = ACME account email, optional)
+    autocert_ca         https://acme-v02.api.letsencrypt.org/directory;
+                                                 # http,server | default: LE production (mutually exclusive with autocert_staging)
+    autocert_staging    off;                     # http,server | default: off          (on = LE staging directory)
+    autocert_path       /var/lib/autocert;       # http only   | default: autocert     (relative → resolved against nginx prefix)
+    autocert_store      secure;                   # http only   | default: secure       (secure | certbot)
+    autocert_key_type   secp384r1;                # http only   | default: secp384r1    (secp384r1 | secp256r1)
+    autocert_challenge  http-01;                  # http only   | default: http-01      (http-01 | tls-alpn-01 | dns-01)
+    autocert_renew_before 7d;                     # http only   | default: 7d           (renew this long before notAfter)
+
+    # ---- resolver used to REACH the CA (not for dns-01 validation) ----
+    autocert_resolver         127.0.0.1 [::1];    # http only   | default: falls back to core `resolver` above
+    autocert_resolver_timeout 30s;                # http only   | default: 30s
+
+    # =====================================================================
+    # 1) Plain HTTP-01 vhost. Needs `listen 80;`. CA fetches the token
+    #    over plain HTTP from /.well-known/acme-challenge/<token>.
+    # =====================================================================
+    server {
+        listen 80;
+        listen 443 ssl;
+        server_name www.example.com example.com;
+        autocert on;                              # http,server | default: off  (server-level `autocert on` is what seeds the empty cert arrays)
+        # no ssl_certificate / ssl_certificate_key — autocert supplies them
+    }
+
+    # =====================================================================
+    # 2) DNS-01 wildcard vhost. Requires dns-01 + both hooks (below).
+    #    Wildcards are ONLY issuable under dns-01.
+    # =====================================================================
+    server {
+        listen 443 ssl;
+        server_name example.org *.example.org;
+        autocert on;                              # http,server | default: off
+    }
+
+    # =====================================================================
+    # 3) A second CA with EAB (e.g. ZeroSSL). This vhost OWNS its CA
+    #    selector, so it inherits NO trust bundle / EAB from http{} —
+    #    everything CA-bound must be set here explicitly.
+    # =====================================================================
+    server {
+        listen 80;
+        listen 443 ssl;
+        server_name shop.example.com;
+        autocert on billing@example.com;          # http,server | default: off
+        autocert_ca https://acme.zerossl.com/v2/DV90;
+                                                  # http,server | default: LE production
+        autocert_eab_kid       AbCdEf0123456789;  # http,server | default: (none)  (both EAB lines or neither)
+        autocert_eab_hmac_key  bX9...base64url...; # http,server | default: (none)
+        # autocert_ca_certificate /etc/ssl/internal-ca.pem;  # http,server | default: (none)  — only for a private CA
+    }
+
+    # =====================================================================
+    # 4) DNS-01 hooks — http{}-global, mandatory when challenge is dns-01.
+    #    Absolute paths only. argv = {hook, _acme-challenge.<domain>, <txt>}.
+    # =====================================================================
+    autocert_challenge             dns-01;        # http only   | default: http-01
+    autocert_dns_hook_add          /etc/nginx/acme/dns-add.sh;    # http only | default: (none)  (absolute path)
+    autocert_dns_hook_remove       /etc/nginx/acme/dns-del.sh;    # http only | default: (none)  (absolute path)
+    autocert_dns_propagation_delay 10s;           # http only   | default: 10s  (wait after add-hook before asking CA to validate)
+    autocert_dns_hook_timeout      30s;           # http only   | default: 30s  (per-hook exec timeout; must be > 0)
+}
+```
+
+> The four `autocert_dns_*` lines and the wildcard server only make sense together —
+> the snippet shows them in one block for reference. A real config picks one
+> challenge type via the single `autocert_challenge` directive.
+
+---
+
+## Directive reference
+
+`http` = `http{}` (main) context; `server` = `server{}`. `http,server` directives
+set an instance-wide default in `http{}` that each `server{}` may override.
+
+| Directive | Context | Default | Description |
+|---|---|---|---|
+| `autocert on\|off [<email>]` | http, server | `off` | Master switch. Optional 2nd arg = ACME account contact email (one `@`, non-empty both sides). A `server{}`-level `autocert on` is what seeds the empty cert arrays so a cert-less vhost still builds an SSL_CTX. |
+| `autocert_ca <url>` | http, server | LE production `https://acme-v02.api.letsencrypt.org/directory` | ACME directory URL to issue against. Distinct effective URLs become distinct CA groups. Mutually exclusive with `autocert_staging`. |
+| `autocert_staging on\|off` | http, server | `off` | Shorthand for the LE staging directory (`https://acme-staging-v02.api.letsencrypt.org/directory`). For CI; no production rate limits. Mutually exclusive with `autocert_ca`. |
+| `autocert_ca_certificate <file>` | http, server | (none) | PEM trust bundle verifying a private CA's TLS endpoint. CA-bound: a server that overrides the CA does **not** inherit it. Made absolute against the nginx prefix. |
+| `autocert_eab_kid <key-id>` | http, server | (none) | EAB key identifier ([RFC 8555 §7.3.4](https://datatracker.ietf.org/doc/html/rfc8555#section-7.3.4)) for CAs requiring External Account Binding. Both-or-neither with `autocert_eab_hmac_key`. CA-bound. |
+| `autocert_eab_hmac_key <b64url>` | http, server | (none) | EAB HMAC key (base64url). Paired with `autocert_eab_kid`. CA-bound. |
+| `autocert_path <path>` | http | `autocert` (→ `<prefix>/autocert`) | Root of the cert / account-key store. Relative paths resolve against the nginx prefix, not the CWD. |
+| `autocert_store secure\|certbot` | http | `secure` | On-disk layout: the module's own hardened layout, or a certbot-compatible `live/` layout. |
+| `autocert_key_type secp384r1\|secp256r1` | http | `secp384r1` | ECDSA curve for issued certs (and the account key). |
+| `autocert_challenge http-01\|tls-alpn-01\|dns-01` | http | `http-01` | ACME challenge type. `dns-01` is required for wildcards and requires both DNS hooks. |
+| `autocert_renew_before <time>` | http | `7d` | Renew this long before a cert's `notAfter`. |
+| `autocert_resolver <addr> [addr…]` | http | falls back to core `resolver` | DNS resolver(s) used to reach the CA host. Same `address[:port] valid= ipv6=` syntax as core `resolver`. |
+| `autocert_resolver_timeout <time>` | http | `30s` | Timeout for that DNS resolution. |
+| `autocert_dns_hook_add <path>` | http | (none) | Absolute path to the executable that **publishes** the dns-01 TXT record. Required when challenge is `dns-01`. |
+| `autocert_dns_hook_remove <path>` | http | (none) | Absolute path to the executable that **removes** the TXT record after validation. Required when challenge is `dns-01`. |
+| `autocert_dns_propagation_delay <time>` | http | `10s` | Wait after the add-hook returns before asking the CA to validate. `0` = no wait. |
+| `autocert_dns_hook_timeout <time>` | http | `30s` | Per-hook exec timeout before SIGKILL. Must be `> 0`. |
+
+**Config-time rejections to know about:**
+
+- `autocert_ca` + `autocert_staging` on the same CA → emerg (mutually exclusive).
+- `dns-01` selected but a hook missing → emerg (`requires both …`).
+- `autocert_eab_kid` / `autocert_eab_hmac_key` — one set without the other → emerg.
+- Two vhosts naming the **same CA URL** with different trust bundle / EAB / account
+  email → emerg (one CA URL = one trust bundle, one EAB, one account).
+- One `server_name` claimed by two vhosts pinned to different CAs → emerg
+  (one name = one cert from one CA).
+
+---
+
+## Challenges
+
+Pick one with `autocert_challenge` (it is `http{}`-global — one type per instance).
+The module asks the CA only for the configured type and fails the order if the CA
+offers no matching challenge.
+
+| Type | What it needs | Wildcards |
+|---|---|---|
+| `http-01` (default) | A `listen 80;` vhost. The CA fetches the token over **plain HTTP** at `/.well-known/acme-challenge/<token>`. | No |
+| `tls-alpn-01` | A `listen 443 ssl;` vhost. Validation is a TLS handshake with ALPN `acme-tls/1` + SNI. The module serves a challenge cert in-handshake. | No |
+| `dns-01` | Both DNS hooks (below). No `:80`/`:443` needed for validation itself. | **Yes** — the only type that can issue `*.example.com`. |
+
+The HTTP-01 handler is registered once in the content phase for the whole
+`http{}` block, matches the `/.well-known/acme-challenge/` URI prefix, and serves
+the token only when the resolved server has autocert enabled. The `:80` vhost that
+answers the CA must therefore be (or inherit) an autocert-enabled server — a bare
+`listen 80;` vhost with autocert disabled will decline the challenge. The `:80` /
+`:443` requirements above are the ACME protocol's, not enforced by the module.
+
+### DNS-01 hook contract
+
+When `autocert_challenge dns-01` is active you must supply **both**
+`autocert_dns_hook_add` and `autocert_dns_hook_remove`, each an **absolute path**.
+The module runs them with **`fork` + `execve`** — no shell, no `system()`. Both
+hooks receive the **same positional argv**:
+
+```
+argv[0] = <hook path>                 # the configured absolute path
+argv[1] = "_acme-challenge.<domain>"  # record name; a leading "*." is stripped
+argv[2] = "<txt-value>"               # 43-char base64url(SHA-256(keyauth))
+argv[3] = NULL
+```
+
+**No environment variables are added by the module** — the hook inherits the
+worker's environment verbatim. This is the certbot-manual convention: pass your
+DNS-provider credentials in the worker's environment; the domain and value arrive
+as `argv[1]` / `argv[2]`, *not* as `CERTBOT_DOMAIN` / `CERTBOT_VALIDATION`.
+
+Flow and timing:
+
+1. Add-hook runs, publishing the TXT record. Must exit `0`; a non-zero exit or a
+   signal fails the order.
+2. The module waits `autocert_dns_propagation_delay` (default `10s`) for DNS to
+   propagate, then asks the CA to validate.
+3. After validation the remove-hook runs (same argv). A remove failure is
+   non-fatal — the record expires by TTL.
+
+Each hook exec is bounded by `autocert_dns_hook_timeout` (default `30s`, must be
+`> 0`); on timeout the whole hook process group is SIGKILLed. The hook runs on
+worker 0 and blocks it for up to the timeout (only one order runs at a time).
+
+For a wildcard `*.example.org` the ACME identifier is `*.example.org`, but the
+hook is called with the base — `argv[1] = "_acme-challenge.example.org"`.
+
+A tiny add-hook (RFC 2136 `nsupdate` flavour):
+
+```sh
+#!/bin/sh
+# argv: $1 = _acme-challenge.<domain>   $2 = <txt-value>
+nsupdate -k /etc/nginx/acme/tsig.key <<EOF
+server 192.0.2.53
+update add $1 60 IN TXT "$2"
+send
+EOF
+```
+
+The matching remove-hook is identical with `update delete $1 IN TXT "$2"`.
+
+---
+
+## Store layout
+
+The store root is `autocert_path` (default `autocert`, resolved against the nginx
+prefix). On disk a domain maps to a segment: literal names use themselves; a
+wildcard `*.rest` is stored under `_wildcard_.rest`. Certificates are committed
+atomically via `renameat2` on Linux ≥ 3.15; on a filesystem lacking
+`RENAME_EXCHANGE` / `RENAME_NOREPLACE` the commit is deferred (the existing cert is
+kept and renewal retries) rather than risking a mismatched pair, so a half-written
+pair is never served. For a wildcard the cache entry, store dir, and the
+≤1 stat/sec throttle are keyed by the shared `_wildcard_.<rest>` segment — one
+entry for all subdomains, not per concrete SNI.
+
+**`secure` (default)** — files live directly under `<path>`:
+
+| Path | Mode |
+|---|---|
+| `<path>/<domain>/` | `0700` |
+| `<path>/<domain>/privkey.pem` | `0600` |
+| `<path>/<domain>/fullchain.pem` | `0644` |
+
+**`certbot`** — certbot-compatible `live/` tree:
+
+| Path | Mode |
+|---|---|
+| `<path>/live/` | `0755` |
+| `<path>/live/<domain>/` | `0700` |
+| `<path>/live/<domain>/privkey.pem` | `0600` |
+| `<path>/live/<domain>/fullchain.pem` | `0644` |
+| `<path>/live/<domain>/cert.pem` | `0644` (leaf only) |
+| `<path>/live/<domain>/chain.pem` | `0644` (intermediates; may be empty) |
+
+`cert.pem` / `chain.pem` exist for certbot-tool compatibility; the serve path only
+reads `fullchain.pem` + `privkey.pem`.
+
+**Account keys** (per CA, both layouts):
+
+```
+<path>/accounts/<ca_hash>/account.key      # 0600, unencrypted PKCS#8 PEM
+<path>/accounts/                            # 0700
+<path>/accounts/<ca_hash>/                  # 0700
+```
+
+`<ca_hash>` is the leading 64 bits of `SHA-256(<canonical CA URL>)` as 16 lowercase
+hex chars. Staging and production are different URLs → different hashes → fully
+isolated accounts. The account key is rejected on load unless it is a regular file,
+owned by the worker's euid, with no group/other permission bits.
+
+**Permissions — the store must be writable by the worker user.** Worker 0 creates
+and writes everything under `autocert_path`, so that tree must be owned by the
+nginx worker user:
+
+```sh
+chown -R www-data /var/lib/autocert
+chmod 0700 /var/lib/autocert
+```
+
+If a previous run created the store as root, fix it once with
+`chown -R <worker-user> <autocert_path>`. Worker 0 also holds a singleton lock at
+`<path>/.driver.lock` (`0600`).
+
+---
+
+## How it works
+
+1. **One driver, worker 0.** The ACME engine — account bootstrap, order flow,
+   renewal scheduler — runs in exactly one process: worker 0 (or the single
+   process under `master_process off`). It is a deterministic, zero-IPC election:
+   a `flock` on `<path>/.driver.lock` guarantees a single driver even across a
+   reload generation. Every other worker only serves challenges and certificates.
+
+2. **Per-SNI serving.** On each TLS handshake a cert callback resolves the SNI,
+   checks it against the set of issuable names, and serves the matching cert from a
+   per-worker cache (reloaded by mtime, throttled to ≤1 stat/sec/name). A name with
+   no issued cert yet gets a self-signed **bootstrap** cert (CN `localhost`) — the
+   honest pre-issuance state; the client sees a name mismatch until the real cert
+   lands. (Under `acme-tls/1` the callback fails closed instead of leaking the
+   bootstrap cert.)
+
+3. **Renewal.** A periodic sweep on worker 0 checks each name's stored
+   `fullchain.pem`. A name is due — and gets reissued — when no cert is stored, the
+   cert is unreadable, or `now >= notAfter − autocert_renew_before` (default `7d`).
+   The sweep runs at most every 12 h and at least every 60 s; failures back off
+   exponentially (60 s base, capped at 1 h), and a CA `429 Retry-After` is honoured.
+
+4. **Staging vs production.** The default CA is Let's Encrypt **production**. Set
+   `autocert_staging on;` to exercise the full issuance flow against LE **staging**
+   without burning production rate limits — useful in CI. Staging certs are not
+   publicly trusted, and (per the account-hash rule above) staging keeps its own
+   account.
+
+This module exposes **no nginx variables** — it is purely a cert/challenge-serving
+module.
+
+---
+
+## Build & test
+
+OpenSSL ≥ 3.0.0 required. Build as a standard dynamic module:
 
 ```sh
 cd nginx-<version>
@@ -53,349 +338,40 @@ make modules
 # -> objs/ngx_http_autocert_module.so
 ```
 
-**2. Load and enable** it:
+The single shipped artifact is `ngx_http_autocert_module.so`. Load it with
+`load_module modules/ngx_http_autocert_module.so;` and enable it per the config
+above.
 
-```nginx
-load_module modules/ngx_http_autocert_module.so;
-
-events {}
-
-http {
-    resolver 1.1.1.1;                  # the ACME engine needs DNS to reach the CA
-    autocert on admin@example.com;     # ACME account contact
-
-    server {
-        listen 443 ssl;
-        server_name example.com www.example.com;
-        autocert on;                   # both names get a certificate
-        # no ssl_certificate needed
-    }
-}
-```
-
-That's it. The listener comes up behind a self-signed bootstrap certificate, the
-module provisions the real one in the background, and it is served per-SNI the
-moment it is issued — and on every renewal — **without a reload**.
-
----
-
-## How it works
-
-1. **Starts immediately.** A `listen ssl; autocert on;` server with no
-   `ssl_certificate` comes up behind a self-signed **bootstrap certificate**, so
-   nothing fails while you wait for issuance.
-2. **Provisions in the background.** A worker-0 timer drives the full RFC 8555
-   order flow for each `server_name`: account → order → challenge → finalize
-   (ECDSA CSR) → download → store.
-3. **Serves per-SNI.** The real certificate is loaded at the TLS handshake and
-   replaces the bootstrap cert. The store is re-read only when the file's mtime
-   changes, so a renewal takes effect on the next handshake — **no reload, no
-   dropped connections**.
-4. **Renews itself.** The timer sweeps and reissues each certificate once it
-   enters the `autocert_renew_before` window (7 days by default). A failed name
-   backs off exponentially (60 s → 1 h); a CA `HTTP 429` `Retry-After` is
-   honoured.
-
----
-
-## Configuration
-
-### Turning it on — `autocert on | off [email];`
-
-`autocert` is valid in `http{}` (the instance default) and in `server{}`. The
-optional `email` is the ACME account contact. A `server{}` value overrides the
-`http{}` global. With per-vhost CAs (see *Multiple CAs* below), the contact is
-per-CA: each CA's account uses the first email set by a vhost in that CA group,
-and configuring one CA with two different contacts is rejected at startup.
-
-```nginx
-http {
-    autocert on admin@example.com;       # default for all vhosts
-
-    server {
-        listen 443 ssl;
-        server_name a.example.com www.a.example.com;
-        autocert on;                     # both names provisioned, no cert file
-    }
-
-    server {
-        listen 443 ssl;
-        server_name c.example.com;
-        ssl_certificate     /etc/ssl/c.crt;   # real cert kept as fallback,
-        ssl_certificate_key /etc/ssl/c.key;   #   overridden per-SNI if enabled
-        autocert off;                          # opt this vhost out
-    }
-}
-```
-
-A `listen ssl;` server with `autocert on` needs **no `ssl_certificate`**. If you
-set one anyway it is kept as the pre-issuance fallback and overridden per-SNI.
-
-> **Gotcha:** the no-cert bootstrap is seeded only for a **server-level**
-> `autocert on`. A vhost enabled purely by the `http{}`-level global still needs
-> its own `autocert on;` line (or an `ssl_certificate`) to serve TLS.
-
-Two configs are rejected at parse time: a `listen ssl;` server with `autocert
-off` **and** no `ssl_certificate` (nothing would serve it), and `autocert on`
-together with a **variable** `ssl_certificate` (e.g. `ssl_certificate $var;`).
-
-### Choosing the CA
-
-These directives select **which CA signs**, plus the trust and credentials bound
-to it. They are valid in `http{}` as the instance default **and** inside a
-`server{}` to pin that vhost to a different CA. All optional.
-
-| Directive | Default | Purpose |
-|---|---|---|
-| `autocert_ca <url>;` | Let's Encrypt production | ACME directory URL |
-| `autocert_staging on\|off;` | `off` | use Let's Encrypt **staging** instead of `autocert_ca` |
-| `autocert_ca_certificate <file>;` | system trust store | PEM bundle to verify the CA (for a private/test CA such as Pebble) |
-| `autocert_eab_kid <key-id>;` | *(none)* | EAB key identifier (commercial CAs) |
-| `autocert_eab_hmac_key <base64url>;` | *(none)* | EAB HMAC key, base64url |
-
-> The ACME server's certificate is **always** verified (chain + hostname); set
-> `autocert_ca_certificate` only when the CA is not in the system trust store.
-> `autocert_key_type` takes OpenSSL curve names (`secp384r1` / `secp256r1`), not
-> `p384` / `p256`.
-
-**Staging.** `autocert_staging on;` is shorthand for
-`autocert_ca https://acme-staging-v02.api.letsencrypt.org/directory`. It is
-mutually exclusive with `autocert_ca` in the same scope (`http{}` or one
-`server{}`) — nginx refuses to start if both appear together. Staging certs run
-the full ACME flow but are signed by the *Fake LE* intermediate (not
-browser-trusted) and consume no production rate-limit quota — ideal for CI.
-
-**External Account Binding (commercial CAs).** Some CAs (ZeroSSL, Sectigo,
-Google Trust Services) require [EAB](https://datatracker.ietf.org/doc/html/rfc8555#section-7.3.4):
-the ACME account is tied to an account you already hold, proven with a key-id +
-HMAC key from the CA dashboard.
-
-```nginx
-http {
-    autocert_ca          https://acme.zerossl.com/v2/DV90;
-    autocert_eab_kid     "your-eab-key-id";
-    autocert_eab_hmac_key "base64url-hmac-key-from-the-CA-dashboard";
-}
-```
-
-The HMAC key is the value as the CA gives it (base64url, no padding).
-`autocert_eab_kid` and `autocert_eab_hmac_key` are **both-or-neither** — setting
-only one fails config. The binding is sent **only** at account registration
-(`newAccount`); orders and renewals are unaffected. Let's Encrypt does not use
-EAB — leave both unset for it.
-
-**Multiple CAs in one instance.** Set the CA-selector directives inside a
-`server{}` to pin that vhost to a different CA than the `http{}` default. Each
-distinct CA gets its own ACME account, account key
-(`<path>/accounts/<hash>/account.key`), and renewal engine.
-
-```nginx
-http {
-    autocert on admin@example.com;
-    autocert_ca https://acme-v02.api.letsencrypt.org/directory;   # default CA
-
-    server {                       # inherits the http{} default (Let's Encrypt)
-        listen 443 ssl;
-        server_name a.example.com;
-    }
-
-    server {                       # pinned to a different CA + EAB
-        listen 443 ssl;
-        server_name b.example.com;
-        autocert_ca          https://acme.zerossl.com/v2/DV90;
-        autocert_eab_kid     "your-eab-key-id";
-        autocert_eab_hmac_key "base64url-hmac-key";
-    }
-}
-```
-
-> **Inheritance rule.** A `server{}` that sets **either** `autocert_ca` **or**
-> `autocert_staging` owns its entire CA selector and inherits **nothing** else
-> from the `http{}` default — not the trust bundle, not the EAB credentials.
-> This is deliberate: inheriting CA-A's pinned root or EAB key for CA-B would
-> send the wrong credentials or pin the wrong root. A vhost that overrides the CA
-> **must repeat** any `autocert_ca_certificate` / `autocert_eab_*` it needs,
-> inside that same `server{}`. A vhost that does *not* override the CA inherits
-> the whole `http{}` selector as usual.
->
-> One `server_name` must resolve to one CA: a name claimed by two vhosts with
-> different CAs is rejected at config time (there is one stored certificate per
-> name).
-
-### Tuning (`http{}` only)
-
-Instance-wide knobs — one value per nginx instance. All optional.
-
-| Directive | Default | Purpose |
-|---|---|---|
-| `autocert_renew_before <time>;` | `7d` | renew this long before expiry |
-| `autocert_key_type secp384r1\|secp256r1;` | `secp384r1` | ECDSA curve (no RSA) |
-| `autocert_store secure\|certbot;` | `secure` | on-disk layout — see [Storage](#storage) |
-| `autocert_path <dir>;` | `autocert` | store location (relative to the nginx prefix) |
-| `autocert_challenge http-01\|tls-alpn-01\|dns-01;` | `http-01` | challenge type |
-| `autocert_resolver <addr>...;` | the `http{}` `resolver` | DNS used to reach the CA |
-| `autocert_resolver_timeout <time>;` | `30s` | DNS query timeout |
-| `autocert_dns_hook_add <path>;` | *(none)* | DNS-01: absolute path of the publish-TXT hook |
-| `autocert_dns_hook_remove <path>;` | *(none)* | DNS-01: absolute path of the remove-TXT hook |
-| `autocert_dns_propagation_delay <time>;` | `10s` | DNS-01: wait after publishing before validating |
-| `autocert_dns_hook_timeout <time>;` | `30s` | DNS-01: max runtime of one hook exec before it is killed |
-
-### Challenges
-
-The CA proves you control a name via a **challenge**. Pick one with
-`autocert_challenge` (default `http-01`).
-
-- **`http-01`** — answered transparently on **port 80** by a built-in handler. No
-  `location` block, nothing to configure.
-- **`tls-alpn-01`** ([RFC 8737](https://datatracker.ietf.org/doc/html/rfc8737)) —
-  validated entirely inside the TLS handshake, so **port 80 can stay closed**.
-- **`dns-01`** — publishes a `_acme-challenge` TXT record via operator hooks. The
-  only challenge that issues **wildcards**, and it needs **no inbound port** —
-  see below.
-
-#### DNS-01 and wildcards
-
-DNS-01 proves control by publishing a TXT record at `_acme-challenge.<domain>`.
-Because every provider's API differs, publishing is delegated to two operator
-**hook scripts** you supply. Both are required under `autocert_challenge dns-01;`
-and both must be **absolute paths**:
-
-```nginx
-http {
-    autocert on admin@example.com;
-    autocert_challenge dns-01;
-    autocert_dns_hook_add    /etc/nginx/acme/publish.sh;
-    autocert_dns_hook_remove /etc/nginx/acme/unpublish.sh;
-    autocert_dns_propagation_delay 30s;   # let the record propagate first
-
-    server {
-        listen 443 ssl;
-        server_name example.com *.example.com;   # wildcard needs dns-01
-        autocert on;
-    }
-}
-```
-
-**Hook contract.** Each hook is run via `fork()` + `execve()` (no shell) with:
-
-```
-argv = { <hook-path>, "_acme-challenge.<domain>", "<txt-value>" }
-```
-
-For a wildcard `*.example.com` the record name is the base
-(`_acme-challenge.example.com`). The hook **must exit 0 on success**; a non-zero
-exit (or a timeout past `autocert_dns_hook_timeout`) fails the order. Example
-publish hook for a provider with an HTTP API:
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-# $1 = _acme-challenge.example.com   $2 = the TXT value
-curl -fsS -X POST "https://dns.example/api/txt" \
-     -H "Authorization: Bearer ${DNS_API_TOKEN}" \
-     -d "name=${1}." -d "value=${2}" >/dev/null
-```
-
-Caveats:
-
-- **The hook runs on the ACME worker** and blocks it for the exec (bounded by
-  `autocert_dns_hook_timeout`). Keep hooks fast — a single API call, not a
-  propagation poll. The propagation *wait* is handled separately and
-  asynchronously by `autocert_dns_propagation_delay`.
-- **The hook inherits nginx's environment** by design, so provider credentials
-  can be passed via env (e.g. `DNS_API_TOKEN`) — the certbot-manual convention.
-- The record is removed by the remove-hook once the authorization settles
-  (cleanup failure is non-fatal — the record expires by TTL).
-
-### Which names get provisioned
-
-The module collects the concrete `server_name`s of every vhost with `autocert
-on` (deduplicated). **Wildcards** (`*.example.com`) are provisioned **only under
-`autocert_challenge dns-01;`** (RFC 8555 forbids HTTP-01/TLS-ALPN-01 for a
-wildcard); the cert is stored under a `_wildcard_.example.com` directory and
-served for any single-label subdomain SNI. **Skipped:** vhosts with `autocert
-off`, the empty catch-all `""`, a leading-dot (`.x`) or regex (`~…`) name, and a
-wildcard under a non-dns-01 challenge — a single ACME order can't cover those.
-
----
-
-## Storage
-
-`autocert_path` (default `autocert`, relative to the nginx prefix) holds the
-account key(s) and the issued certificates. `autocert_store` picks the layout:
-
-| Mode | Layout |
-|---|---|
-| `secure` (default) | `<path>/<domain>/{privkey,fullchain}.pem` |
-| `certbot` | `<path>/live/<domain>/{privkey,cert,chain,fullchain}.pem` (flat `live/`, real files — no `archive/` + symlinks) |
-
-Account keys live under `<path>/accounts/<ca-hash>/account.key`, one per CA.
-
-### Permissions — the store must be writable by the worker user
-
-The ACME engine runs in **worker 0**, so the **worker user owns the key
-material**: `account.key`, the per-domain cert store, and the `.driver.lock` file
-are all created and written by the user NGINX drops to (the `user` directive;
-default `nobody` when started as root). Make that directory writable by it:
+To compile the in-tree test directives and run the test suite, configure the build
+with `AUTOCERT_TEST=1` set in the environment:
 
 ```sh
-mkdir -p /var/lib/autocert
-chown <worker-user>:<worker-group> /var/lib/autocert
-chmod 0700 /var/lib/autocert
+AUTOCERT_TEST=1 ./configure --with-compat --with-http_ssl_module \
+    --add-dynamic-module=/path/to/nginx-autocert-module
+make
 ```
 
-> **Upgrading from the old root-owned helper?** Existing `account.key` and store
-> files are owned by `root` and the worker cannot read or rewrite them. Run
-> `chown -R <worker-user> <autocert_path>` once before restarting (an account key
-> not owned by the running user is rejected).
+`AUTOCERT_TEST=1` is consumed at configure time only (it bakes
+`-DNGX_AUTOCERT_TEST=1` into the generated Makefile), so it is set on `./configure`
+and not repeated on `make`. Use a full `make` here — not `make modules` — because
+the e2e suite under `tests/*.sh` runs the actual server binary (`objs/nginx` or
+`objs/angie`), which `make modules` does not build.
 
----
-
-## Architecture
-
-- A **worker-0 timer** runs the ACME state machine. Certificate and account keys
-  are managed inside the worker process — no separate helper. (This matches
-  Angie's native `acme` and the official Rust `nginx-acme`, which also drive ACME
-  from a worker rather than a privileged helper.)
-- **Exactly one driver** runs at a time. The engine is armed only on worker 0,
-  and an `flock` on `<autocert_path>/.driver.lock` serializes generations across
-  a reload or `USR2` hot upgrade — the retiring worker 0 holds the lock until it
-  exits, then the fresh worker 0 takes over (within seconds) and runs its first
-  sweep. No two processes ever race the account nonce or submit duplicate orders.
-- With **multiple CAs**, the one driver runs an independent engine per CA (its
-  own account, key, and renewal schedule), still under the single driver lock —
-  one ACME order is in flight at a time across all CAs.
-- The engine reaches each CA over a **verified TLS** connection (its own resolver
-  + HTTP/1.1 client); challenge tokens and cert state live in a shared-memory
-  zone accessible to all workers.
-- Certificates are loaded **per-SNI at the TLS handshake**, so renewal needs no
-  config reload.
-- A **config reload** is handled in both run modes. In the normal master+workers
-  model nginx forks fresh workers, so the new worker 0 simply re-arms the engine.
-  In **`master_process off`** (single-process) mode the process survives the
-  reload, so the module rebinds the driver and the per-SNI serve gate to the new
-  configuration in place — added/removed issuance names take effect, and any
-  in-flight ACME request is cancelled cleanly before the old state is torn down.
-
-The addon ships a **single** dynamic module: `ngx_http_autocert_module.so`.
-
----
-
-## Status
-
-**Works today:** full issuance + renewal on nginx mainline **and Angie** (same
-end-to-end suite on both); HTTP-01, TLS-ALPN-01, and DNS-01 (incl. **wildcards**
-via operator hooks); EAB for commercial CAs; **per-vhost multiple CAs** (one
-account + engine per CA); per-SNI serving with bootstrap + zero-reload hot-swap;
-ECDSA P-384/P-256; `secure` and `certbot` store layouts; `badNonce` retry,
-per-name backoff, and `429` / `Retry-After` awareness.
-
-**Not yet:** a packaged Debian sub-package.
+(The e2e harness uses [Pebble](https://github.com/letsencrypt/pebble) as a local
+ACME server.)
 
 ---
 
 ## See also
 
-- 📝 Article: [Automatic TLS Certs, No Certbot](https://deb.myguard.nl/2026/06/nginx-autocert-module/) — what it is and how it works, in plain English.
-- 📦 [NGINX modules repository for Debian & Ubuntu](https://deb.myguard.nl/nginx-modules/) — 100+ ready-built NGINX modules, no compiling.
-- 💻 Source: <https://github.com/eilandert/nginx-autocert-module>
+- **[Automatic TLS Certs, No Certbot](https://deb.myguard.nl/2026/06/nginx-autocert-module/)**
+  — the walkthrough on deb.myguard.nl.
+- **[NGINX modules repository for Debian & Ubuntu](https://deb.myguard.nl/nginx-modules/)**
+  — prebuilt packages.
+- **Source:** <https://github.com/eilandert/nginx-autocert-module>
+
+---
+
+## License
+
+No license file is shipped with this module at this time.
