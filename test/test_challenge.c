@@ -25,6 +25,9 @@
 
 static int          failures;
 static ngx_pool_t  *pool;
+/* Pass a zero-initialised log (log_level 0) so ngx_log_debug*() stay no-ops
+ * in --with-debug builds instead of dereferencing a NULL log (segfault). */
+static ngx_log_t   test_log;
 
 #define CHECK(cond, msg)                                                      \
     do {                                                                      \
@@ -218,7 +221,7 @@ main(void)
         return 2;
     }
 
-    pool = ngx_create_pool(16 * 1024, NULL);
+    pool = ngx_create_pool(16 * 1024, &test_log);
     if (pool == NULL) {
         fprintf(stderr, "FAIL: pool\n");
         return 2;

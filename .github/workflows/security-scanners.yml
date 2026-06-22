@@ -76,6 +76,9 @@ jobs:
 
       - name: Generate nginx build headers (for clang-tidy)
         run: |
+          # /usr/share/nginx/src is root-owned; configure must create objs/ in it
+          # (the clang-tidy step reads /usr/share/nginx/src/objs for the headers).
+          sudo chown -R "$(id -u):$(id -g)" /usr/share/nginx/src
           cd /usr/share/nginx/src
           CC=gcc ./configure \
             --with-compat \
