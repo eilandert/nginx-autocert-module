@@ -81,6 +81,14 @@ expect_reject "autocert_wildcard non-wildcard arg" \
 expect_reject "autocert_wildcard embedded star" \
     "    autocert_wildcard *.ex*ple.com;" \
     "is not a leading-label wildcard"
+# Codex LOW: an empty label ("*..example.com") or trailing dot must be rejected
+# at config time, not silently suppress a concrete name then fail at issuance.
+expect_reject "autocert_wildcard empty label" \
+    "    autocert_wildcard *..example.com;" \
+    "is not a leading-label wildcard"
+expect_reject "autocert_wildcard trailing dot" \
+    "    autocert_wildcard *.example.com.;" \
+    "is not a leading-label wildcard"
 
 # D5: a wildcard cert is unissuable over http-01 / tls-alpn-01, so an
 # autocert_wildcard with a non-dns-01 challenge is rejected at postconfig. The
