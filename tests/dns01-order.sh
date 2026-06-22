@@ -84,11 +84,12 @@ user root;
 error_log $PREFIX/logs/error.log notice;
 events {}
 http {
-    autocert on admin@example.com;
+    autocert on;
+    autocert_contact admin@example.com;
     autocert_ca https://pebble:14000/dir;
     autocert_resolver 127.0.0.1:${DNS_PORT};
-    autocert_ca_certificate $PREFIX/ca.pem;
-    autocert_path $PREFIX/store;
+    autocert_ca_trusted_certificate $PREFIX/ca.pem;
+    autocert_store_path $PREFIX/store;
     autocert_challenge dns-01;
     # D3 requires both hooks for dns-01; /bin/true is a no-op stub so the order
     # still reaches (and logs) the publish-TXT step without a real DNS provider.

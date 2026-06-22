@@ -248,23 +248,25 @@ events {}
 http {
     autocert_resolver 127.0.0.1:${DNS_PORT};
     autocert_resolver_timeout 5s;
-    autocert_path $PREFIX/store;
+    autocert_store_path $PREFIX/store;
 
     # CA overrides do NOT inherit trust from http{} — repeat
-    # autocert_ca_certificate inside each overriding server (index.md durable fact).
+    # autocert_ca_trusted_certificate inside each overriding server (index.md durable fact).
     server {
         listen 80;
         server_name ${NAME_A};
-        autocert on ${EMAIL_A};
+        autocert on;
+        autocert_contact ${EMAIL_A};
         autocert_ca https://${CA_HOST}:${CA_PORT_A}/dir;
-        autocert_ca_certificate $PREFIX/ca.pem;
+        autocert_ca_trusted_certificate $PREFIX/ca.pem;
     }
     server {
         listen 80;
         server_name ${NAME_B};
-        autocert on ${EMAIL_B};
+        autocert on;
+        autocert_contact ${EMAIL_B};
         autocert_ca https://${CA_HOST}:${CA_PORT_B}/dir;
-        autocert_ca_certificate $PREFIX/ca.pem;
+        autocert_ca_trusted_certificate $PREFIX/ca.pem;
     }
 }
 EOF
@@ -318,20 +320,22 @@ error_log $PREFIX/logs/conflict.log notice;
 events {}
 http {
     autocert_resolver 127.0.0.1:${DNS_PORT};
-    autocert_path $PREFIX/store2;
+    autocert_store_path $PREFIX/store2;
     server {
         listen 80;
         server_name c1.example.com;
-        autocert on one@example.com;
+        autocert on;
+        autocert_contact one@example.com;
         autocert_ca https://${CA_HOST}:${CA_PORT_A}/dir;
-        autocert_ca_certificate $PREFIX/ca.pem;
+        autocert_ca_trusted_certificate $PREFIX/ca.pem;
     }
     server {
         listen 80;
         server_name c2.example.com;
-        autocert on two@example.com;
+        autocert on;
+        autocert_contact two@example.com;
         autocert_ca https://${CA_HOST}:${CA_PORT_A}/dir;
-        autocert_ca_certificate $PREFIX/ca.pem;
+        autocert_ca_trusted_certificate $PREFIX/ca.pem;
     }
 }
 EOF

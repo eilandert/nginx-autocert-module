@@ -110,11 +110,12 @@ user root;   # worker-0 ACME driver writes the store; keep worker uid able to
 error_log $PREFIX/logs/error.log notice;
 events {}
 http {
-    autocert on admin@example.com;
+    autocert on;
+    autocert_contact admin@example.com;
     autocert_ca https://pebble:14000/dir;
     autocert_resolver 127.0.0.1:${DNS_PORT};
-    autocert_ca_certificate $PREFIX/ca.pem;
-    autocert_path $PREFIX/store;
+    autocert_ca_trusted_certificate $PREFIX/ca.pem;
+    autocert_store_path $PREFIX/store;
     server {
         listen 80;
         server_name ${ORDER_DOMAIN};

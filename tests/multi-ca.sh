@@ -153,13 +153,14 @@ user root;
 error_log $PREFIX/logs/error.log notice;
 events {}
 http {
-    autocert on admin@example.com;
+    autocert on;
+    autocert_contact admin@example.com;
     autocert_resolver 127.0.0.1:${DNS_PORT};
-    autocert_path $PREFIX/store;
+    autocert_store_path $PREFIX/store;
 
     # A server that OVERRIDES the CA owns its whole CA selector and inherits
     # NEITHER trust bundle NOR EAB from the http{} default (M4: don't leak one
-    # CA's pinned root / EAB to another). So autocert_ca_certificate must be set
+    # CA's pinned root / EAB to another). So autocert_ca_trusted_certificate must be set
     # per-server here, alongside each server's autocert_ca.
 
     # vhost A -> CA-A (no EAB). Host "pebble" is in the baked cert SAN.
@@ -167,7 +168,7 @@ http {
         listen 80;
         server_name ${DOMAIN_A};
         autocert_ca https://pebble:14000/dir;
-        autocert_ca_certificate $PREFIX/ca-bundle.pem;
+        autocert_ca_trusted_certificate $PREFIX/ca-bundle.pem;
     }
 
     # vhost B -> CA-B (EAB required). Host "localhost" is in the baked cert SAN;
@@ -176,7 +177,7 @@ http {
         listen 80;
         server_name ${DOMAIN_B};
         autocert_ca https://localhost:14001/dir;
-        autocert_ca_certificate $PREFIX/ca-bundle.pem;
+        autocert_ca_trusted_certificate $PREFIX/ca-bundle.pem;
         autocert_eab_kid "$EAB_KID";
         autocert_eab_hmac_key "$EAB_HMAC";
     }

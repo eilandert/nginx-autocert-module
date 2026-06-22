@@ -74,6 +74,8 @@ static char *ngx_http_autocert_test_alpn(ngx_conf_t *cf,
 #endif
 
 static char *ngx_http_autocert(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
+static char *ngx_http_autocert_contact(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
 static char *ngx_http_autocert_key_type(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_autocert_store(ngx_conf_t *cf, ngx_command_t *cmd,
@@ -103,8 +105,19 @@ static ngx_command_t  ngx_http_autocert_commands[] = {
      * giving a global default plus per-vhost override.
      */
     { ngx_string("autocert"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE12,
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
       ngx_http_autocert,
+      NGX_HTTP_SRV_CONF_OFFSET,
+      0,
+      NULL },
+
+    /* ACME account contact email (was the optional 2nd arg of `autocert on`;
+     * split out for clarity so `autocert on|off` is a plain switch). MAIN+SRV,
+     * per-CA: the first non-empty contact in a CA group supplies that CA's
+     * newAccount email (same resolution as before). */
+    { ngx_string("autocert_contact"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
+      ngx_http_autocert_contact,
       NGX_HTTP_SRV_CONF_OFFSET,
       0,
       NULL },
@@ -165,14 +178,14 @@ static ngx_command_t  ngx_http_autocert_commands[] = {
       0,
       NULL },
 
-    { ngx_string("autocert_store"),
+    { ngx_string("autocert_store_layout"),
       NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
       ngx_http_autocert_store,
       NGX_HTTP_MAIN_CONF_OFFSET,
       0,
       NULL },
 
-    { ngx_string("autocert_path"),
+    { ngx_string("autocert_store_path"),
       NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_str_slot,
       NGX_HTTP_MAIN_CONF_OFFSET,
@@ -202,7 +215,7 @@ static ngx_command_t  ngx_http_autocert_commands[] = {
       offsetof(ngx_http_autocert_main_conf_t, resolver_timeout),
       NULL },
 
-    { ngx_string("autocert_ca_certificate"),
+    { ngx_string("autocert_ca_trusted_certificate"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_TAKE1,
       ngx_conf_set_str_slot,
       NGX_HTTP_SRV_CONF_OFFSET,
@@ -739,7 +752,7 @@ ngx_http_autocert_ca_entry(ngx_conf_t *cf,
         {
             ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                 "autocert: CA \"%V\" is configured with conflicting "
-                "\"autocert_ca_certificate\" / \"autocert_eab_*\" across "
+                "\"autocert_ca_trusted_certificate\" / \"autocert_eab_*\" across "
                 "servers; one CA URL must use one trust bundle and one EAB "
                 "credential", &cac->ca);
             return NULL;
@@ -1603,32 +1616,46 @@ ngx_http_autocert(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         return NGX_CONF_ERROR;
     }
 
-    if (cf->args->nelts == 3) {
-        /*
-         * Minimal validation: an ACME contact must look like an email
-         * (contain a single '@' with text either side). Full RFC validation
-         * is the CA's job; this only catches obvious config typos.
-         */
-        u_char  *at;
+    return NGX_CONF_OK;
+}
 
-        at = ngx_strlchr(value[2].data, value[2].data + value[2].len, '@');
 
-        if (at == NULL
-            || at == value[2].data
-            || at == value[2].data + value[2].len - 1
-            || ngx_strlchr(at + 1, value[2].data + value[2].len, '@') != NULL)
-        {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                               "invalid email \"%V\" in \"autocert\" directive",
-                               &value[2]);
-            return NGX_CONF_ERROR;
-        }
+/* ACME account contact email (autocert_contact <email>). Split out of the old
+ * `autocert on <email>` positional arg for config clarity; per-CA resolution
+ * (first non-empty contact in a CA group) is unchanged. */
+static char *
+ngx_http_autocert_contact(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_autocert_srv_conf_t  *ascf = conf;
+    ngx_str_t                     *value = cf->args->elts;
+    u_char                        *at;
 
-        ascf->email = value[2];
-
-        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, cf->log, 0,
-                       "autocert: account email \"%V\"", &ascf->email);
+    if (ascf->email.len != 0) {
+        return "is duplicate";
     }
+
+    /*
+     * Minimal validation: an ACME contact must look like an email (a single
+     * '@' with text either side). Full RFC validation is the CA's job; this
+     * only catches obvious config typos.
+     */
+    at = ngx_strlchr(value[1].data, value[1].data + value[1].len, '@');
+
+    if (at == NULL
+        || at == value[1].data
+        || at == value[1].data + value[1].len - 1
+        || ngx_strlchr(at + 1, value[1].data + value[1].len, '@') != NULL)
+    {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "invalid email \"%V\" in \"autocert_contact\"",
+                           &value[1]);
+        return NGX_CONF_ERROR;
+    }
+
+    ascf->email = value[1];
+
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, cf->log, 0,
+                   "autocert: account contact \"%V\"", &ascf->email);
 
     return NGX_CONF_OK;
 }
@@ -1645,16 +1672,24 @@ ngx_http_autocert_key_type(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         return "is duplicate";
     }
 
-    if (ngx_strcmp(value[1].data, "secp384r1") == 0) {
+    /* Accept friendly aliases alongside the OpenSSL curve names: operators
+     * think "P-384"/"P-256", not "secp384r1"/"secp256r1". */
+    if (ngx_strcmp(value[1].data, "secp384r1") == 0
+        || ngx_strcmp(value[1].data, "p384") == 0
+        || ngx_strcmp(value[1].data, "ecdsa-p384") == 0)
+    {
         amcf->key_type = NGX_HTTP_AUTOCERT_KEY_P384;
 
-    } else if (ngx_strcmp(value[1].data, "secp256r1") == 0) {
+    } else if (ngx_strcmp(value[1].data, "secp256r1") == 0
+               || ngx_strcmp(value[1].data, "p256") == 0
+               || ngx_strcmp(value[1].data, "ecdsa-p256") == 0)
+    {
         amcf->key_type = NGX_HTTP_AUTOCERT_KEY_P256;
 
     } else {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            "invalid key type \"%V\" in \"autocert_key_type\", "
-                           "expected \"secp384r1\" or \"secp256r1\"",
+                           "expected p384 (secp384r1) or p256 (secp256r1)",
                            &value[1]);
         return NGX_CONF_ERROR;
     }
@@ -1674,7 +1709,11 @@ ngx_http_autocert_store(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         return "is duplicate";
     }
 
-    if (ngx_strcmp(value[1].data, "secure") == 0) {
+    /* "default" is the module's own hardened layout (was "secure" — renamed so
+     * it doesn't imply the certbot layout is insecure). "secure" still accepted. */
+    if (ngx_strcmp(value[1].data, "default") == 0
+        || ngx_strcmp(value[1].data, "secure") == 0)
+    {
         amcf->store = NGX_HTTP_AUTOCERT_STORE_SECURE;
 
     } else if (ngx_strcmp(value[1].data, "certbot") == 0) {
@@ -1682,8 +1721,8 @@ ngx_http_autocert_store(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     } else {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                           "invalid store \"%V\" in \"autocert_store\", "
-                           "expected \"secure\" or \"certbot\"", &value[1]);
+                           "invalid layout \"%V\" in \"autocert_store_layout\", "
+                           "expected \"default\" or \"certbot\"", &value[1]);
         return NGX_CONF_ERROR;
     }
 

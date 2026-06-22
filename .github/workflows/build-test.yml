@@ -969,7 +969,7 @@ jobs:
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: autocert_store certbot issues into live/<domain>/{privkey,cert,chain,fullchain}.pem
+      - name: autocert_store_layout certbot issues into live/<domain>/{privkey,cert,chain,fullchain}.pem
         uses: ./.github/actions/run-e2e
         with:
           flavor: ${{ matrix.flavor }}

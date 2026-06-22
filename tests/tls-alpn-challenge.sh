@@ -45,7 +45,7 @@ load_module $HTTP_SO;
 error_log $PREFIX/logs/error.log info;
 events {}
 http {
-    autocert_path $PREFIX/store;
+    autocert_store_path $PREFIX/store;
     autocert_challenge tls-alpn-01;
     autocert_test_alpn $DOMAIN $KEYAUTH;
     server {

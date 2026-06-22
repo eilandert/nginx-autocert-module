@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# certbot store layout test: `autocert_store certbot;` issues into the flat
+# certbot store layout test: `autocert_store_layout certbot;` issues into the flat
 # certbot live/ layout, <path>/live/<domain>/{privkey,cert,chain,fullchain}.pem,
 # and the serve path reads from there.
 #
@@ -196,13 +196,14 @@ user root;   # worker-0 ACME driver writes the store; keep worker uid able to
 error_log $PREFIX/logs/error.log notice;
 events {}
 http {
-    autocert on admin@example.com;
+    autocert on;
+    autocert_contact admin@example.com;
     autocert_ca https://${CA_HOST}:${CA_PORT}/dir;
     autocert_resolver 127.0.0.1:${DNS_PORT};
     autocert_resolver_timeout 5s;
-    autocert_ca_certificate $PREFIX/ca.pem;
-    autocert_path $PREFIX/store;
-    autocert_store certbot;
+    autocert_ca_trusted_certificate $PREFIX/ca.pem;
+    autocert_store_path $PREFIX/store;
+    autocert_store_layout certbot;
     server { listen 80; server_name ${NAME}; }
 }
 EOF

@@ -37,8 +37,9 @@ load_module $HTTP_SO;
 error_log $PREFIX/logs/error.log;
 events {}
 http {
-    autocert on a@b.com;
-    autocert_path $PREFIX/store;
+    autocert on;
+    autocert_contact a@b.com;
+    autocert_store_path $PREFIX/store;
 $body
     server { listen $PORT; server_name x.example.com; }
 }
@@ -94,8 +95,9 @@ load_module $HTTP_SO;
 error_log $PREFIX/logs/error.log;
 events {}
 http {
-    autocert on a@b.com;
-    autocert_path $PREFIX/store;
+    autocert on;
+    autocert_contact a@b.com;
+    autocert_store_path $PREFIX/store;
     autocert_dns_hook_timeout 15s;
     server { listen $PORT; server_name x.example.com; }
 }
