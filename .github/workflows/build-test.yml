@@ -191,6 +191,9 @@ jobs:
           flavor: angie
           dir: ${{ needs.resolve.outputs.angie_dir }}
           script: coexist-native-acme.sh
+          # native acme's implicit @acme block binds :80 for http-01 even under
+          # `-t`; the unprivileged runner needs sudo for the bind to succeed.
+          sudo: "true"
 
   # ABI-drift regression. The prod crash was a struct-offset mismatch: the .so
   # was built against vanilla angie, but our packaged angie carries
