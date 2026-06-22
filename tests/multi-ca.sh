@@ -23,7 +23,7 @@
 # registrations in the log, not the issuer.
 #
 # Topology (mirrors order-authz.sh, doubled): a user bridge whose gateway is the
-# host IP the Pebble VAs fetch our :80 from; dnsmasq maps each order domain to
+# host IP the Pebble VAs fetch our :80 from; challtestsrv maps each order domain to
 # that host IP. Both Pebbles validate http-01 on port 80 against OUR single
 # nginx. The driver reaches each Pebble over its published port; the two CA
 # directory hosts are "pebble" (->14000) and "localhost" (->14001) because the
@@ -70,17 +70,34 @@ HOST_IP=$(docker network inspect "$NET_NAME" \
     -f '{{ (index .IPAM.Config 0).Gateway }}')
 echo "== host IP reachable from containers: $HOST_IP =="
 
-echo "== starting dnsmasq (pebble+localhost -> 127.0.0.1 for driver; domains -> host) =="
+echo "== starting challtestsrv (pebble+localhost -> 127.0.0.1 for driver; domains -> host) =="
 DNS_PORT=15353
+MGMT_PORT=$((DNS_PORT + 1))
 docker run -d --name "$DNS_NAME" --network "$NET_NAME" \
     -p ${DNS_PORT}:53/udp -p ${DNS_PORT}:53/tcp \
-    --entrypoint dnsmasq andyshinn/dnsmasq:2.83 \
-    -k --address=/pebble/127.0.0.1 \
-    --address=/localhost/127.0.0.1 \
-    --address=/${DOMAIN_A}/"${HOST_IP}" \
-    --address=/${DOMAIN_B}/"${HOST_IP}" >/dev/null
+    -p ${MGMT_PORT}:8055 \
+    ghcr.io/letsencrypt/pebble-challtestsrv:latest \
+    -dnsserver :53 -management :8055 \
+    -http01 "" -https01 "" -tlsalpn01 "" -doh "" \
+    -defaultIPv4 "" -defaultIPv6 "" >/dev/null
 DNS_CONTAINER_IP=$(docker inspect -f \
     '{{ (index .NetworkSettings.Networks "'"$NET_NAME"'").IPAddress }}' "$DNS_NAME")
+
+# challtestsrv mgmt readiness, then republish the A records challtestsrv must serve
+for i in $(seq 1 30); do
+    if curl -sf -X POST "http://127.0.0.1:${MGMT_PORT}/clear-txt" \
+            -d '{"host":"_probe.invalid."}' >/dev/null 2>&1; then break; fi
+    sleep 1
+    [ "$i" = 30 ] && { echo "challtestsrv mgmt did not come up"; docker logs "$DNS_NAME"; exit 1; }
+done
+curl -sf -X POST "http://127.0.0.1:${MGMT_PORT}/add-a" \
+    -d "{\"host\":\"pebble.\",\"addresses\":[\"127.0.0.1\"]}" >/dev/null
+curl -sf -X POST "http://127.0.0.1:${MGMT_PORT}/add-a" \
+    -d "{\"host\":\"localhost.\",\"addresses\":[\"127.0.0.1\"]}" >/dev/null
+curl -sf -X POST "http://127.0.0.1:${MGMT_PORT}/add-a" \
+    -d "{\"host\":\"${DOMAIN_A}.\",\"addresses\":[\"${HOST_IP}\"]}" >/dev/null
+curl -sf -X POST "http://127.0.0.1:${MGMT_PORT}/add-a" \
+    -d "{\"host\":\"${DOMAIN_B}.\",\"addresses\":[\"${HOST_IP}\"]}" >/dev/null
 
 # CA-A: plain, http-01 on port 80, mgmt 15000, ACME 14000.
 cat > "$PREFIX/pebbleA.json" <<EOF

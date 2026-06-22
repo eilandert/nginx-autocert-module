@@ -24,6 +24,7 @@ NET_NAME="ac-dns01-net-$$"
 PEBBLE_NAME="ac-dns01-pebble-$$"
 DNS_NAME="ac-dns01-dns-$$"
 DNS_PORT=15355
+MGMT_PORT=$((DNS_PORT + 1))
 ORDER_DOMAIN="dns01.example.com"
 
 cleanup() {
@@ -39,14 +40,28 @@ mkdir -p "$PREFIX/logs" "$PREFIX/conf" "$PREFIX/store"
 docker network create "$NET_NAME" >/dev/null
 HOST_IP=$(docker network inspect "$NET_NAME" -f '{{ (index .IPAM.Config 0).Gateway }}')
 
-echo "== dnsmasq (pebble -> 127.0.0.1; order domain -> host) =="
+echo "== challtestsrv (pebble -> 127.0.0.1; order domain -> host) =="
 docker run -d --name "$DNS_NAME" --network "$NET_NAME" \
     -p ${DNS_PORT}:53/udp -p ${DNS_PORT}:53/tcp \
-    --entrypoint dnsmasq andyshinn/dnsmasq:2.83 \
-    -k --address=/pebble/127.0.0.1 \
-    --address=/${ORDER_DOMAIN}/"${HOST_IP}" >/dev/null
+    -p ${MGMT_PORT}:8055 \
+    ghcr.io/letsencrypt/pebble-challtestsrv:latest \
+    -dnsserver :53 -management :8055 \
+    -http01 "" -https01 "" -tlsalpn01 "" -doh "" \
+    -defaultIPv4 "" -defaultIPv6 "" >/dev/null
 DNS_CONTAINER_IP=$(docker inspect -f \
     '{{ (index .NetworkSettings.Networks "'"$NET_NAME"'").IPAddress }}' "$DNS_NAME")
+
+# challtestsrv mgmt readiness, then republish the A records challtestsrv must serve
+for i in $(seq 1 30); do
+    if curl -sf -X POST "http://127.0.0.1:${MGMT_PORT}/clear-txt" \
+            -d '{"host":"_probe.invalid."}' >/dev/null 2>&1; then break; fi
+    sleep 1
+    [ "$i" = 30 ] && { echo "challtestsrv mgmt did not come up"; docker logs "$DNS_NAME"; exit 1; }
+done
+curl -sf -X POST "http://127.0.0.1:${MGMT_PORT}/add-a" \
+    -d "{\"host\":\"pebble.\",\"addresses\":[\"127.0.0.1\"]}" >/dev/null
+curl -sf -X POST "http://127.0.0.1:${MGMT_PORT}/add-a" \
+    -d "{\"host\":\"${ORDER_DOMAIN}.\",\"addresses\":[\"${HOST_IP}\"]}" >/dev/null
 
 cat > "$PREFIX/pebble-config.json" <<EOF
 {
@@ -62,7 +77,7 @@ cat > "$PREFIX/pebble-config.json" <<EOF
 }
 EOF
 
-echo "== Pebble (DNS via dnsmasq) =="
+echo "== Pebble (DNS via challtestsrv) =="
 docker run -d --name "$PEBBLE_NAME" --network "$NET_NAME" \
     -p 14000:14000 -p 15000:15000 \
     -e PEBBLE_VA_NOSLEEP=1 \

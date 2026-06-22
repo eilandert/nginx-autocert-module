@@ -2,7 +2,7 @@
 #
 # ACME order + authorization + issuance e2e test (M6a/M6b).
 #
-# Builds on acme-directory.sh: brings up Pebble + dnsmasq, registers an account,
+# Builds on acme-directory.sh: brings up Pebble + challtestsrv, registers an account,
 # then drives the full issuance for one domain —
 #   newOrder -> fetch authz -> http-01 token -> keyauth -> publish to the
 #   challenge store -> POST the challenge -> poll the authorization until valid
@@ -15,8 +15,8 @@
 #   http://<domain>/.well-known/acme-challenge/<token>
 # from OUR nginx. So:
 #   - nginx listens on :80 (the :80 worker serves the M5 challenge handler),
-#   - dnsmasq maps <domain> to the host IP reachable from the Pebble container,
-#   - Pebble is told to use that dnsmasq for DNS and to hit port 80.
+#   - challtestsrv maps <domain> to the host IP reachable from the Pebble container,
+#   - Pebble is told to use that challtestsrv for DNS and to hit port 80.
 # We then assert the helper logs the authorization reaching "valid".
 #
 # Inputs (env):
@@ -54,20 +54,35 @@ HOST_IP=$(docker network inspect "$NET_NAME" \
     -f '{{ (index .IPAM.Config 0).Gateway }}')
 echo "== host IP reachable from containers: $HOST_IP =="
 
-echo "== starting dnsmasq (pebble -> 127.0.0.1 view for the helper; order domain -> host) =="
-# dnsmasq serves two views via published port:
+echo "== starting challtestsrv (pebble -> 127.0.0.1 view for the helper; order domain -> host) =="
+# challtestsrv serves two views via published port:
 #   - the helper (on the host) resolves 'pebble' to 127.0.0.1 (Pebble's published port)
 #   - Pebble (in-container) resolves the order domain to the host gateway
 # A single address mapping the order domain to the host IP is enough for the VA;
 # the helper reaches Pebble through the published 14000 with host 'pebble'.
 DNS_PORT=15353
+MGMT_PORT=$((DNS_PORT + 1))
 docker run -d --name "$DNS_NAME" --network "$NET_NAME" \
     -p ${DNS_PORT}:53/udp -p ${DNS_PORT}:53/tcp \
-    --entrypoint dnsmasq andyshinn/dnsmasq:2.83 \
-    -k --address=/pebble/127.0.0.1 \
-    --address=/${ORDER_DOMAIN}/"${HOST_IP}" >/dev/null
+    -p ${MGMT_PORT}:8055 \
+    ghcr.io/letsencrypt/pebble-challtestsrv:latest \
+    -dnsserver :53 -management :8055 \
+    -http01 "" -https01 "" -tlsalpn01 "" -doh "" \
+    -defaultIPv4 "" -defaultIPv6 "" >/dev/null
 DNS_CONTAINER_IP=$(docker inspect -f \
     '{{ (index .NetworkSettings.Networks "'"$NET_NAME"'").IPAddress }}' "$DNS_NAME")
+
+# challtestsrv mgmt readiness, then republish the A records challtestsrv must serve
+for i in $(seq 1 30); do
+    if curl -sf -X POST "http://127.0.0.1:${MGMT_PORT}/clear-txt" \
+            -d '{"host":"_probe.invalid."}' >/dev/null 2>&1; then break; fi
+    sleep 1
+    [ "$i" = 30 ] && { echo "challtestsrv mgmt did not come up"; docker logs "$DNS_NAME"; exit 1; }
+done
+curl -sf -X POST "http://127.0.0.1:${MGMT_PORT}/add-a" \
+    -d "{\"host\":\"pebble.\",\"addresses\":[\"127.0.0.1\"]}" >/dev/null
+curl -sf -X POST "http://127.0.0.1:${MGMT_PORT}/add-a" \
+    -d "{\"host\":\"${ORDER_DOMAIN}.\",\"addresses\":[\"${HOST_IP}\"]}" >/dev/null
 
 # Pebble's baked test config validates http-01 on port 5002, not 80. Override
 # with our own config so the VA fetches our token on port 80 (where nginx
@@ -87,7 +102,7 @@ cat > "$PREFIX/pebble-config.json" <<EOF
 }
 EOF
 
-echo "== starting Pebble (VA -> http :80 at the order domain, DNS via dnsmasq) =="
+echo "== starting Pebble (VA -> http :80 at the order domain, DNS via challtestsrv) =="
 docker run -d --name "$PEBBLE_NAME" --network "$NET_NAME" \
     -p 14000:14000 -p 15000:15000 \
     -e PEBBLE_VA_NOSLEEP=1 \

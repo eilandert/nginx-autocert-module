@@ -67,10 +67,12 @@ docker run -d --name "$PEBBLE_NAME" -p 14000:14000 -p 15000:15000 \
     -v "$PREFIX/conf/pebble-config.json:/test/config/pebble-config.json:ro" \
     ghcr.io/letsencrypt/pebble:latest >/dev/null
 
-echo "== starting dnsmasq (resolves 'pebble' -> 127.0.0.1) =="
+echo "== starting challtestsrv (resolves 'pebble' -> 127.0.0.1) =="
 docker run -d --name "$DNS_NAME" -p ${DNS_PORT}:53/udp -p ${DNS_PORT}:53/tcp \
-    --entrypoint dnsmasq andyshinn/dnsmasq:2.83 \
-    -k --address=/pebble/127.0.0.1 >/dev/null
+    ghcr.io/letsencrypt/pebble-challtestsrv:latest \
+    -dnsserver :53 -management :8055 \
+    -http01 "" -https01 "" -tlsalpn01 "" -doh "" \
+    -defaultIPv4 127.0.0.1 -defaultIPv6 "" >/dev/null
 
 for i in $(seq 1 30); do
     if curl -ksf https://127.0.0.1:14000/dir >/dev/null 2>&1; then break; fi
