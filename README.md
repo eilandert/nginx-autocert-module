@@ -81,12 +81,29 @@ http {
 
     # =====================================================================
     # 2) DNS-01 wildcard vhost. Requires dns-01 + both hooks (below).
-    #    Wildcards are ONLY issuable under dns-01.
-    # =====================================================================
+    #    Wildcards are ONLY issuable under dns-01. Two ways to ask for one:
+    #
+    #    (a) put the wildcard directly in server_name (this vhost then also
+    #        ROUTES every subdomain — fine for a single catch-all vhost):
     server {
         listen 443 ssl;
         server_name example.org *.example.org;
         autocert on;                              # http,server | default: off
+    }
+    #    (b) keep concrete per-subdomain vhosts and SHARE one wildcard cert via
+    #        autocert_wildcard — no wildcard in server_name, no catch-all, and
+    #        the covered concrete names are NOT issued separately:
+    server {
+        listen 443 ssl;
+        server_name a.example.net;
+        autocert on;
+        autocert_wildcard *.example.net;          # http,server | served from the wildcard
+    }
+    server {
+        listen 443 ssl;
+        server_name b.example.net;
+        autocert on;
+        autocert_wildcard *.example.net;          # same cert; declared once in http{} also works
     }
 
     # =====================================================================
@@ -132,6 +149,7 @@ set an instance-wide default in `http{}` that each `server{}` may override.
 | Directive | Context | Default | Description |
 |---|---|---|---|
 | `autocert on\|off [<email>]` | http, server | `off` | Master switch. Optional 2nd arg = ACME account contact email (one `@`, non-empty both sides). A `server{}`-level `autocert on` is what seeds the empty cert arrays so a cert-less vhost still builds an SSL_CTX. |
+| `autocert_wildcard *.rest [*.rest …]` | http, server | (none) | Declare wildcard SAN(s) for this scope **without** putting `*.` in `server_name` (which would also make the vhost a subdomain catch-all). In `http{}` it applies to every enabled vhost; a `server{}` occurrence adds to that vhost. **dns-01 only.** A concrete `server_name` the wildcard covers (one leading label, e.g. `a.example.com` under `*.example.com`) is served from the wildcard cert, not issued separately. Repeatable; sole-leading-label form only. |
 | `autocert_ca <url>` | http, server | LE production `https://acme-v02.api.letsencrypt.org/directory` | ACME directory URL to issue against. Distinct effective URLs become distinct CA groups. Mutually exclusive with `autocert_staging`. |
 | `autocert_staging on\|off` | http, server | `off` | Shorthand for the LE staging directory (`https://acme-staging-v02.api.letsencrypt.org/directory`). For CI; no production rate limits. Mutually exclusive with `autocert_ca`. |
 | `autocert_ca_certificate <file>` | http, server | (none) | PEM trust bundle verifying a private CA's TLS endpoint. CA-bound: a server that overrides the CA does **not** inherit it. Made absolute against the nginx prefix. |
@@ -154,6 +172,8 @@ set an instance-wide default in `http{}` that each `server{}` may override.
 - `autocert_ca` + `autocert_staging` on the same CA → emerg (mutually exclusive).
 - `dns-01` selected but a hook missing → emerg (`requires both …`).
 - `autocert_eab_kid` / `autocert_eab_hmac_key` — one set without the other → emerg.
+- `autocert_wildcard` with a non `*.`-form argument → emerg (sole-leading-label only).
+- `autocert_wildcard` under a non-dns-01 challenge → emerg (a wildcard is unissuable over http-01/tls-alpn-01).
 - Two vhosts naming the **same CA URL** with different trust bundle / EAB / account
   email → emerg (one CA URL = one trust bundle, one EAB, one account).
 - One `server_name` claimed by two vhosts pinned to different CAs → emerg

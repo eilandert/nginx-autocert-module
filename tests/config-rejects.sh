@@ -72,6 +72,22 @@ expect_reject "autocert_dns_hook_timeout 0" "    autocert_dns_hook_timeout 0;" \
 expect_reject "autocert_dns_hook_timeout -1" "    autocert_dns_hook_timeout -1;" \
     "invalid value"
 
+# D5 (#16): autocert_wildcard must be a sole leading-label wildcard. A concrete
+# name (or any non "*." form) is rejected at parse by the directive setter.
+expect_reject "autocert_wildcard non-wildcard arg" \
+    "    autocert_wildcard example.com;" \
+    "is not a leading-label wildcard"
+expect_reject "autocert_wildcard embedded star" \
+    "    autocert_wildcard *.ex*ple.com;" \
+    "is not a leading-label wildcard"
+
+# D5: a wildcard cert is unissuable over http-01 / tls-alpn-01, so an
+# autocert_wildcard with a non-dns-01 challenge is rejected at postconfig. The
+# template's default challenge is http-01, so just declaring one trips the gate.
+expect_reject "autocert_wildcard under http-01" \
+    "    autocert_wildcard *.example.com;" \
+    "autocert_wildcard requires \"autocert_challenge dns-01\""
+
 # Sanity: a positive timeout is accepted (config syntax ok).
 cat > "$PREFIX/conf/nginx.conf" <<EOF
 load_module $HTTP_SO;

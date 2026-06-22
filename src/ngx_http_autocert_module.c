@@ -82,6 +82,16 @@ static char *ngx_http_autocert_challenge(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
 static char *ngx_http_autocert_resolver(ngx_conf_t *cf, ngx_command_t *cmd,
     void *conf);
+static char *ngx_http_autocert_wildcard(ngx_conf_t *cf, ngx_command_t *cmd,
+    void *conf);
+
+/* D5 (#16) autocert_wildcard helpers. */
+static ngx_int_t ngx_http_autocert_is_wildcard(ngx_str_t *name);
+static ngx_int_t ngx_http_autocert_name_covered(ngx_str_t *name,
+    ngx_array_t *wildcards);
+static ngx_int_t ngx_http_autocert_add_name(ngx_conf_t *cf,
+    ngx_http_autocert_main_conf_t *amcf, ngx_autocert_ca_conf_t *cac,
+    ngx_http_autocert_srv_conf_t *ascf, ngx_str_t name);
 
 
 static ngx_command_t  ngx_http_autocert_commands[] = {
@@ -124,6 +134,21 @@ static ngx_command_t  ngx_http_autocert_commands[] = {
       ngx_conf_set_flag_slot,
       NGX_HTTP_SRV_CONF_OFFSET,
       offsetof(ngx_http_autocert_srv_conf_t, ca_conf.staging),
+      NULL },
+
+    /*
+     * D5 (#16): declare wildcard SAN(s) for this scope without putting a
+     * wildcard in server_name (which would also make the vhost a subdomain
+     * catch-all). MAIN+SRV: http{} sets an instance-wide wildcard inherited by
+     * every vhost; a server{} occurrence appends its own. Repeatable / 1+ args.
+     * dns-01 only (enforced at postconfig). A concrete server_name covered by a
+     * declared wildcard is served from the wildcard cert, not issued separately.
+     */
+    { ngx_string("autocert_wildcard"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_CONF_1MORE,
+      ngx_http_autocert_wildcard,
+      NGX_HTTP_SRV_CONF_OFFSET,
+      0,
       NULL },
 
     { ngx_string("autocert_renew_before"),
@@ -504,6 +529,9 @@ ngx_http_autocert_create_srv_conf(ngx_conf_t *cf)
      * needs an explicit UNSET so a future merge_value can detect "not set". */
     ascf->ca_conf.staging = NGX_CONF_UNSET;
 
+    /* D5: UNSET_PTR so merge can tell "no autocert_wildcard here" from "empty". */
+    ascf->wildcards = NGX_CONF_UNSET_PTR;
+
     return ascf;
 }
 
@@ -562,6 +590,30 @@ ngx_http_autocert_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
             if (conf->ca_conf.eab_hmac_key.data == NULL) {
                 conf->ca_conf.eab_hmac_key = prev->ca_conf.eab_hmac_key;
             }
+        }
+    }
+
+    /*
+     * D5 wildcard inheritance: http{}-level autocert_wildcard is inherited by
+     * every vhost; a server{} that declares its own gets the http{} set too
+     * (concatenated). A server with none simply inherits the http{} pointer
+     * (read-only). Duplicates across the two scopes are harmless — postconfig
+     * dedups by name when adding to the issuance set.
+     */
+    if (conf->wildcards == NGX_CONF_UNSET_PTR) {
+        conf->wildcards = prev->wildcards;
+
+    } else if (prev->wildcards != NGX_CONF_UNSET_PTR) {
+        ngx_str_t   *pw = prev->wildcards->elts;
+        ngx_str_t   *w;
+        ngx_uint_t   i;
+
+        for (i = 0; i < prev->wildcards->nelts; i++) {
+            w = ngx_array_push(conf->wildcards);
+            if (w == NULL) {
+                return NGX_CONF_ERROR;
+            }
+            *w = pw[i];
         }
     }
 
@@ -792,17 +844,242 @@ ngx_http_autocert_bind_ca_email(ngx_conf_t *cf, ngx_autocert_ca_entry_t *ce,
  * the main-conf name array (deduplicated) AND into its CA's ca_list group. Then
  * size and register the shared zone that publishes that set to the helper.
  */
+/*
+ * D5: autocert_wildcard setter. Validates each arg is a sole-leading-label
+ * wildcard ("*.example.com") and accumulates them on the scope's srv_conf
+ * (lazily creating the array), so repeated directives and the MAIN+SRV merge
+ * both append. dns-01-only is checked at postconfig (challenge isn't known yet).
+ */
+static char *
+ngx_http_autocert_wildcard(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_autocert_srv_conf_t  *ascf = conf;
+    ngx_str_t                     *value = cf->args->elts;
+    ngx_str_t                     *w;
+    ngx_uint_t                      i;
+
+    if (ascf->wildcards == NGX_CONF_UNSET_PTR) {
+        ascf->wildcards = ngx_array_create(cf->pool, 2, sizeof(ngx_str_t));
+        if (ascf->wildcards == NULL) {
+            return NGX_CONF_ERROR;
+        }
+    }
+
+    for (i = 1; i < cf->args->nelts; i++) {
+        if (!ngx_http_autocert_is_wildcard(&value[i])) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "autocert_wildcard: \"%V\" is not a leading-label wildcard "
+                "(expected the form \"*.example.com\")", &value[i]);
+            return NGX_CONF_ERROR;
+        }
+
+        w = ngx_array_push(ascf->wildcards);
+        if (w == NULL) {
+            return NGX_CONF_ERROR;
+        }
+
+        /* Store a lowercased copy. DNS names are case-insensitive, the SNI is
+         * lowercased before the serve-path lookup, and the wildcard's on-disk
+         * "_wildcard_.<rest>" segment must agree with that lookup — so a
+         * mixed-case "*.Example.com" has to be normalized here or the issued
+         * cert would never be found at handshake time. */
+        w->len = value[i].len;
+        w->data = ngx_pnalloc(cf->pool, value[i].len);
+        if (w->data == NULL) {
+            return NGX_CONF_ERROR;
+        }
+        ngx_strlow(w->data, value[i].data, value[i].len);
+    }
+
+    return NGX_CONF_OK;
+}
+
+
+/* D5: a sole, leading-label wildcard "*.rest" (the only wildcard ACME issues).
+ * Same shape gate the server_name path applies to a wildcard server_name. */
+static ngx_int_t
+ngx_http_autocert_is_wildcard(ngx_str_t *name)
+{
+    return name->len >= 3
+           && name->data[0] == '*' && name->data[1] == '.'
+           && ngx_strlchr(name->data + 2, name->data + name->len, '*') == NULL;
+}
+
+
+/*
+ * D5: is `name` a single-label subdomain of one of the wildcards? i.e. exactly
+ * "<label>.<rest>" (one non-empty leading label, no embedded dot) where
+ * "*.<rest>" is declared. Mirrors the RFC 6125 one-label fold the serve path
+ * uses, so a name suppressed here is exactly one the wildcard cert will serve.
+ * The apex (rest itself) and multi-label names are NOT covered.
+ */
+static ngx_int_t
+ngx_http_autocert_name_covered(ngx_str_t *name, ngx_array_t *wildcards)
+{
+    ngx_str_t   *wc = wildcards->elts;
+    ngx_uint_t   i;
+    u_char      *dot;
+    size_t       rest_len;
+    u_char      *rest;
+
+    /* A wildcard name is never "covered" by a wildcard — only concrete names
+     * are suppressed. (Without this, "*.example.com" would match the wildcard
+     * "*.example.com" via the rest-compare below and get routed through the
+     * wrong path; a wildcard server_name must keep its own server_name flow.) */
+    if (name->len != 0 && name->data[0] == '*') {
+        return 0;
+    }
+
+    dot = ngx_strlchr(name->data, name->data + name->len, '.');
+    if (dot == NULL || dot == name->data || dot + 1 >= name->data + name->len) {
+        return 0;                       /* no label, empty label, or trailing dot */
+    }
+
+    rest = dot + 1;
+    rest_len = (size_t) (name->data + name->len - rest);
+
+    for (i = 0; i < wildcards->nelts; i++) {
+        /* wc[i] is "*.X" (validated, lowercased); compare X to the part after
+         * the 1st dot, case-insensitively (server_name may be mixed case). */
+        if (wc[i].len - 2 == rest_len
+            && ngx_strncasecmp(wc[i].data + 2, rest, rest_len) == 0)
+        {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
+/*
+ * D5: add one issuable name to the global set + its CA group (the per-name body
+ * lifted out of postconfig so both the server_name loop and the autocert_wildcard
+ * loop share it). Dedups against amcf->names; a name already claimed by a
+ * different CA is an emerg (one name = one cert = one CA); a same-CA dup still
+ * routes through ca_entry so its trust/EAB-conflict gate + email bind run.
+ */
+static ngx_int_t
+ngx_http_autocert_add_name(ngx_conf_t *cf, ngx_http_autocert_main_conf_t *amcf,
+    ngx_autocert_ca_conf_t *cac, ngx_http_autocert_srv_conf_t *ascf,
+    ngx_str_t name)
+{
+    ngx_uint_t                i;
+    ngx_autocert_ca_entry_t  *ce;
+    ngx_str_t                *slot;
+
+    /* Dedup: the same name may appear across vhosts. */
+    for (i = 0; i < amcf->names->nelts; i++) {
+        ngx_str_t  *e = &((ngx_str_t *) amcf->names->elts)[i];
+
+        if (e->len == name.len
+            && ngx_strncmp(e->data, name.data, name.len) == 0)
+        {
+            break;
+        }
+    }
+
+    if (i < amcf->names->nelts) {
+        /*
+         * The name is already claimed by an earlier vhost. There is ONE stored
+         * certificate per name, so it must resolve to ONE CA. If this vhost pins
+         * it to a DIFFERENT CA than the one that first claimed it, that is an
+         * ambiguous config (which CA signs the single cert?) — reject at parse
+         * rather than silently keeping the first CA (Codex M5 LOW). Same CA =
+         * the harmless dup we skip.
+         */
+        ngx_autocert_ca_entry_t  *owner = NULL;
+        ngx_uint_t                k, m;
+
+        ce = amcf->ca_list->elts;
+        for (k = 0; k < amcf->ca_list->nelts && owner == NULL; k++) {
+            ngx_str_t  *gn = ce[k].names->elts;
+            for (m = 0; m < ce[k].names->nelts; m++) {
+                if (gn[m].len == name.len
+                    && ngx_strncmp(gn[m].data, name.data, name.len) == 0)
+                {
+                    owner = &ce[k];
+                    break;
+                }
+            }
+        }
+
+        if (owner != NULL
+            && (owner->ca_conf.ca.len != cac->ca.len
+                || ngx_strncmp(owner->ca_conf.ca.data, cac->ca.data,
+                               cac->ca.len) != 0))
+        {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "autocert: server name \"%V\" is claimed by two vhosts "
+                "with different CAs (\"%V\" vs \"%V\"); one name issues "
+                "one certificate from one CA — pin it to a single CA",
+                &name, &owner->ca_conf.ca, &cac->ca);
+            return NGX_ERROR;
+        }
+
+        /* Dup name, same CA URL: this vhost adds no new name, but it must still
+         * pass the SAME trust/EAB-conflict gate a name-contributing vhost does
+         * (ngx_http_autocert_ca_entry rejects a same-URL group reconfigured with
+         * a different ca_certificate/EAB), and its `autocert on <email>` binds to
+         * the CA group's contact. Route through ca_entry so the dup path can't
+         * bypass that validation; the entry already exists so no group grows. */
+        if (owner != NULL) {
+            ngx_autocert_ca_entry_t  *grp;
+
+            grp = ngx_http_autocert_ca_entry(cf, amcf, cac);
+            if (grp == NULL) {
+                return NGX_ERROR;
+            }
+            if (ngx_http_autocert_bind_ca_email(cf, grp, &ascf->email)
+                != NGX_OK)
+            {
+                return NGX_ERROR;
+            }
+        }
+
+        return NGX_OK;
+    }
+
+    slot = ngx_array_push(amcf->names);
+    if (slot == NULL) {
+        return NGX_ERROR;
+    }
+
+    *slot = name;
+
+    /* M2: first-wins by CA — a new global name also joins the group of the CA of
+     * the server that introduced it. Create the group lazily here (only now is
+     * there a name for it) so no empty entry appears. ca_entry may grow ca_list
+     * (realloc), so use the fresh `ce` at once — nothing else touches ca_list
+     * before the push below. */
+    ce = ngx_http_autocert_ca_entry(cf, amcf, cac);
+    if (ce == NULL) {
+        return NGX_ERROR;
+    }
+    if (ngx_http_autocert_bind_ca_email(cf, ce, &ascf->email) != NGX_OK) {
+        return NGX_ERROR;
+    }
+    slot = ngx_array_push(ce->names);
+    if (slot == NULL) {
+        return NGX_ERROR;
+    }
+    *slot = name;
+
+    return NGX_OK;
+}
+
+
 static ngx_int_t
 ngx_http_autocert_postconfig(ngx_conf_t *cf)
 {
     ngx_str_t                       name;
-    ngx_uint_t                      s, n, i;
+    ngx_uint_t                      s, n;
     ngx_http_server_name_t         *sn;
     ngx_http_autocert_srv_conf_t   *ascf;
     ngx_http_autocert_main_conf_t  *amcf;
     ngx_http_core_srv_conf_t      **cscfp, *cscf;
     ngx_http_core_main_conf_t      *cmcf;
-    ngx_autocert_ca_entry_t        *ce;
+    ngx_array_t                    *wc;
     ngx_autocert_ca_conf_t         *cac;
 
     amcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_autocert_module);
@@ -882,6 +1159,20 @@ ngx_http_autocert_postconfig(ngx_conf_t *cf)
 
         sn = cscf->server_names.elts;
 
+        /* D5: this vhost's effective wildcard set (http{} default folded in by
+         * merge_srv_conf). A declared wildcard is issuable only over dns-01 —
+         * RFC 8555 §7.1.3 forbids a wildcard under http-01 / tls-alpn-01. */
+        wc = (ascf->wildcards == NGX_CONF_UNSET_PTR) ? NULL : ascf->wildcards;
+
+        if (wc != NULL && wc->nelts != 0
+            && amcf->challenge != NGX_HTTP_AUTOCERT_CHALLENGE_DNS_01)
+        {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "autocert_wildcard requires \"autocert_challenge dns-01\" "
+                "(a wildcard certificate can only be issued over dns-01)");
+            return NGX_ERROR;
+        }
+
         for (n = 0; n < cscf->server_names.nelts; n++) {
             name = sn[n].name;
 
@@ -905,118 +1196,45 @@ ngx_http_autocert_postconfig(ngx_conf_t *cf)
                 continue;
             }
             if (ngx_strlchr(name.data, name.data + name.len, '*') != NULL) {
-                /* D4: keep "*.rest" only under dns-01 and only if the '*' is the
+                /* D4: keep "*.rest" only under dns-01 and only if it is the
                  * sole, leading-label wildcard. The order flow sends "*.rest" as
                  * the ACME identifier and stores it under "_wildcard_.rest". */
                 if (amcf->challenge != NGX_HTTP_AUTOCERT_CHALLENGE_DNS_01
-                    || name.len < 3
-                    || name.data[0] != '*' || name.data[1] != '.'
-                    || ngx_strlchr(name.data + 2, name.data + name.len, '*')
-                       != NULL)
+                    || !ngx_http_autocert_is_wildcard(&name))
                 {
                     continue;
                 }
             }
 
-            /* Dedup: the same name may appear across vhosts. */
-            for (i = 0; i < amcf->names->nelts; i++) {
-                ngx_str_t  *e = &((ngx_str_t *) amcf->names->elts)[i];
-
-                if (e->len == name.len
-                    && ngx_strncmp(e->data, name.data, name.len) == 0)
-                {
-                    break;
-                }
-            }
-
-            if (i < amcf->names->nelts) {
-                /*
-                 * The name is already claimed by an earlier vhost. There is ONE
-                 * stored certificate per name, so it must resolve to ONE CA. If
-                 * this vhost pins it to a DIFFERENT CA than the one that first
-                 * claimed it, that is an ambiguous config (which CA signs the
-                 * single cert?) — reject at parse rather than silently keeping
-                 * the first CA (Codex M5 LOW). Same CA = the harmless dup we skip.
-                 */
-                ngx_autocert_ca_entry_t  *owner = NULL;
-                ngx_uint_t                k, m;
-
-                ce = amcf->ca_list->elts;
-                for (k = 0; k < amcf->ca_list->nelts && owner == NULL; k++) {
-                    ngx_str_t  *gn = ce[k].names->elts;
-                    for (m = 0; m < ce[k].names->nelts; m++) {
-                        if (gn[m].len == name.len
-                            && ngx_strncmp(gn[m].data, name.data, name.len) == 0)
-                        {
-                            owner = &ce[k];
-                            break;
-                        }
-                    }
-                }
-
-                if (owner != NULL
-                    && (owner->ca_conf.ca.len != cac->ca.len
-                        || ngx_strncmp(owner->ca_conf.ca.data, cac->ca.data,
-                                       cac->ca.len) != 0))
-                {
-                    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                        "autocert: server name \"%V\" is claimed by two vhosts "
-                        "with different CAs (\"%V\" vs \"%V\"); one name issues "
-                        "one certificate from one CA — pin it to a single CA",
-                        &name, &owner->ca_conf.ca, &cac->ca);
-                    return NGX_ERROR;
-                }
-
-                /* Dup name, same CA URL: this vhost adds no new name, but it must
-                 * still pass the SAME trust/EAB-conflict gate a name-contributing
-                 * vhost does (ngx_http_autocert_ca_entry rejects a same-URL group
-                 * reconfigured with a different ca_certificate/EAB), and its
-                 * `autocert on <email>` binds to the CA group's contact. Route
-                 * through ca_entry so the dup path can't bypass that validation;
-                 * the entry already exists (the name claimed it) so no group grows. */
-                if (owner != NULL) {
-                    ngx_autocert_ca_entry_t  *grp;
-
-                    grp = ngx_http_autocert_ca_entry(cf, amcf, cac);
-                    if (grp == NULL) {
-                        return NGX_ERROR;
-                    }
-                    if (ngx_http_autocert_bind_ca_email(cf, grp, &ascf->email)
-                        != NGX_OK)
-                    {
-                        return NGX_ERROR;
-                    }
-                }
-
+            /* D5: a concrete subdomain covered by one of this vhost's
+             * autocert_wildcard entries is served from the wildcard cert, so do
+             * not also issue a separate certificate for it. */
+            if (wc != NULL && wc->nelts != 0
+                && ngx_http_autocert_name_covered(&name, wc))
+            {
                 continue;
             }
 
-            ngx_str_t  *slot = ngx_array_push(amcf->names);
-            if (slot == NULL) {
-                return NGX_ERROR;
-            }
-
-            *slot = name;
-
-            /* M2: first-wins by CA — a new global name also joins the group of
-             * the CA of the server that introduced it. Create the group lazily
-             * here (only now is there a name for it) so no empty entry appears.
-             * ca_entry may grow ca_list (realloc), so use the fresh `ce` at once
-             * — nothing else touches ca_list before the push below. */
-            ce = ngx_http_autocert_ca_entry(cf, amcf, cac);
-            if (ce == NULL) {
-                return NGX_ERROR;
-            }
-            if (ngx_http_autocert_bind_ca_email(cf, ce, &ascf->email)
+            if (ngx_http_autocert_add_name(cf, amcf, cac, ascf, name)
                 != NGX_OK)
             {
                 return NGX_ERROR;
             }
-            slot = ngx_array_push(ce->names);
-            if (slot == NULL) {
-                return NGX_ERROR;
+        }
+
+        /* D5: add the wildcard SAN(s) declared via autocert_wildcard. They run
+         * through the same dedup / one-name-one-CA / email-bind path as a
+         * server_name-derived name. */
+        if (wc != NULL) {
+            ngx_str_t  *wn = wc->elts;
+
+            for (n = 0; n < wc->nelts; n++) {
+                if (ngx_http_autocert_add_name(cf, amcf, cac, ascf, wn[n])
+                    != NGX_OK)
+                {
+                    return NGX_ERROR;
+                }
             }
-            *slot = name;
         }
     }
 
