@@ -810,6 +810,29 @@ jobs:
           dir: ${{ matrix.dir }}
           script: single-process-reload.sh
 
+  reload-inflight:
+    name: master_process off reload while ACME in flight (cancel_inflight) [${{ matrix.flavor }}]
+    needs: [resolve, build-nginx, build-angie]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: nginx
+            dir: ${{ needs.resolve.outputs.nginx_dir }}
+          - flavor: angie
+            dir: ${{ needs.resolve.outputs.angie_dir }}
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: a reload storm under in-flight ACME must not UAF (cancel_inflight)
+        uses: ./.github/actions/run-e2e
+        with:
+          flavor: ${{ matrix.flavor }}
+          dir: ${{ matrix.dir }}
+          script: reload-inflight.sh
+
   account-migration:
     name: per-CA account path + legacy migration (M3, #15) [${{ matrix.flavor }}]
     needs: [resolve, build-nginx, build-angie]

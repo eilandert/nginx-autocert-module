@@ -271,7 +271,25 @@ ngx_autocert_acme_request(ngx_autocert_acme_request_t *r)
 
     r->resolve = ctx;
 
+    /*
+     * Publish the inflight pointer NOW, before ngx_resolve_name(), for the same
+     * reason the connect path publishes before ssl_init (see the long comment
+     * at the ngx_autocert_acme_inflight assignment in ngx_autocert_acme_connect):
+     * nginx's resolver can invoke ctx->handler SYNCHRONOUSLY (cached/quick name)
+     * and still return NGX_OK, so resolve_handler -> connect -> ssl_init ->
+     * finalize can run inline on this stack and the *_done handler may destroy
+     * r->pool before ngx_resolve_name() returns. Writing `r` into the global
+     * AFTER the call (the old code did this below the call) was therefore a
+     * use-after-free: it republished a pointer into an already-freed pool.
+     * finalize clears the pointer on completion; the sync-start-failure path
+     * just below clears it explicitly before the caller frees the pool.
+     */
+    ngx_autocert_acme_inflight = r;     /* armed; cancelable on reload */
+
     if (ngx_resolve_name(ctx) != NGX_OK) {
+        if (r == ngx_autocert_acme_inflight) {
+            ngx_autocert_acme_inflight = NULL;
+        }
         r->resolve = NULL;
         ngx_log_error(NGX_LOG_ERR, r->log, 0,
                       "autocert: ngx_resolve_name() failed for \"%V\"",
@@ -279,7 +297,6 @@ ngx_autocert_acme_request(ngx_autocert_acme_request_t *r)
         return NGX_ERROR;
     }
 
-    ngx_autocert_acme_inflight = r;     /* resolve armed; cancelable on reload */
     return NGX_OK;
 }
 

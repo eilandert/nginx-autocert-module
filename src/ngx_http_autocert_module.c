@@ -1421,6 +1421,18 @@ ngx_http_autocert_challenge_handler(ngx_http_request_t *r)
         return NGX_HTTP_NOT_ALLOWED;
     }
 
+    /*
+     * Drain any request body before producing our own response. A GET/HEAD may
+     * still carry a Content-Length / chunked body; a content-phase handler that
+     * emits output without discarding it leaves those bytes in the connection
+     * buffer, desyncing keepalive framing (the next pipelined request mis-parses
+     * the leftover as its start line). Mirrors ngx_http_stub_status_module.
+     */
+    rc = ngx_http_discard_request_body(r);
+    if (rc != NGX_OK) {
+        return rc;
+    }
+
     /* the token is the single path segment after the prefix */
     token.data = r->uri.data + pfxlen;
     token.len = r->uri.len - pfxlen;

@@ -90,4 +90,48 @@ clen=$(curl -fsS -D - -o /dev/null \
     echo "::error::Content-Length $clen != ${#KEYAUTH}"; exit 1; }
 echo "✓ Content-Length correct"
 
+# Regression: a GET carrying a request body on a keepalive connection must not
+# desync the connection. The content-phase challenge handler emits its own
+# response and so must ngx_http_discard_request_body() the unread GET body;
+# otherwise the leftover body bytes are mis-parsed as the next pipelined
+# request's start line (a request-smuggling / keepalive-framing bug). We send
+# request #1 (GET + Content-Length body) immediately followed by request #2 on
+# the SAME socket and require TWO 200s and the keyauth body twice.
+echo "== GET-with-body on keepalive must not desync (body discarded) =="
+resp=$(python3 - "$PORT" "$TOKEN" <<'PY'
+import socket, sys
+port = int(sys.argv[1]); token = sys.argv[2]
+path = "/.well-known/acme-challenge/" + token
+body = b"BODYBYTES"
+req1 = ("GET %s HTTP/1.1\r\nHost: a.example.com\r\n"
+        "Content-Length: %d\r\nConnection: keep-alive\r\n\r\n"
+        % (path, len(body))).encode() + body
+req2 = ("GET %s HTTP/1.1\r\nHost: a.example.com\r\n"
+        "Connection: close\r\n\r\n" % path).encode()
+s = socket.create_connection(("127.0.0.1", port), 5); s.settimeout(5)
+s.sendall(req1 + req2)
+data = b""
+while True:
+    try:
+        chunk = s.recv(4096)
+    except socket.timeout:
+        break
+    if not chunk:
+        break
+    data += chunk
+sys.stdout.write(data.decode("latin1"))
+PY
+)
+# The keyauth body carries no trailing newline, so the 2nd response's status
+# line is glued to the end of the 1st body — count OCCURRENCES, not lines.
+n200=$(printf '%s' "$resp" | grep -o 'HTTP/1.1 200' | wc -l | tr -d ' ')
+nkey=$(printf '%s' "$resp" | grep -o -F "$KEYAUTH" | wc -l | tr -d ' ')
+if [ "$n200" -ne 2 ] || [ "$nkey" -ne 2 ] \
+   || printf '%s' "$resp" | grep -q 'HTTP/1.1 400'; then
+    echo "::error::keepalive desync after GET-with-body (200s=$n200 keyauth=$nkey):"
+    printf '%s' "$resp" | grep -o 'HTTP/1.1 [0-9]*' | sed 's/^/    /'
+    exit 1
+fi
+echo "✓ GET-with-body discarded; keepalive framing intact across pipelined requests"
+
 echo "✓ M5 HTTP-01 challenge serve path verified"
