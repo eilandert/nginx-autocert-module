@@ -59,7 +59,14 @@ runs:
         # (autocert_test_challenge / autocert_test_alpn) the e2e suite needs.
         # Production builds omit them; the "test-directives rejected" job proves
         # a no-flag build rejects them.
+        # angie ships a native `acme` module; enable it so the coexistence test
+        # (native acme + this module's autocert in one instance — the prod
+        # scenario that SIGSEGV'd, memory issues.md 2026-06-22) is exercised.
+        # Mainline nginx has no such flag.
+        ACME_FLAG=
+        [ "${{ inputs.flavor }}" = angie ] && ACME_FLAG=--with-http_acme_module
         AUTOCERT_TEST=1 ./configure --with-compat --with-http_ssl_module \
+          $ACME_FLAG \
           --with-cc="ccache cc" \
           --with-cc-opt="-Wall -Wextra -Werror" \
           --add-dynamic-module="$GITHUB_WORKSPACE" > /tmp/conf.log 2>&1 \

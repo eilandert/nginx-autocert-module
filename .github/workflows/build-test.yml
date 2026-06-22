@@ -172,6 +172,50 @@ jobs:
           url: ${{ needs.resolve.outputs.angie_url }}
           dir: ${{ needs.resolve.outputs.angie_dir }}
 
+  # Coexistence: this module's `autocert` alongside Angie's native `acme`
+  # (the implicit "@acme" server block) in one instance — the exact prod
+  # scenario that SIGSEGV'd in serve_init (memory issues.md 2026-06-22). angie
+  # only (the build sets --with-http_acme_module for angie); the test skips on
+  # nginx. `-t` only, no docker.
+  coexist-native-acme:
+    name: Coexist with native angie acme (-t)
+    needs: [resolve, build-angie]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: native acme + autocert in one instance
+        uses: ./.github/actions/run-e2e
+        with:
+          flavor: angie
+          dir: ${{ needs.resolve.outputs.angie_dir }}
+          script: coexist-native-acme.sh
+
+  # ABI-drift regression. The prod crash was a struct-offset mismatch: the .so
+  # was built against vanilla angie, but our packaged angie carries
+  # nginx_dynamic_tls_records (adds ngx_ssl_dyn_rec_t to ngx_ssl_s, +32B,
+  # shifting ngx_http_ssl_srv_conf_t.certificates 208->240). This builds the
+  # module against vanilla AND a synthetically-enlarged ngx_ssl_s tree and
+  # proves: matched builds work, mismatched builds are refused by the module's
+  # ABI guard (clean [emerg], never SIGSEGV). Self-contained — no dependency on
+  # our private deb patches.
+  abi-mismatch-guard:
+    name: ABI-drift guard (matched OK, mismatch refused)
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Build vanilla + enlarged angie, run ABI matrix
+        shell: bash
+        env:
+          ANGIE_URL: ${{ needs.resolve.outputs.angie_url }}
+        run: |
+          set -euo pipefail
+          WORKSPACE="$GITHUB_WORKSPACE" bash tests/abi-build-and-check.sh
+
   # Prove a PRODUCTION build (no AUTOCERT_TEST) omits the test-only seed
   # directives entirely, so a stray/templated autocert_test_challenge cannot
   # inject a forged key authorization. Builds the module withOUT the flag and
