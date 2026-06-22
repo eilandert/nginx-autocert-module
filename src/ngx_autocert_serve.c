@@ -119,6 +119,59 @@ static int ngx_http_autocert_serve_alpn_cert(ngx_connection_t *c,
     SSL *ssl_conn, ngx_autocert_serve_ctx_t *sctx, ngx_str_t *host);
 
 
+/*
+ * ABI safety net for a dynamic-module/binary mismatch.
+ *
+ * A dynamic module bakes in the compile-time offsets of every core/ssl struct
+ * field it reads. If the running nginx/angie was built from a different source
+ * tree — e.g. with our `nginx_dynamic_tls_records.patch`, which adds
+ * `ngx_ssl_dyn_rec_t dyn_rec` to `ngx_ssl_s` and so pushes
+ * `ngx_http_ssl_srv_conf_t.certificates` from offset 208 to 240 — the offsets
+ * disagree and serve_init reads `certificates`/`certificate_values` from the
+ * wrong bytes. nginx's own ABI guard (NGX_MODULE_SIGNATURE) would normally
+ * refuse to load such a module, but our packages pin the signature
+ * (0002-Make-sure-signature-stays-the-same.patch) so a mismatched .so loads and
+ * then SIGSEGVs deep in serve_init.
+ *
+ * `ssl.ctx` sits at offset 0 of the ssl srv conf and never drifts, so we only
+ * sanity-check the drift-prone array pointers, and only for a real ssl server
+ * (ctx != NULL — the exact servers whose fields we go on to dereference). A
+ * live `ngx_array_t *` is either NULL or a word-aligned heap pointer well above
+ * the zero page; a misread lands on a small flag value (verify_depth == 1 in
+ * the observed crash) or a non-canonical word, which this rejects. Heuristic by
+ * nature — it reliably catches the vanilla-built-into-patched case that bit us
+ * and converts the crash into a clear, actionable config error. The real
+ * guarantee is still: build the module against the same tree as the binary.
+ */
+static ngx_int_t
+ngx_autocert_ptr_plausible(void *p)
+{
+    uintptr_t  v = (uintptr_t) p;
+
+    if (v == 0) {
+        return 1;                       /* NULL is a legitimate field value */
+    }
+    if (v & (sizeof(void *) - 1)) {
+        return 0;                       /* heap pointers are word-aligned */
+    }
+    /* Below the zero page is never a heap object; above the 47-bit
+     * user-space ceiling is never a canonical userland pointer. */
+    if (v < 0x10000 || v >= 0x800000000000ULL) {
+        return 0;
+    }
+    return 1;
+}
+
+
+static ngx_int_t
+ngx_autocert_ssl_srv_conf_abi_ok(ngx_http_ssl_srv_conf_t *sscf)
+{
+    return ngx_autocert_ptr_plausible(sscf->certificates)
+           && ngx_autocert_ptr_plausible(sscf->certificate_values)
+           && ngx_autocert_ptr_plausible(sscf->certificate_keys);
+}
+
+
 ngx_int_t
 ngx_http_autocert_serve_init(ngx_conf_t *cf,
     ngx_http_autocert_main_conf_t *amcf)
@@ -170,6 +223,26 @@ ngx_http_autocert_serve_init(ngx_conf_t *cf,
 
         ascf = cscf->ctx->srv_conf[ngx_http_autocert_module.ctx_index];
         sscf = cscf->ctx->srv_conf[ngx_http_ssl_module.ctx_index];
+
+        /*
+         * Fail loud, not with a SIGSEGV, if this module's compiled view of
+         * ngx_http_ssl_srv_conf_t disagrees with the running binary's (ABI
+         * mismatch — see ngx_autocert_ssl_srv_conf_abi_ok). ssl.ctx (offset 0)
+         * never drifts, so gate on it: only real ssl servers reach the field
+         * reads below, and only there does a layout mismatch matter.
+         */
+        if (sscf->ssl.ctx != NULL
+            && !ngx_autocert_ssl_srv_conf_abi_ok(sscf))
+        {
+            ngx_log_error(NGX_LOG_EMERG, cf->log, 0,
+                          "autocert: ngx_http_ssl_srv_conf_t ABI mismatch for "
+                          "server \"%V\" — this module was built against a "
+                          "different nginx/angie source tree than the running "
+                          "binary (e.g. missing nginx_dynamic_tls_records). "
+                          "Rebuild the module against this exact binary.",
+                          &cscf->server_name);
+            return NGX_ERROR;
+        }
 
         if (ascf->enable != 1) {
             /*

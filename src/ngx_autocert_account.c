@@ -865,8 +865,12 @@ ngx_autocert_account_register_done(ngx_autocert_acme_request_t *req,
     }
 
     if (ok != NGX_OK) {
+        /* Surface the ACME problem document (RFC 8555 §6.7) so a CA-side
+         * rejection — e.g. badNonce, malformed JWS, rejectedIdentifier — is
+         * diagnosable from the log instead of an opaque status code. */
         ngx_log_error(NGX_LOG_ERR, acct->log, 0,
-                      "autocert: newAccount failed, status %ui", req->status);
+                      "autocert: newAccount failed, status %ui: %*s",
+                      req->status, (size_t) req->body_out.len, req->body_out.data);
     }
 
     ngx_destroy_pool(req->pool);
