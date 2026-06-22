@@ -51,6 +51,37 @@ the real certificate lands, after which the module renews it on its own (by defa
 7 days before expiry). Add a vhost, set `autocert on;`, reload once — that's the
 whole workflow.
 
+### No port 80? Use TLS-ALPN-01
+
+Can't (or won't) open port 80? Switch the challenge to `tls-alpn-01` — it validates
+inside a TLS handshake on `:443`, so no HTTP listener is needed:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name example.com www.example.com;
+    autocert on;
+    autocert_challenge tls-alpn-01;    # validate in-handshake on :443, no port 80
+}
+```
+
+**Read these caveats before switching — `tls-alpn-01` is not a drop-in for every setup:**
+
+- **Not every CA offers it.** `tls-alpn-01` is optional in ACME
+  ([RFC 8737](https://datatracker.ietf.org/doc/html/rfc8737)). Let's Encrypt
+  supports it; many commercial CAs do **not**. The module asks the CA only for the
+  configured challenge and **fails the order** if the CA doesn't list it. `http-01`
+  is universal — that's why it's the default.
+- **Validation must terminate on NGINX.** The proof is a raw TLS handshake with
+  ALPN `acme-tls/1` that the module answers in-process. **Any** TLS-terminating
+  layer in front — reverse proxy, load balancer, CDN — intercepts that handshake
+  and validation fails. Behind such a layer, use `http-01` or `dns-01` instead.
+- **It's instance-wide, not per-vhost.** `autocert_challenge` lives in `http{}` —
+  one challenge type for the whole NGINX instance. You can't pair a `tls-alpn-01`
+  vhost with an `http-01` one; flipping it switches **every** autocert vhost.
+- **`:443` must be reachable from the internet** on the standard port — the CA
+  always connects there for this challenge (no custom port).
+
 Everything below is for when you want *more* — LE staging, wildcards, DNS-01, a
 different CA, EAB. **None of it is needed for the common case above.**
 
