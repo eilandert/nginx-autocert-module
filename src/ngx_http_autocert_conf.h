@@ -92,6 +92,16 @@ typedef struct {
      * groups names by CA URL into main_conf.ca_list. staging starts UNSET (set
      * in create_srv_conf) so merge can tell "not set" from "off". */
     ngx_autocert_ca_conf_t  ca_conf;
+
+    /* D5 (#16): explicit wildcard SANs (autocert_wildcard *.example.com ...).
+     * MAIN+SRV scope, stored here via SRV_CONF_OFFSET; merge_srv_conf folds the
+     * http{} default into each server (http-level = inherited by all vhosts,
+     * server-level = appended). Each is a sole-leading-label wildcard. At
+     * postconfig they join the names/ca_list pipeline like any issuable name,
+     * and a concrete server_name they cover is suppressed (served from the
+     * wildcard cert, not issued separately). NGX_CONF_UNSET_PTR until set. Only
+     * valid under autocert_challenge dns-01 (enforced at postconfig). */
+    ngx_array_t            *wildcards;        /* ngx_str_t "*.rest" */
 } ngx_http_autocert_srv_conf_t;
 
 

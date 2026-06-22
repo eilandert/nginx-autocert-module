@@ -51,7 +51,7 @@ load_module $HTTP_SO;
 error_log $PREFIX/logs/error.log notice;
 events {}
 http {
-    autocert_path $PREFIX/store;
+    autocert_store_path $PREFIX/store;
     server {
         listen $PORT ssl;
         server_name $DOMAIN;
@@ -85,7 +85,7 @@ load_module $HTTP_SO;
 error_log $PREFIX/logs/neg.log notice;
 events {}
 http {
-    autocert_path $PREFIX/store;
+    autocert_store_path $PREFIX/store;
     map \$ssl_server_name \$cf { default /x.pem; }
     server {
         listen $PORT ssl; server_name $DOMAIN; autocert on;

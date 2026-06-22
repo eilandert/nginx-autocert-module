@@ -39,7 +39,7 @@ user root;   # worker-0 ACME driver writes the store; keep worker uid able to
 error_log $PREFIX/logs/error.log notice;
 events {}
 http {
-    autocert_path $PREFIX/store;
+    autocert_store_path $PREFIX/store;
     autocert_test_challenge $TOKEN "$KEYAUTH";
     server {
         listen $PORT;

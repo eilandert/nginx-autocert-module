@@ -89,13 +89,14 @@ runs:
         error_log $PREFIX/logs/error.log notice;   # NOTICE level: the worker-0 driver-armed line is NOTICE
         events {}
         http {
-            autocert on admin@example.com;   # global
+            autocert on;
+            autocert_contact admin@example.com;   # global
             # M2 global tuning knobs (all non-default values).
             autocert_ca https://acme-staging-v02.api.letsencrypt.org/directory;
             autocert_renew_before 10d;
             autocert_key_type secp256r1;
-            autocert_store secure;
-            autocert_path $PREFIX/store;   # writable by the unprivileged runner; the worker-0 driver creates + locks it
+            autocert_store_layout secure;
+            autocert_store_path $PREFIX/store;   # writable by the unprivileged runner; the worker-0 driver creates + locks it
             autocert_challenge tls-alpn-01;
             server {
                 listen 8080;
@@ -157,9 +158,9 @@ runs:
           echo "✓ rejected: $desc"
         }
 
-        run_neg "invalid email"        'server { listen 8080; autocert on x@; }'                          'invalid email'
+        run_neg "invalid email"        'server { listen 8080; autocert on; autocert_contact x@; }'                          'invalid email'
         run_neg "bad key_type"         'autocert_key_type rsa2048;'                                       'invalid key type'
-        run_neg "bad store"            'autocert_store vault;'                                            'invalid store'
+        run_neg "bad store"            'autocert_store_layout vault;'                                            'invalid layout'
         run_neg "bad challenge"        'autocert_challenge bogus-01;'                                     'invalid challenge'
         run_neg "duplicate key"        'autocert_key_type secp384r1; autocert_key_type secp256r1;'        'is duplicate'
         run_neg "knob in server{}"     'server { listen 8080; autocert_renew_before 10d; }'               'directive is not allowed'
@@ -178,8 +179,8 @@ runs:
           echo "✓ accepted: $desc"
         }
 
-        run_pos "autocert_staging on"  'autocert_staging on; autocert_path /tmp/ac-stage;'
-        run_pos "store certbot"        'autocert_store certbot; autocert_path /tmp/ac-cb;'
+        run_pos "autocert_staging on"  'autocert_staging on; autocert_store_path /tmp/ac-stage;'
+        run_pos "store certbot"        'autocert_store_layout certbot; autocert_store_path /tmp/ac-cb;'
         run_pos "server autocert_ca"   'server { listen 8080; autocert_ca https://example.com/dir; }'
         echo "✓ all positive cases accepted"
 

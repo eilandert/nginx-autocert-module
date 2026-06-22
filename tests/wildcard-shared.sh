@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
 #
-# dns-01 exec-hook full issuance e2e test (D3, #16) — port 80/TLS VA NEVER used.
+# autocert_wildcard shared-cert e2e test (D5, #16).
 #
-# Proves the dns-01 provider path end to end: the driver computes the TXT value,
-# runs the operator add-hook (fork+execve) to publish it, waits the propagation
-# delay, the CA validates the authorization by a real DNS TXT lookup, the cert
-# is finalized + downloaded + stored, and the remove-hook runs on order finish.
+# Proves the autocert_wildcard directive: several CONCRETE-name vhosts
+# (foo. and bar.wc.example.com), each on its own listener, share ONE wildcard
+# certificate declared once at http{} level with `autocert_wildcard
+# *.wc.example.com;` — without any wildcard in server_name. Asserts:
+#   1. exactly the wildcard "*.wc.example.com" is issued (stored under
+#      "_wildcard_.wc.example.com"),
+#   2. SUPPRESSION: no per-subdomain cert dir (foo./bar.) is created — the
+#      concrete server_names covered by the wildcard are NOT issued separately,
+#   3. each subdomain's own listener serves that one wildcard cert per-SNI.
 #
-# DNS is served by pebble-challtestsrv: its mgmt API (:8055) lets the hook
-# publish/clear TXT records dynamically, and Pebble is pointed at its DNS (:53)
-# with `-dnsserver`. No HTTP-01 / TLS-ALPN-01 listener is involved at all.
+# This is the autocert_wildcard counterpart to wildcard-issue.sh (which drives
+# the legacy wildcard-in-server_name path). Reuses the same pebble +
+# pebble-challtestsrv dns-01 harness.
 #
-# Inputs (env):
-#   SERVER_BIN   - path to the built nginx/angie binary (required)
-#   NGX_BUILD_DIR- build dir holding objs/*.so (defaults to dir of SERVER_BIN)
+# Inputs (env): SERVER_BIN (required), NGX_BUILD_DIR.
 
 set -euo pipefail
 
@@ -22,13 +25,17 @@ NGX_BUILD_DIR="${NGX_BUILD_DIR:-$(cd "$(dirname "$SERVER_BIN")/.." && pwd)}"
 HTTP_SO="$NGX_BUILD_DIR/objs/ngx_http_autocert_module.so"
 [ -f "$HTTP_SO" ] || { echo "missing $HTTP_SO"; exit 1; }
 
-PREFIX="${PREFIX:-/tmp/ac-dns01-hook}"
-NET_NAME="ac-dns01h-net-$$"
-PEBBLE_NAME="ac-dns01h-pebble-$$"
-DNS_NAME="ac-dns01h-dns-$$"
-DNS_PORT=15356
-MGMT_PORT=8055
-ORDER_DOMAIN="dns01hook.example.com"
+PREFIX="${PREFIX:-/tmp/ac-wildcard-shared}"
+NET_NAME="ac-wcs-net-$$"
+PEBBLE_NAME="ac-wcs-pebble-$$"
+DNS_NAME="ac-wcs-dns-$$"
+DNS_PORT=15358
+MGMT_PORT=8057
+BASE_DOMAIN="wc.example.com"
+WILDCARD="*.$BASE_DOMAIN"
+WILDCARD_SEG="_wildcard_.$BASE_DOMAIN"
+FOO_PORT=8443
+BAR_PORT=8444
 
 cleanup() {
     "$SERVER_BIN" -p "$PREFIX" -c "$PREFIX/conf/nginx.conf" -s stop 2>/dev/null || true
@@ -43,9 +50,6 @@ mkdir -p "$PREFIX/logs" "$PREFIX/conf" "$PREFIX/store" "$PREFIX/hooks"
 docker network create "$NET_NAME" >/dev/null
 
 echo "== pebble-challtestsrv (DNS :53 + mgmt :${MGMT_PORT}; default A -> 127.0.0.1) =="
-# defaultIPv4 127.0.0.1 makes "pebble" resolve to the host loopback where Pebble
-# is published, so the nginx ACME client can reach https://pebble:14000/dir.
-# http01/https01/tlsalpn01 challenge responders are disabled (dns-01 only).
 docker run -d --name "$DNS_NAME" --network "$NET_NAME" \
     -p ${DNS_PORT}:53/udp -p ${DNS_PORT}:53/tcp \
     -p ${MGMT_PORT}:8055 \
@@ -56,7 +60,6 @@ docker run -d --name "$DNS_NAME" --network "$NET_NAME" \
 DNS_CONTAINER_IP=$(docker inspect -f \
     '{{ (index .NetworkSettings.Networks "'"$NET_NAME"'").IPAddress }}' "$DNS_NAME")
 
-# mgmt API reachable from the host (the hook scripts curl it).
 for i in $(seq 1 30); do
     if curl -sf -X POST "http://127.0.0.1:${MGMT_PORT}/clear-txt" \
             -d '{"host":"_probe.example.com."}' >/dev/null 2>&1; then break; fi
@@ -95,8 +98,6 @@ for i in $(seq 1 30); do
 done
 docker cp "$PEBBLE_NAME:/test/certs/pebble.minica.pem" "$PREFIX/ca.pem"
 
-# Provider hooks. argv = { hook, _acme-challenge.<domain>, <txt> }. challtestsrv
-# wants a fully-qualified host (trailing dot).
 cat > "$PREFIX/hooks/add.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -111,6 +112,10 @@ curl -sf -X POST "http://127.0.0.1:${MGMT_PORT}/clear-txt" \
 EOF
 chmod +x "$PREFIX/hooks/add.sh" "$PREFIX/hooks/remove.sh"
 
+# The whole point: NO wildcard in server_name. The two vhosts carry concrete
+# names; one http-level autocert_wildcard covers both and is the only cert
+# issued. (foo. and bar. are single-label subdomains of the wildcard, so they
+# are suppressed — served from the wildcard, not issued.)
 cat > "$PREFIX/conf/nginx.conf" <<EOF
 load_module $HTTP_SO;
 user root;
@@ -128,24 +133,31 @@ http {
     autocert_dns_hook_remove $PREFIX/hooks/remove.sh;
     autocert_dns_propagation_delay 0;
     autocert_dns_hook_timeout 15;
+    autocert_wildcard ${WILDCARD};
+
     server {
-        listen 8080;
-        server_name ${ORDER_DOMAIN};
+        listen ${FOO_PORT} ssl;
+        server_name foo.${BASE_DOMAIN};
+        autocert on;
+    }
+    server {
+        listen ${BAR_PORT} ssl;
+        server_name bar.${BASE_DOMAIN};
         autocert on;
     }
 }
 EOF
 
-echo "== config test =="
+echo "== config accepts concrete vhosts + http-level autocert_wildcard =="
 "$SERVER_BIN" -t -p "$PREFIX" -c "$PREFIX/conf/nginx.conf"
 echo "✓ config accepted"
 
-echo "== start: dns-01 order with exec hooks for ${ORDER_DOMAIN} =="
+echo "== start: shared wildcard dns-01 order for ${WILDCARD} =="
 "$SERVER_BIN" -p "$PREFIX" -c "$PREFIX/conf/nginx.conf"
 
 issued=
 for i in $(seq 1 90); do
-    if grep -q 'autocert: certificate provisioned for' "$PREFIX/logs/error.log"; then
+    if grep -q "autocert: certificate provisioned for" "$PREFIX/logs/error.log"; then
         issued=1; break
     fi
     if grep -Eq 'autocert: (ACME order failed|finalize failed|order poll timed out|authorization did not become valid|dns-01 hook .* failed)' \
@@ -159,42 +171,49 @@ echo "== helper log =="
 grep autocert "$PREFIX/logs/error.log" | tail -30 || true
 
 if [ -z "$issued" ]; then
-    echo "::error::certificate was not provisioned via dns-01 exec hook"
-    echo "== pebble log =="; docker logs "$PEBBLE_NAME" 2>&1 | tail -40 || true
-    echo "== challtestsrv log =="; docker logs "$DNS_NAME" 2>&1 | tail -20 || true
+    echo "::error::shared wildcard certificate was not provisioned"
+    docker logs "$PEBBLE_NAME" 2>&1 | tail -40 || true
     exit 1
 fi
-echo "✓ certificate provisioned via dns-01 (add-hook published, CA validated)"
+echo "✓ wildcard certificate provisioned"
 
-# The add-hook must have actually fired (fork+execve path).
-grep -q 'autocert: dns-01 exec add hook' "$PREFIX/logs/error.log" \
-    || { echo "::error::add-hook never executed"; exit 1; }
-echo "✓ dns-01 add-hook executed"
-
-KEY="$PREFIX/store/${ORDER_DOMAIN}/privkey.pem"
-CHAIN="$PREFIX/store/${ORDER_DOMAIN}/fullchain.pem"
+# Stored under the fs-safe "_wildcard_." segment.
+CHAIN="$PREFIX/store/${WILDCARD_SEG}/fullchain.pem"
+KEY="$PREFIX/store/${WILDCARD_SEG}/privkey.pem"
+[ -f "$CHAIN" ] || { echo "::error::missing $CHAIN (wildcard not stored)"; exit 1; }
 [ -f "$KEY" ]   || { echo "::error::missing $KEY"; exit 1; }
-[ -f "$CHAIN" ] || { echo "::error::missing $CHAIN"; exit 1; }
+echo "✓ stored under ${WILDCARD_SEG}/"
+
+# SUPPRESSION: the concrete subdomains must NOT have their own cert dirs — they
+# are covered by the wildcard and served from it, never issued separately.
+for sub in foo bar; do
+    [ ! -e "$PREFIX/store/${sub}.${BASE_DOMAIN}" ] \
+        || { echo "::error::${sub}.${BASE_DOMAIN} got its own cert dir — suppression failed (it should be served from the wildcard)"; exit 1; }
+done
+echo "✓ suppression: no per-subdomain cert issued (foo./bar. served from the wildcard)"
+
+# Exactly one name was issued (the wildcard). "provisioned for" lines == 1.
+PROV=$(grep -c "autocert: certificate provisioned for" "$PREFIX/logs/error.log" || true)
+[ "$PROV" = "1" ] || { echo "::error::expected exactly 1 provisioned cert, got $PROV"; exit 1; }
+echo "✓ exactly one certificate issued for the whole subdomain set"
 
 openssl x509 -in "$CHAIN" -noout -ext subjectAltName 2>/dev/null \
-    | grep -q "DNS:${ORDER_DOMAIN}" \
-    || { echo "::error::issued cert SAN does not list ${ORDER_DOMAIN}"; exit 1; }
-echo "✓ issued fullchain.pem certifies ${ORDER_DOMAIN}"
+    | grep -qF "DNS:${WILDCARD}" \
+    || { echo "::error::issued cert SAN does not list ${WILDCARD}"; exit 1; }
+echo "✓ issued fullchain.pem certifies ${WILDCARD}"
 
-CERT_PUB=$(openssl x509 -in "$CHAIN" -noout -pubkey 2>/dev/null | openssl md5)
-KEY_PUB=$(openssl pkey -in "$KEY" -pubout 2>/dev/null | openssl md5)
-[ "$CERT_PUB" = "$KEY_PUB" ] || { echo "::error::cert pubkey != stored privkey"; exit 1; }
-echo "✓ issued certificate public key matches the stored private key"
+# Serve path: each subdomain's OWN listener presents the shared wildcard cert.
+serve_check() {
+    local sni="$1" port="$2"
+    local san
+    san=$(echo | openssl s_client -connect "127.0.0.1:${port}" \
+            -servername "$sni" 2>/dev/null \
+            | openssl x509 -noout -ext subjectAltName 2>/dev/null || true)
+    echo "$san" | grep -qF "DNS:${WILDCARD}" \
+        || { echo "::error::SNI $sni (:$port) was not served the wildcard cert (got: $san)"; exit 1; }
+    echo "✓ SNI $sni (:$port) served the shared wildcard cert"
+}
+serve_check "foo.${BASE_DOMAIN}" "$FOO_PORT"
+serve_check "bar.${BASE_DOMAIN}" "$BAR_PORT"
 
-# The remove-hook must run on order finish (unpublish), cleaning up the TXT.
-removed=
-for i in $(seq 1 20); do
-    if grep -q 'autocert: dns-01 exec remove hook' "$PREFIX/logs/error.log"; then
-        removed=1; break
-    fi
-    sleep 0.5
-done
-[ -n "$removed" ] || { echo "::error::remove-hook never executed on order finish"; exit 1; }
-echo "✓ dns-01 remove-hook executed (TXT cleaned up)"
-
-echo "✓✓ full dns-01 exec-hook issuance verified end-to-end"
+echo "✓✓ autocert_wildcard: one shared wildcard cert, concrete names suppressed, served per-SNI"

@@ -53,13 +53,14 @@ http {
     resolver 127.0.0.1 [::1] valid=300s;        # core nginx; autocert falls back to this if autocert_resolver is unset
 
     # ---- instance-wide defaults (folded into every server) ----
-    autocert            on  admin@example.com;  # http,server | default: off          (2nd arg = ACME account email, optional)
+    autocert            on;                      # http,server | default: off
+    autocert_contact    admin@example.com;       # http,server | ACME account email (optional)
     autocert_ca         https://acme-v02.api.letsencrypt.org/directory;
                                                  # http,server | default: LE production (mutually exclusive with autocert_staging)
     autocert_staging    off;                     # http,server | default: off          (on = LE staging directory)
-    autocert_path       /var/lib/autocert;       # http only   | default: autocert     (relative → resolved against nginx prefix)
-    autocert_store      secure;                   # http only   | default: secure       (secure | certbot)
-    autocert_key_type   secp384r1;                # http only   | default: secp384r1    (secp384r1 | secp256r1)
+    autocert_store_path       /var/lib/autocert;       # http only   | default: autocert     (relative → resolved against nginx prefix)
+    autocert_store_layout      default;                 # http only   | default: default       (default | certbot)
+    autocert_key_type   p384;                     # http only   | default: p384          (p384 | p256; OpenSSL secp384r1/secp256r1 also accepted)
     autocert_challenge  http-01;                  # http only   | default: http-01      (http-01 | tls-alpn-01 | dns-01)
     autocert_renew_before 7d;                     # http only   | default: 7d           (renew this long before notAfter)
 
@@ -81,12 +82,29 @@ http {
 
     # =====================================================================
     # 2) DNS-01 wildcard vhost. Requires dns-01 + both hooks (below).
-    #    Wildcards are ONLY issuable under dns-01.
-    # =====================================================================
+    #    Wildcards are ONLY issuable under dns-01. Two ways to ask for one:
+    #
+    #    (a) put the wildcard directly in server_name (this vhost then also
+    #        ROUTES every subdomain — fine for a single catch-all vhost):
     server {
         listen 443 ssl;
         server_name example.org *.example.org;
         autocert on;                              # http,server | default: off
+    }
+    #    (b) keep concrete per-subdomain vhosts and SHARE one wildcard cert via
+    #        autocert_wildcard — no wildcard in server_name, no catch-all, and
+    #        the covered concrete names are NOT issued separately:
+    server {
+        listen 443 ssl;
+        server_name a.example.net;
+        autocert on;
+        autocert_wildcard *.example.net;          # http,server | served from the wildcard
+    }
+    server {
+        listen 443 ssl;
+        server_name b.example.net;
+        autocert on;
+        autocert_wildcard *.example.net;          # same cert; declared once in http{} also works
     }
 
     # =====================================================================
@@ -98,12 +116,13 @@ http {
         listen 80;
         listen 443 ssl;
         server_name shop.example.com;
-        autocert on billing@example.com;          # http,server | default: off
+        autocert on;                              # http,server | default: off
+        autocert_contact billing@example.com;     # this CA's account email
         autocert_ca https://acme.zerossl.com/v2/DV90;
                                                   # http,server | default: LE production
         autocert_eab_kid       AbCdEf0123456789;  # http,server | default: (none)  (both EAB lines or neither)
         autocert_eab_hmac_key  bX9...base64url...; # http,server | default: (none)
-        # autocert_ca_certificate /etc/ssl/internal-ca.pem;  # http,server | default: (none)  — only for a private CA
+        # autocert_ca_trusted_certificate /etc/ssl/internal-ca.pem;  # http,server | default: (none)  — only for a private CA
     }
 
     # =====================================================================
@@ -131,15 +150,17 @@ set an instance-wide default in `http{}` that each `server{}` may override.
 
 | Directive | Context | Default | Description |
 |---|---|---|---|
-| `autocert on\|off [<email>]` | http, server | `off` | Master switch. Optional 2nd arg = ACME account contact email (one `@`, non-empty both sides). A `server{}`-level `autocert on` is what seeds the empty cert arrays so a cert-less vhost still builds an SSL_CTX. |
+| `autocert on\|off` | http, server | `off` | Master switch. A `server{}`-level `autocert on` is what seeds the empty cert arrays so a cert-less vhost still builds an SSL_CTX. |
+| `autocert_contact <email>` | http, server | (none) | ACME account contact email (one `@`, non-empty both sides). Picked per CA group — the first non-empty contact from a vhost in that group. (Was the optional 2nd arg of `autocert on`.) |
+| `autocert_wildcard *.rest [*.rest …]` | http, server | (none) | Declare wildcard SAN(s) for this scope **without** putting `*.` in `server_name` (which would also make the vhost a subdomain catch-all). In `http{}` it applies to every enabled vhost; a `server{}` occurrence adds to that vhost. **dns-01 only.** A concrete `server_name` the wildcard covers (one leading label, e.g. `a.example.com` under `*.example.com`) is served from the wildcard cert, not issued separately. Repeatable; sole-leading-label form only. |
 | `autocert_ca <url>` | http, server | LE production `https://acme-v02.api.letsencrypt.org/directory` | ACME directory URL to issue against. Distinct effective URLs become distinct CA groups. Mutually exclusive with `autocert_staging`. |
 | `autocert_staging on\|off` | http, server | `off` | Shorthand for the LE staging directory (`https://acme-staging-v02.api.letsencrypt.org/directory`). For CI; no production rate limits. Mutually exclusive with `autocert_ca`. |
-| `autocert_ca_certificate <file>` | http, server | (none) | PEM trust bundle verifying a private CA's TLS endpoint. CA-bound: a server that overrides the CA does **not** inherit it. Made absolute against the nginx prefix. |
+| `autocert_ca_trusted_certificate <file>` | http, server | (none) | PEM trust bundle verifying a private CA's TLS endpoint. CA-bound: a server that overrides the CA does **not** inherit it. Made absolute against the nginx prefix. |
 | `autocert_eab_kid <key-id>` | http, server | (none) | EAB key identifier ([RFC 8555 §7.3.4](https://datatracker.ietf.org/doc/html/rfc8555#section-7.3.4)) for CAs requiring External Account Binding. Both-or-neither with `autocert_eab_hmac_key`. CA-bound. |
 | `autocert_eab_hmac_key <b64url>` | http, server | (none) | EAB HMAC key (base64url). Paired with `autocert_eab_kid`. CA-bound. |
-| `autocert_path <path>` | http | `autocert` (→ `<prefix>/autocert`) | Root of the cert / account-key store. Relative paths resolve against the nginx prefix, not the CWD. |
-| `autocert_store secure\|certbot` | http | `secure` | On-disk layout: the module's own hardened layout, or a certbot-compatible `live/` layout. |
-| `autocert_key_type secp384r1\|secp256r1` | http | `secp384r1` | ECDSA curve for issued certs (and the account key). |
+| `autocert_store_path <path>` | http | `autocert` (→ `<prefix>/autocert`) | Root of the cert / account-key store. Relative paths resolve against the nginx prefix, not the CWD. |
+| `autocert_store_layout default\|certbot` | http | `default` | On-disk layout: the module's own hardened layout, or a certbot-compatible `live/` layout. (`secure` accepted as an alias for `default`.) |
+| `autocert_key_type p384\|p256` | http | `p384` | ECDSA curve for issued certs (and the account key). The OpenSSL names `secp384r1`/`secp256r1` (and `ecdsa-p384`/`ecdsa-p256`) are also accepted. |
 | `autocert_challenge http-01\|tls-alpn-01\|dns-01` | http | `http-01` | ACME challenge type. `dns-01` is required for wildcards and requires both DNS hooks. |
 | `autocert_renew_before <time>` | http | `7d` | Renew this long before a cert's `notAfter`. |
 | `autocert_resolver <addr> [addr…]` | http | falls back to core `resolver` | DNS resolver(s) used to reach the CA host. Same `address[:port] valid= ipv6=` syntax as core `resolver`. |
@@ -154,6 +175,8 @@ set an instance-wide default in `http{}` that each `server{}` may override.
 - `autocert_ca` + `autocert_staging` on the same CA → emerg (mutually exclusive).
 - `dns-01` selected but a hook missing → emerg (`requires both …`).
 - `autocert_eab_kid` / `autocert_eab_hmac_key` — one set without the other → emerg.
+- `autocert_wildcard` with a non `*.`-form argument → emerg (sole-leading-label only).
+- `autocert_wildcard` under a non-dns-01 challenge → emerg (a wildcard is unissuable over http-01/tls-alpn-01).
 - Two vhosts naming the **same CA URL** with different trust bundle / EAB / account
   email → emerg (one CA URL = one trust bundle, one EAB, one account).
 - One `server_name` claimed by two vhosts pinned to different CAs → emerg
@@ -233,7 +256,7 @@ The matching remove-hook is identical with `update delete $1 IN TXT "$2"`.
 
 ## Store layout
 
-The store root is `autocert_path` (default `autocert`, resolved against the nginx
+The store root is `autocert_store_path` (default `autocert`, resolved against the nginx
 prefix). On disk a domain maps to a segment: literal names use themselves; a
 wildcard `*.rest` is stored under `_wildcard_.rest`. Certificates are committed
 atomically via `renameat2` on Linux ≥ 3.15; on a filesystem lacking
@@ -243,7 +266,7 @@ pair is never served. For a wildcard the cache entry, store dir, and the
 ≤1 stat/sec throttle are keyed by the shared `_wildcard_.<rest>` segment — one
 entry for all subdomains, not per concrete SNI.
 
-**`secure` (default)** — files live directly under `<path>`:
+**`default`** — files live directly under `<path>` (the module's own hardened layout):
 
 | Path | Mode |
 |---|---|
@@ -279,7 +302,7 @@ isolated accounts. The account key is rejected on load unless it is a regular fi
 owned by the worker's euid, with no group/other permission bits.
 
 **Permissions — the store must be writable by the worker user.** Worker 0 creates
-and writes everything under `autocert_path`, so that tree must be owned by the
+and writes everything under `autocert_store_path`, so that tree must be owned by the
 nginx worker user:
 
 ```sh
@@ -288,7 +311,7 @@ chmod 0700 /var/lib/autocert
 ```
 
 If a previous run created the store as root, fix it once with
-`chown -R <worker-user> <autocert_path>`. Worker 0 also holds a singleton lock at
+`chown -R <worker-user> <autocert_store_path>`. Worker 0 also holds a singleton lock at
 `<path>/.driver.lock` (`0600`).
 
 ---

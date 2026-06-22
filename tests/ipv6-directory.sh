@@ -98,10 +98,11 @@ user root;   # worker-0 ACME driver writes the root-created store under sudo
 error_log $PREFIX/logs/error.log notice;
 events {}
 http {
-    autocert on admin@example.com;
+    autocert on;
+    autocert_contact admin@example.com;
     autocert_ca https://[::1]:${CA_PORT}/dir;
-    autocert_ca_certificate $PREFIX/ca.pem;
-    autocert_path $PREFIX/store;
+    autocert_ca_trusted_certificate $PREFIX/ca.pem;
+    autocert_store_path $PREFIX/store;
     server { listen 18089; server_name ipv6.example.com; }
 }
 EOF

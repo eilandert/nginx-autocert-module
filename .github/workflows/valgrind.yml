@@ -126,12 +126,13 @@ jobs:
           error_log $PREFIX/logs/error.log notice;
           events {}
           http {
-              autocert on admin@example.com;
+              autocert on;
+              autocert_contact admin@example.com;
               autocert_ca https://acme-staging-v02.api.letsencrypt.org/directory;
               autocert_renew_before 10d;
               autocert_key_type secp256r1;
-              autocert_store secure;
-              autocert_path $PREFIX/store;
+              autocert_store_layout secure;
+              autocert_store_path $PREFIX/store;
               autocert_challenge tls-alpn-01;
               server {
                   listen 8443 ssl;

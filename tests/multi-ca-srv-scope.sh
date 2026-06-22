@@ -46,9 +46,10 @@ load_module $HTTP_SO;
 error_log $PREFIX/logs/error.log notice;
 events {}
 http {
-    autocert on admin@example.com;
+    autocert on;
+    autocert_contact admin@example.com;
     autocert_ca https://127.0.0.1:1/ca-a;
-    autocert_path $PREFIX/store;
+    autocert_store_path $PREFIX/store;
 
     # vhost A: inherits the http{} default CA (CA-A).
     server {
@@ -104,7 +105,7 @@ load_module $HTTP_SO;
 error_log $PREFIX/logs/bad.log notice;
 events {}
 http {
-    autocert_path $PREFIX/store;
+    autocert_store_path $PREFIX/store;
     server {
         listen 8083;
         server_name d.example.com;
@@ -132,9 +133,10 @@ load_module $HTTP_SO;
 error_log $PREFIX/logs/stg.log notice;
 events {}
 http {
-    autocert on admin@example.com;
+    autocert on;
+    autocert_contact admin@example.com;
     autocert_ca https://127.0.0.1:1/ca-a;
-    autocert_path $PREFIX/store;
+    autocert_store_path $PREFIX/store;
     server {
         listen 8084;
         server_name p.example.com;
@@ -172,8 +174,9 @@ load_module $HTTP_SO;
 error_log $PREFIX/logs/dup.log notice;
 events {}
 http {
-    autocert on admin@example.com;
-    autocert_path $PREFIX/store;
+    autocert on;
+    autocert_contact admin@example.com;
+    autocert_store_path $PREFIX/store;
     server {
         listen 8086;
         server_name dup.example.com;
@@ -204,9 +207,10 @@ load_module $HTTP_SO;
 error_log $PREFIX/logs/same.log notice;
 events {}
 http {
-    autocert on admin@example.com;
+    autocert on;
+    autocert_contact admin@example.com;
     autocert_ca https://127.0.0.1:1/ca-a;
-    autocert_path $PREFIX/store;
+    autocert_store_path $PREFIX/store;
     server { listen 8088; server_name sds.example.com; autocert on; }
     server { listen 8089; server_name sds.example.com; autocert on; }
 }

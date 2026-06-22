@@ -623,6 +623,29 @@ jobs:
           dir: ${{ matrix.dir }}
           script: wildcard-issue.sh
 
+  wildcard-shared:
+    name: autocert_wildcard shared cert + suppression (D5, #16) [${{ matrix.flavor }}]
+    needs: [resolve, build-nginx, build-angie]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: nginx
+            dir: ${{ needs.resolve.outputs.nginx_dir }}
+          - flavor: angie
+            dir: ${{ needs.resolve.outputs.angie_dir }}
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Concrete vhosts share one autocert_wildcard cert; covered names suppressed
+        uses: ./.github/actions/run-e2e
+        with:
+          flavor: ${{ matrix.flavor }}
+          dir: ${{ matrix.dir }}
+          script: wildcard-shared.sh
+
   multi-ca-grouping:
     name: multi-CA name grouping (M2, #15) [${{ matrix.flavor }}]
     needs: [resolve, build-nginx, build-angie]
@@ -946,7 +969,7 @@ jobs:
     steps:
       - name: Checkout module
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-      - name: autocert_store certbot issues into live/<domain>/{privkey,cert,chain,fullchain}.pem
+      - name: autocert_store_layout certbot issues into live/<domain>/{privkey,cert,chain,fullchain}.pem
         uses: ./.github/actions/run-e2e
         with:
           flavor: ${{ matrix.flavor }}

@@ -69,7 +69,7 @@ daemon on;
 pid $PREFIX/logs/nginx.pid;
 events {}
 http {
-    autocert_path $PREFIX/store;
+    autocert_store_path $PREFIX/store;
     server {
         listen $PORT ssl;
         server_name $1;

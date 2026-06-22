@@ -196,13 +196,14 @@ user root;
 error_log $PREFIX/logs/error.log notice;
 events {}
 http {
-    autocert on admin@example.com;
+    autocert on;
+    autocert_contact admin@example.com;
     autocert_ca https://${CA_HOST}:${CA_PORT}/dir;
     autocert_resolver 127.0.0.1:${DNS_PORT};
     autocert_resolver_timeout 5s;
-    autocert_ca_certificate $PREFIX/ca.pem;
-    autocert_path $store_path;
-    autocert_store $1;
+    autocert_ca_trusted_certificate $PREFIX/ca.pem;
+    autocert_store_path $store_path;
+    autocert_store_layout $1;
     server { listen 80; server_name ${NAME}; }
 }
 EOF

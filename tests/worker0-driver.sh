@@ -4,7 +4,7 @@
 # helper-lifecycle.sh + helper-usr2.sh, which tested the removed helper process).
 #
 # The ACME engine runs on worker 0 behind an flock singleton lock
-# (<autocert_path>/.driver.lock). This asserts:
+# (<autocert_store_path>/.driver.lock). This asserts:
 #   START   exactly one worker arms the driver ("ACME driver armed on worker 0").
 #   RELOAD  the lock hands off: the retiring worker 0 releases, a fresh worker 0
 #           re-arms — so the armed-pid changes and is alive, and at most one
@@ -41,8 +41,9 @@ pid $P/logs/nginx.pid;
 error_log $P/logs/error.log notice;
 events {}
 http {
-    autocert on a@b.com;
-    autocert_path $STORE;
+    autocert on;
+    autocert_contact a@b.com;
+    autocert_store_path $STORE;
     server { listen $PORT; server_name x.example.com; autocert on; }
 }
 EOF

@@ -42,9 +42,10 @@ error_log $PREFIX/logs/error.log notice;
 user root;
 events {}
 http {
-    autocert on admin@example.com;
+    autocert on;
+    autocert_contact admin@example.com;
     autocert_ca https://127.0.0.1:1/dir;     # unreachable: migration is pre-CA
-    autocert_path $PREFIX/store;
+    autocert_store_path $PREFIX/store;
     server {
         listen 8080;
         server_name a.example.com;
