@@ -217,7 +217,7 @@ jobs:
           ANGIE_URL: ${{ needs.resolve.outputs.angie_url }}
         run: |
           set -euo pipefail
-          WORKSPACE="$GITHUB_WORKSPACE" bash tests/abi-build-and-check.sh
+          WORKSPACE="$GITHUB_WORKSPACE" bash tests/e2e/abi-build-and-check.sh
 
   # Prove a PRODUCTION build (no AUTOCERT_TEST) omits the test-only seed
   # directives entirely, so a stray/templated autocert_test_challenge cannot
@@ -1339,4 +1339,4 @@ jobs:
           NGX="$GITHUB_WORKSPACE/${{ matrix.dir }}"
           BIN="$NGX/objs/${{ matrix.flavor }}"; [ -x "$BIN" ] || BIN="$NGX/objs/nginx"
           SERVER_BIN="$BIN" NGX_BUILD_DIR="$NGX" \
-            bash "$GITHUB_WORKSPACE/tests/slowloris-read.sh"
+            bash "$GITHUB_WORKSPACE/tests/e2e/slowloris-read.sh"
