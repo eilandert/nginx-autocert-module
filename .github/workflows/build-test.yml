@@ -1093,6 +1093,30 @@ jobs:
           script: mock-finalize-ready.sh
           sudo: "true"
 
+  mock-download-400-retry:
+    name: download 400 -> re-poll order -> retry download (mock CA) [${{ matrix.flavor }}]
+    needs: [resolve, build-nginx, build-angie]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: nginx
+            dir: ${{ needs.resolve.outputs.nginx_dir }}
+          - flavor: angie
+            dir: ${{ needs.resolve.outputs.angie_dir }}
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: A 400 on the certificate download must re-poll + retry, not abort
+        uses: ./.github/actions/run-e2e
+        with:
+          flavor: ${{ matrix.flavor }}
+          dir: ${{ matrix.dir }}
+          script: mock-download-400-retry.sh
+          sudo: "true"
+
   store-certbot:
     name: certbot store layout (live/<domain>/4 files) [${{ matrix.flavor }}]
     needs: [resolve, build-nginx, build-angie]
