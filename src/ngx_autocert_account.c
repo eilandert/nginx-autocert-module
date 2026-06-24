@@ -317,6 +317,24 @@ ngx_autocert_account_load_key(ngx_autocert_account_t *acct)
         return NGX_ERROR;
     }
 
+    /*
+     * L1: the account key (the JWS signer) is always generated P-384; that is
+     * the invariant the rest of the module assumes. key_from_pem already rejects
+     * anything but a P-256/P-384 EC key, so a non-NULL curve name that is not
+     * "P-384" can only be a legacy P-256 account.key — grandfather it (it still
+     * signs valid ES256 JWS) but warn so the operator can rotate to P-384.
+     */
+    {
+        const char  *curve = ngx_http_autocert_key_curve_name(acct->key);
+
+        if (curve != NULL && ngx_strcmp(curve, "P-384") != 0) {
+            ngx_log_error(NGX_LOG_WARN, acct->log, 0,
+                          "autocert: account key \"%V\" is %s, not the expected "
+                          "P-384; grandfathered — rotate it to P-384",
+                          &acct->key_path, curve);
+        }
+    }
+
     ngx_log_error(NGX_LOG_NOTICE, acct->log, 0,
                   "autocert: loaded account key from \"%V\"", &acct->key_path);
     return NGX_OK;

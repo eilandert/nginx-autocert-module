@@ -1407,9 +1407,18 @@ ngx_http_autocert_serve_alpn_cert(ngx_connection_t *c, SSL *ssl_conn,
 
     /*
      * Bind the challenge cert/key (self-signed: no chain). A partial bind would
-     * present a mismatched pair, so any failure fails the handshake. Clear any
-     * inherited chain so a stale intermediate never ships with the leaf.
+     * present a mismatched pair, so any failure fails the handshake.
+     *
+     * SSL_certs_clear() drops every cert already installed on this SSL (the
+     * inherited per-vhost leaves — one EC and, since dual-cert, one RSA slot).
+     * Without it SSL_use_certificate only replaces the slot matching the
+     * challenge key's type, leaving the other-type vhost leaf negotiable: a
+     * client/CA offering that sigalg would get the real leaf (no acmeIdentifier)
+     * instead of the challenge cert and tls-alpn-01 would fail. set1_chain(NULL)
+     * then strips any inherited chain so a stale intermediate never ships.
      */
+    SSL_certs_clear(ssl_conn);
+
     if (SSL_use_certificate(ssl_conn, cert) != 1
         || SSL_use_PrivateKey(ssl_conn, key) != 1
         || SSL_set1_chain(ssl_conn, NULL) != 1)

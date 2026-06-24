@@ -184,9 +184,25 @@ X509 *ngx_http_autocert_acme_tls_cert(EVP_PKEY *pkey, ngx_str_t *domain,
  * NGX_ERROR on any other open/parse failure. Used by the renewal scheduler
  * (M8) to decide whether a stored cert is inside its renew window. No nginx
  * pool dependency.
+ *
+ * key_id (nullable): out-param set to the leaf public key's EVP_PKEY family
+ * (EVP_PKEY_EC / EVP_PKEY_RSA), or EVP_PKEY_NONE if unreadable.
+ *
+ * verify_name (nullable): when non-NULL and non-empty, the stored leaf must
+ * cover this host (X509_check_host) or the call returns NGX_ABORT — used by the
+ * scheduler to treat a wrong-domain stored cert as due (M2). Pass a concrete
+ * sub-label for a wildcard name so default wildcard matching applies.
  */
 ngx_int_t ngx_http_autocert_cert_not_after(const char *path, time_t *out,
-    int *key_id);
+    int *key_id, const ngx_str_t *verify_name);
+
+
+/*
+ * EC curve display name of a key ("P-256" / "P-384"), or NULL for a non-EC or
+ * unsupported-curve key. The account loader uses it to enforce the P-384
+ * account-key invariant (a legacy P-256 key is grandfathered with a warning).
+ */
+const char *ngx_http_autocert_key_curve_name(EVP_PKEY *pkey);
 
 
 #endif /* _NGX_HTTP_AUTOCERT_CRYPTO_H_INCLUDED_ */
