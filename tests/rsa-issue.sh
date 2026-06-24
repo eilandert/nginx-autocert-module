@@ -178,8 +178,12 @@ if [ -z "$issued" ]; then
 fi
 echo "✓ certificate provisioned (finalize -> poll -> download -> store)"
 
-KEY="$PREFIX/store/${ORDER_DOMAIN}/privkey.pem"
-CHAIN="$PREFIX/store/${ORDER_DOMAIN}/fullchain.pem"
+# RSA leaves use the .rsa. suffixed store names (EC keeps the legacy flat
+# names) so an RSA and an EC variant can coexist per name in dual-cert mode.
+# A sole-RSA config still writes the suffixed names — the suffix is keyed on
+# the key type, not on whether a second keytype is present.
+KEY="$PREFIX/store/${ORDER_DOMAIN}/privkey.rsa.pem"
+CHAIN="$PREFIX/store/${ORDER_DOMAIN}/fullchain.rsa.pem"
 [ -f "$KEY" ]   || { echo "::error::missing $KEY"; exit 1; }
 [ -f "$CHAIN" ] || { echo "::error::missing $CHAIN"; exit 1; }
 
