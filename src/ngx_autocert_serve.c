@@ -89,6 +89,11 @@ typedef struct {
     ngx_uint_t          store;       /* ngx_http_autocert_store_e */
     ngx_array_t        *names;       /* ngx_str_t: the issuable name set */
     ngx_shm_zone_t     *alpn_zone;   /* M10b tls-alpn-01 cert store; NULL=off */
+    ngx_uint_t          slot_mask;   /* bit s set => slot s (EC/RSA) is config-
+                                      * enabled; only enabled slots are reloaded
+                                      * + installed, so a stale opposite-keytype
+                                      * file left after a dual->single rollback is
+                                      * never served. */
 } ngx_autocert_serve_ctx_t;
 
 
@@ -218,6 +223,36 @@ ngx_http_autocert_serve_init(ngx_conf_t *cf,
     sctx->store = amcf->store;
     sctx->names = amcf->names;       /* bounds the per-worker cache */
     sctx->alpn_zone = amcf->alpn_zone;  /* M10b: NULL unless tls-alpn-01 wired */
+
+    /*
+     * Build the enabled-slot mask from the configured key_type list so serving
+     * only ever installs a keytype the operator actually asked for. After a
+     * dual-cert -> single rollback the dropped keytype's files may linger in the
+     * store; without this mask OpenSSL could still pick that stale leaf.
+     */
+    sctx->slot_mask = 0;
+    {
+        ngx_uint_t   i, kt, *ktp;
+        ngx_array_t *kts = amcf->key_types;
+
+        if (kts != NULL && kts->nelts > 0) {
+            ktp = kts->elts;
+            for (i = 0; i < kts->nelts; i++) {
+                kt = ktp[i];
+                if (kt == NGX_HTTP_AUTOCERT_KEY_RSA2048
+                    || kt == NGX_HTTP_AUTOCERT_KEY_RSA3072
+                    || kt == NGX_HTTP_AUTOCERT_KEY_RSA4096)
+                {
+                    sctx->slot_mask |= (1u << NGX_AUTOCERT_SLOT_RSA);
+                } else {
+                    sctx->slot_mask |= (1u << NGX_AUTOCERT_SLOT_EC);
+                }
+            }
+        } else {
+            /* No explicit list: the default keytype is EC (p384). */
+            sctx->slot_mask = (1u << NGX_AUTOCERT_SLOT_EC);
+        }
+    }
 
     ngx_log_debug3(NGX_LOG_DEBUG_HTTP, cf->log, 0,
                    "autocert: serve init path \"%V\" names:%ui alpn:%ui",
@@ -770,6 +805,27 @@ ngx_http_autocert_cert_cb(SSL *ssl_conn, void *arg)
         if (now != cert->checked) {
             cert->checked = now;
             for (s = 0; s < NGX_AUTOCERT_NSLOTS; s++) {
+                if (!(sctx->slot_mask & (1u << s))) {
+                    /* Slot not config-enabled (e.g. dropped in a dual->single
+                     * rollback): never load it, and drop anything we cached for
+                     * it earlier so it can't keep being served. */
+                    ngx_autocert_slot_t  *sl = &cert->slots[s];
+
+                    if (sl->cert != NULL) {
+                        X509_free(sl->cert);
+                        sl->cert = NULL;
+                    }
+                    if (sl->chain != NULL) {
+                        sk_X509_pop_free(sl->chain, X509_free);
+                        sl->chain = NULL;
+                    }
+                    if (sl->key != NULL) {
+                        EVP_PKEY_free(sl->key);
+                        sl->key = NULL;
+                    }
+                    sl->mtime = -1;
+                    continue;
+                }
                 (void) ngx_http_autocert_cache_reload(cert, s, &store, &host,
                                                       sctx, c->log);
             }
@@ -1022,6 +1078,27 @@ ngx_http_autocert_cache_reload(ngx_autocert_cert_t *c, ngx_uint_t slot,
         ngx_log_error(NGX_LOG_ERR, log, 0,
                       "autocert: key/cert mismatch for \"%V\"", host);
         goto done;
+    }
+
+    /*
+     * The slot is selected by FILENAME (EC = flat, RSA = .rsa.), but a file's
+     * contents must match the slot's key family or we would install the wrong
+     * algorithm into a slot. A pre-dual-cert single-RSA deployment wrote its RSA
+     * leaf to the flat fullchain.pem (the EC slot's name); reject it here so the
+     * EC slot stays empty (and the scheduler keeps the EC variant due) instead of
+     * serving an RSA leaf as the "EC" cert.
+     */
+    {
+        int           want = (slot == NGX_AUTOCERT_SLOT_RSA)
+                                 ? EVP_PKEY_RSA : EVP_PKEY_EC;
+        EVP_PKEY     *lpk = X509_get0_pubkey(leaf);
+
+        if (lpk == NULL || EVP_PKEY_base_id(lpk) != want) {
+            ngx_log_error(NGX_LOG_ERR, log, 0,
+                          "autocert: stored leaf for \"%V\" is not the expected "
+                          "key family for slot %ui; ignoring", host, slot);
+            goto done;
+        }
     }
 
     /* Verify against the REQUESTED SNI (verify), not the store key (host): for a

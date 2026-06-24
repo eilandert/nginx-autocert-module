@@ -1097,14 +1097,18 @@ ngx_autocert_timegm(const struct tm *tm)
 /*
  * Read the leaf cert's notAfter from the PEM fullchain at `path`. See the
  * header for the contract. ENOENT/ENOTDIR => NGX_DECLINED (no cert yet);
- * other failures => NGX_ERROR.
+ * other failures => NGX_ERROR. When `key_id` is non-NULL it also returns the
+ * leaf's public-key family (EVP_PKEY_EC / EVP_PKEY_RSA / …) so the caller can
+ * detect a stored cert whose algorithm no longer matches the slot it was read
+ * for (e.g. a pre-dual-cert RSA leaf sitting under the flat EC filename).
  */
 ngx_int_t
-ngx_http_autocert_cert_not_after(const char *path, time_t *out)
+ngx_http_autocert_cert_not_after(const char *path, time_t *out, int *key_id)
 {
     int         fd;
     BIO        *bio;
     X509       *leaf;
+    EVP_PKEY   *pk;
     struct tm   tm;
     time_t      t;
     ngx_int_t   rc;
@@ -1141,6 +1145,11 @@ ngx_http_autocert_cert_not_after(const char *path, time_t *out)
         if (t != (time_t) -1) {
             *out = t;
             rc = NGX_OK;
+
+            if (key_id != NULL) {
+                pk = X509_get0_pubkey(leaf);
+                *key_id = (pk != NULL) ? EVP_PKEY_base_id(pk) : EVP_PKEY_NONE;
+            }
         }
     }
 

@@ -101,7 +101,7 @@ static ngx_int_t ngx_autocert_order_write_tmp_at(ngx_autocert_order_t *order,
 static ngx_int_t ngx_autocert_order_fsync_dirfd(ngx_autocert_order_t *order,
     int fd, const char *label);
 static void ngx_autocert_order_rm_staging_at(int cfd, const char *leaf);
-static void ngx_autocert_order_seed_staging_at(ngx_autocert_order_t *order,
+static ngx_int_t ngx_autocert_order_seed_staging_at(ngx_autocert_order_t *order,
     int cfd, const char *dir, int sfd, ngx_uint_t skip_kt);
 static ngx_int_t ngx_autocert_order_swap_dirs_at(ngx_autocert_order_t *order,
     int cfd, const char *staging, const char *dir);
@@ -2164,8 +2164,11 @@ ngx_autocert_order_store(ngx_autocert_order_t *order)
      * BEFORE we write this keytype's pair so our writes overwrite the seeded
      * (stale) copy of our own files; the other keytype's files pass through.
      */
-    ngx_autocert_order_seed_staging_at(order, cfd, (char *) dir, sfd,
-                                       order->key_type);
+    if (ngx_autocert_order_seed_staging_at(order, cfd, (char *) dir, sfd,
+                                           order->key_type) != NGX_OK)
+    {
+        NGX_AUTOCERT_STORE_FAIL();
+    }
 
     ngx_autocert_keytype_pem_names(order->key_type, &priv_name, &chain_name,
                                    &leaf_name, &rest_name);
@@ -2381,13 +2384,22 @@ ngx_autocert_order_rm_staging_at(int cfd, const char *leaf)
  * only the OTHER keytype's files are carried forward (their inodes are never
  * touched by this order, so the hardlink is safe and the swap preserves them).
  *
- * Best-effort: a missing live dir (first ever issuance) or a missing individual
- * file is fine. linkat is done relative to a freshly-pinned live dir fd
- * (O_DIRECTORY|O_NOFOLLOW) and the staging fd, so a swapped <dir> component
- * cannot redirect a link outside the store. A symlinked or non-regular live
- * file is skipped (we only carry forward real cert files).
+ * A missing live dir (first ever issuance) or a missing individual file is fine
+ * — there is simply nothing to carry forward. linkat is done relative to a
+ * freshly-pinned live dir fd (O_DIRECTORY|O_NOFOLLOW) and the staging fd, so a
+ * swapped <dir> component cannot redirect a link outside the store. A symlinked
+ * or non-regular live file is skipped (we only carry forward real cert files).
+ *
+ * NOT best-effort on a PRESENT file. If an existing regular other-keytype file
+ * cannot be linked into staging (cross-device, ENOSPC, permission, …), seeding
+ * MUST fail: the subsequent whole-<seg> RENAME_EXCHANGE would otherwise publish
+ * a live dir missing that file and the cleanup of the old dir would then destroy
+ * the only copy — i.e. the other keytype's live cert is lost. So this is a
+ * commit precondition; the caller aborts the store on NGX_ERROR (the existing
+ * live dir is left untouched). Returns NGX_OK when staging holds a faithful copy
+ * of every present other-keytype file.
  */
-static void
+static ngx_int_t
 ngx_autocert_order_seed_staging_at(ngx_autocert_order_t *order, int cfd,
     const char *dir, int sfd, ngx_uint_t skip_kt)
 {
@@ -2403,7 +2415,7 @@ ngx_autocert_order_seed_staging_at(ngx_autocert_order_t *order, int cfd,
     if (lfd == -1) {
         /* No live dir yet (first issuance), or it is not a real dir — nothing
          * to carry forward. A non-dir live entry is handled by the commit. */
-        return;
+        return NGX_OK;
     }
 
     for (i = 0; (name = ngx_autocert_store_files[i]) != NULL; i++) {
@@ -2415,23 +2427,29 @@ ngx_autocert_order_seed_staging_at(ngx_autocert_order_t *order, int cfd,
         }
 
         /* Only hardlink real, regular files; skip symlinks/dirs/specials so a
-         * planted non-regular entry can't be carried into staging. */
-        if (fstatat(lfd, name, &st, AT_SYMLINK_NOFOLLOW) == -1
-            || !S_ISREG(st.st_mode))
-        {
+         * planted non-regular entry can't be carried into staging. A missing
+         * file (ENOENT) is fine — the other keytype simply has not issued it. */
+        if (fstatat(lfd, name, &st, AT_SYMLINK_NOFOLLOW) == -1) {
+            continue;
+        }
+        if (!S_ISREG(st.st_mode)) {
             continue;
         }
 
         if (linkat(lfd, name, sfd, name, 0) == -1 && ngx_errno != NGX_EEXIST) {
-            /* Cross-device or other failure: log and continue. Worst case the
-             * other keytype's file is absent from staging and will be re-issued
-             * by its own renewal cycle; we never lose the live copy here. */
-            ngx_log_error(NGX_LOG_WARN, order->log, ngx_errno,
-                          "autocert: seed staging linkat(\"%s\") failed", name);
+            /* A PRESENT regular file we could not carry forward. Failing the
+             * seed here keeps the live dir intact (caller aborts before any
+             * swap) rather than publishing a dir that drops this file. */
+            ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
+                          "autocert: seed staging linkat(\"%s\") failed; "
+                          "aborting store to preserve the live cert", name);
+            (void) close(lfd);
+            return NGX_ERROR;
         }
     }
 
     (void) close(lfd);
+    return NGX_OK;
 }
 
 

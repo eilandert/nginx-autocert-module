@@ -185,7 +185,8 @@ X509 *ngx_http_autocert_acme_tls_cert(EVP_PKEY *pkey, ngx_str_t *domain,
  * (M8) to decide whether a stored cert is inside its renew window. No nginx
  * pool dependency.
  */
-ngx_int_t ngx_http_autocert_cert_not_after(const char *path, time_t *out);
+ngx_int_t ngx_http_autocert_cert_not_after(const char *path, time_t *out,
+    int *key_id);
 
 
 #endif /* _NGX_HTTP_AUTOCERT_CRYPTO_H_INCLUDED_ */

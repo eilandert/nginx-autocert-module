@@ -1,6 +1,6 @@
 /*
  * Unit tests for the crypto TU's certificate-expiry helpers (M8 renewal):
- *   - ngx_http_autocert_cert_not_after(path, &out) — read a leaf PEM's notAfter
+ *   - ngx_http_autocert_cert_not_after(path, &out, &key_id) — read a leaf PEM's notAfter
  *     as a Unix epoch; ENOENT/ENOTDIR -> NGX_DECLINED, a symlinked path ->
  *     NGX_ERROR (O_NOFOLLOW), other failures -> NGX_ERROR.
  *   - ngx_autocert_timegm(struct tm*) — a self-contained, timezone-independent
@@ -121,14 +121,25 @@ static void
 test_cert_not_after(void)
 {
     time_t  out = 0;
+    int     key_id = EVP_PKEY_NONE;
 
-    CHECK(ngx_http_autocert_cert_not_after(FIXTURE_PATH, &out) == NGX_OK
+    CHECK(ngx_http_autocert_cert_not_after(FIXTURE_PATH, &out, &key_id) == NGX_OK
           && out == FIXTURE_EPOCH,
           "cert_not_after reads the fixture's exact notAfter epoch");
 
+    /* The fixture leaf is EC (id-ecPublicKey); the key_id out-param reports it. */
+    CHECK(key_id == EVP_PKEY_EC,
+          "cert_not_after reports the leaf key family (EC) via key_id");
+
+    /* key_id is optional: a NULL pointer must be accepted. */
+    out = 0;
+    CHECK(ngx_http_autocert_cert_not_after(FIXTURE_PATH, &out, NULL) == NGX_OK
+          && out == FIXTURE_EPOCH,
+          "cert_not_after accepts a NULL key_id out-param");
+
     /* Missing file -> NGX_DECLINED (no cert stored yet). */
     out = 0;
-    CHECK(ngx_http_autocert_cert_not_after("test/does-not-exist.pem", &out)
+    CHECK(ngx_http_autocert_cert_not_after("test/does-not-exist.pem", &out, NULL)
               == NGX_DECLINED,
           "cert_not_after missing file -> NGX_DECLINED");
 
@@ -145,7 +156,7 @@ test_cert_not_after(void)
                 && symlink(abs_target, link) == 0)
             {
                 out = 0;
-                CHECK(ngx_http_autocert_cert_not_after(link, &out) == NGX_ERROR,
+                CHECK(ngx_http_autocert_cert_not_after(link, &out, NULL) == NGX_ERROR,
                       "cert_not_after refuses to follow a symlink (O_NOFOLLOW)");
                 unlink(link);
             } else {
