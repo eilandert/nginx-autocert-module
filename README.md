@@ -478,4 +478,4 @@ ACME server.)
 
 ## License
 
-No license file is shipped with this module at this time.
+2-clause BSD (the same license as nginx). See [LICENSE](LICENSE).
