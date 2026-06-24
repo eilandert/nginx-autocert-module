@@ -1,7 +1,7 @@
 /*
  * Minimal nginx surface for the autocert ACME HTTP-response / URL parser
  * (ngx_autocert_acme_parse_url / parse_response / dechunk / header / memmem /
- * url_part_safe), sliced from ../src/ngx_autocert_acme.c by extract_http.sh
+ * url_part_safe), sliced from ../../src/ngx_autocert_acme.c by extract_http.sh
  * into generated_http.inc.
  *
  * Those bodies operate on an ngx_autocert_acme_request_t but touch only a
@@ -11,10 +11,10 @@
  * the sliced code compiles unchanged. The bodies are NOT copied — only the
  * struct surface they read is shimmed.
  *
- * Used by BOTH the standalone unit test (test/test_http.c, compiled against
+ * Used by BOTH the standalone unit test (tests/unit/test_http.c, compiled against
  * an nginx tree but the parser surface still routed through this slice) — no,
  * see test_http.c which includes this shim + the .inc directly — and the
- * libFuzzer target fuzz/fuzz_http.c.
+ * libFuzzer target tests/fuzz/fuzz_http.c.
  */
 
 #ifndef NGX_AUTOCERT_HTTP_FUZZ_SHIM_H

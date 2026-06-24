@@ -6,7 +6,7 @@
  * inject a field or corrupt the header.
  *
  * The function is static, so this TU slices JUST it from the shipped
- * src/ngx_autocert_account.c via test/extract_jsonsafe.sh (the whole .c is the
+ * src/ngx_autocert_account.c via tests/unit/extract_jsonsafe.sh (the whole .c is the
  * account state machine and would drag in the acme client + json + crypto TUs
  * to link). Locked to production code, no copy drift.
  *

@@ -128,7 +128,7 @@ jobs:
       - name: Run fuzzers
         run: |
           set -euo pipefail
-          cd fuzz
+          cd tests/fuzz
           # Split the budget across the two targets so a dispatch duration is
           # honoured overall (each gets half, min 30s).
           half=$(( FUZZ_SECS / 2 ))
@@ -151,7 +151,7 @@ jobs:
         if: success() && github.event_name == 'schedule'
         run: |
           set -euo pipefail
-          cd fuzz
+          cd tests/fuzz
           for t in json http; do
             src="corpus"; [ "$t" = http ] && src="corpus_http"
             mkdir -p "${src}-min"

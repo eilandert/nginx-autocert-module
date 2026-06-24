@@ -29,7 +29,7 @@
 #include <string.h>
 
 
-/* Locked P-256 vector (see test/vec_p256_p8.pem; derived via openssl CLI). */
+/* Locked P-256 vector (see tests/unit/vec_p256_p8.pem; derived via openssl CLI). */
 static const char *VEC_P256_PEM =
     "-----BEGIN PRIVATE KEY-----\n"
     "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgCiiqnUnKUr9CM7ky\n"

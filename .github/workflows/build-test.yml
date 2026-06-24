@@ -11,7 +11,7 @@ name: Build & Test
 #   ./.github/actions/setup         apt deps + optional ccache restore.
 #   ./.github/actions/build-module  fetch+build one flavor, run the no-network
 #                                   load/serve tests, upload build-<flavor>.
-#   ./.github/actions/run-e2e       restore build-nginx + run one tests/*.sh
+#   ./.github/actions/run-e2e       restore build-nginx + run one tests/e2e/*.sh
 #                                   Pebble e2e (optionally under sudo).
 
 # Neither nginx nor angie is pinned: the `resolve` job scrapes the current
