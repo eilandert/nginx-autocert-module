@@ -12,3 +12,13 @@ objs/
 
 # agent worktrees / local tooling
 .claude/
+
+# crash dumps (local valgrind / ASAN runs)
+core
+core.*
+vgcore.*
+
+# coverage artifacts
+*.gcda
+*.gcno
+*.gcov
