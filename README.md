@@ -10,11 +10,13 @@
 
 `nginx-autocert-module` is an [ACME](https://datatracker.ietf.org/doc/html/rfc8555)
 client that lives *inside* NGINX. Add `autocert on;` to a vhost and NGINX itself
-obtains, serves, and renews an ECDSA certificate from Let's Encrypt (or any ACME
-CA) for that vhost's `server_name`s — no certbot, no cron job, no deploy hook, no
-reload. The whole flow runs inside the worker, and the new certificate is served
-on the very next TLS handshake. **Your existing `server_name` list *is* the domain
-list.** Works on both NGINX and Angie (coexists with Angie's native `acme`).
+obtains, serves, and renews a certificate from Let's Encrypt (or any ACME CA) for
+that vhost's `server_name`s — no certbot, no cron job, no deploy hook, no reload.
+Certificates are ECDSA by default; RSA and dual EC+RSA (one of each, served by
+client preference) are also supported. The whole flow runs inside the worker, and
+the new certificate is served on the very next TLS handshake. **Your existing
+`server_name` list *is* the domain list.** Works on both NGINX and Angie (coexists
+with Angie's native `acme`).
 
 > 📖 New here? Start with the walkthrough:
 > **[Automatic TLS Certs, No Certbot](https://deb.myguard.nl/2026/06/nginx-autocert-module/)**
@@ -93,6 +95,10 @@ different CA, EAB. **None of it is needed for the common case above.**
   running server. Nothing to install alongside, nothing to schedule.
 - **Three challenge types:** `http-01` (default), `tls-alpn-01`
   ([RFC 8737](https://datatracker.ietf.org/doc/html/rfc8737)), and `dns-01`.
+- **ECDSA, RSA, or both.** `autocert_key_type` selects the leaf key — P-384
+  (default), P-256, RSA-2048/3072/4096, or a dual EC+RSA pair (one of each).
+  With a dual pair both certs are issued and stored, and OpenSSL serves whichever
+  the client's handshake prefers.
 - **Wildcards** via `dns-01` and an operator-supplied DNS hook (the only challenge
   type the ACME spec allows for `*.example.com`).
 - **External Account Binding (EAB)** for commercial CAs (ZeroSSL, Sectigo, Google)
@@ -124,7 +130,7 @@ http {
     autocert_staging    off;                     # http,server | default: off          (on = LE staging directory)
     autocert_store_path       /var/lib/autocert;       # http only   | default: autocert     (relative → resolved against nginx prefix)
     autocert_store_layout      default;                 # http only   | default: default       (default | certbot)
-    autocert_key_type   p384;                     # http only   | default: p384          (p384 | p256; OpenSSL secp384r1/secp256r1 also accepted)
+    autocert_key_type   p384;                     # http only   | default: p384          (p384 | p256 | rsa2048 | rsa3072(=rsa) | rsa4096; list up to one EC + one RSA for a dual cert)
     autocert_challenge  http-01;                  # http only   | default: http-01      (http-01 | tls-alpn-01 | dns-01)
     autocert_renew_before 7d;                     # http only   | default: 7d           (renew this long before notAfter)
 
@@ -224,7 +230,7 @@ set an instance-wide default in `http{}` that each `server{}` may override.
 | `autocert_eab_hmac_key <b64url>` | http, server | (none) | EAB HMAC key (base64url). Paired with `autocert_eab_kid`. CA-bound. |
 | `autocert_store_path <path>` | http | `autocert` (→ `<prefix>/autocert`) | Root of the cert / account-key store. Relative paths resolve against the nginx prefix, not the CWD. |
 | `autocert_store_layout default\|certbot` | http | `default` | On-disk layout: the module's own hardened layout, or a certbot-compatible `live/` layout. (`secure` accepted as an alias for `default`.) |
-| `autocert_key_type p384\|p256` | http | `p384` | ECDSA curve for issued certs (and the account key). The OpenSSL names `secp384r1`/`secp256r1` (and `ecdsa-p384`/`ecdsa-p256`) are also accepted. |
+| `autocert_key_type <type> [type …]` | http | `p384` | Key type(s) for issued leaf certs. Accepts `p384`, `p256`, `rsa2048`, `rsa3072` (alias `rsa`), `rsa4096` — case-insensitive, with the OpenSSL/long aliases (`secp384r1`, `prime256v1`/`secp256r1`, `ecdsa-p384`/`ecdsa-p256`, `rsa-2048`, …) also accepted. List up to **one EC + one RSA** type (max 2 effective; ≥3 args or two of the same family is rejected) to issue and serve a **dual** EC+RSA pair per vhost — OpenSSL then picks the cert each client's handshake supports. The ACME account key stays ECDSA P-384 regardless. |
 | `autocert_challenge http-01\|tls-alpn-01\|dns-01` | http | `http-01` | ACME challenge type. `dns-01` is required for wildcards and requires both DNS hooks. |
 | `autocert_renew_before <time>` | http | `7d` | Renew this long before a cert's `notAfter`. |
 | `autocert_resolver <addr> [addr…]` | http | falls back to core `resolver` | DNS resolver(s) used to reach the CA host. Same `address[:port] valid= ipv6=` syntax as core `resolver`. |
@@ -241,6 +247,7 @@ set an instance-wide default in `http{}` that each `server{}` may override.
 - `autocert_eab_kid` / `autocert_eab_hmac_key` — one set without the other → emerg.
 - `autocert_wildcard` with a non `*.`-form argument → emerg (sole-leading-label only).
 - `autocert_wildcard` under a non-dns-01 challenge → emerg (a wildcard is unissuable over http-01/tls-alpn-01).
+- `autocert_key_type` with more than 4 args, a duplicate type, two ECDSA types, or two RSA types → emerg (at most one EC + one RSA).
 - Two vhosts naming the **same CA URL** with different trust bundle / EAB / account
   email → emerg (one CA URL = one trust bundle, one EAB, one account).
 - One `server_name` claimed by two vhosts pinned to different CAs → emerg
@@ -352,6 +359,13 @@ entry for all subdomains, not per concrete SNI.
 `cert.pem` / `chain.pem` exist for certbot-tool compatibility; the serve path only
 reads `fullchain.pem` + `privkey.pem`.
 
+**RSA and dual certs.** The filenames above hold the **ECDSA** leaf. An RSA leaf is
+stored alongside it with a `.rsa.` infix — `privkey.rsa.pem` / `fullchain.rsa.pem`
+(and `cert.rsa.pem` / `chain.rsa.pem` under `certbot`) — in the same `<domain>/`
+directory. A single `autocert_key_type rsa…;` writes only the `.rsa.` files; a dual
+EC+RSA config writes both sets side by side. The suffix is keyed on the key type,
+not on single-vs-dual.
+
 **Account keys** (per CA, both layouts):
 
 ```
@@ -390,15 +404,18 @@ If a previous run created the store as root, fix it once with
 
 2. **Per-SNI serving.** On each TLS handshake a cert callback resolves the SNI,
    checks it against the set of issuable names, and serves the matching cert from a
-   per-worker cache (reloaded by mtime, throttled to ≤1 stat/sec/name). A name with
-   no issued cert yet gets a self-signed **bootstrap** cert (CN `localhost`) — the
-   honest pre-issuance state; the client sees a name mismatch until the real cert
-   lands. (Under `acme-tls/1` the callback fails closed instead of leaking the
-   bootstrap cert.)
+   per-worker cache (reloaded by mtime, throttled to ≤1 stat/sec/name). With a dual
+   EC+RSA config both leaves are installed and OpenSSL picks the one the client's
+   ciphersuites/sigalgs support. A name with no issued cert yet gets a self-signed
+   **bootstrap** cert (CN `localhost`) — the honest pre-issuance state; the client
+   sees a name mismatch until the real cert lands. (Under `acme-tls/1` the callback
+   fails closed instead of leaking the bootstrap cert.)
 
-3. **Renewal.** A periodic sweep on worker 0 checks each name's stored
-   `fullchain.pem`. A name is due — and gets reissued — when no cert is stored, the
-   cert is unreadable, or `now >= notAfter − autocert_renew_before` (default `7d`).
+3. **Renewal.** A periodic sweep on worker 0 checks each name's stored leaf
+   (`fullchain.pem`, and `fullchain.rsa.pem` for the RSA half of a dual config,
+   each tracked independently). A name is due — and gets reissued — when no cert is
+   stored, the cert is unreadable, or `now >= notAfter − autocert_renew_before`
+   (default `7d`).
    The sweep runs at most every 12 h and at least every 60 s; failures back off
    exponentially (60 s base, capped at 1 h), and a CA `429 Retry-After` is honoured.
 
