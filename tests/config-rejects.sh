@@ -114,4 +114,20 @@ EOF
     || { echo "::error::a valid autocert_dns_hook_timeout was rejected"; exit 1; }
 echo "✓ valid autocert_dns_hook_timeout accepted"
 
+# Phase B dual-cert: autocert_key_type is a 1-4 element list. Two ECDSA types
+# collide on the flat privkey.pem/fullchain.pem name; two RSA types collide on
+# the .rsa. name; a repeated value and >4 are rejected.
+expect_reject "autocert_key_type two ECDSA" \
+    "    autocert_key_type p256 p384;" \
+    "more than one ECDSA"
+expect_reject "autocert_key_type two RSA" \
+    "    autocert_key_type rsa2048 rsa4096;" \
+    "more than one RSA"
+expect_reject "autocert_key_type duplicate value" \
+    "    autocert_key_type rsa3072 rsa3072;" \
+    "duplicate key type"
+expect_reject "autocert_key_type over cap" \
+    "    autocert_key_type p256 p384 rsa2048 rsa3072 rsa4096;" \
+    "at most 4 key types"
+
 echo "✓✓ config-time rejection checks verified"
