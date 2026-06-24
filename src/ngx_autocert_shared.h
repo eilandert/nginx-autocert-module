@@ -37,7 +37,9 @@ typedef struct {
     ngx_uint_t       key_type;       /* ngx_http_autocert_key_type_e; == cert_key_types[0],
                                         kept for not-yet-array-aware consumers */
     ngx_array_t     *cert_key_types; /* dual-cert (Phase B): ngx_uint_t list of leaf
-                                        key types to issue per name (1..4). The ACME
+                                        key types to issue per name. 1 or 2 entries:
+                                        at most one EC and at most one RSA (the parser
+                                        rejects a duplicate family). The ACME
                                         account/challenge keys stay EC regardless. */
     ngx_uint_t       store;          /* ngx_http_autocert_store_e (disk layout) */
     ngx_str_t        path;           /* cert store dir (holds the account key) */

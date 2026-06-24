@@ -1153,19 +1153,43 @@ ngx_autocert_name_due(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
     p = ngx_cpymem(p, chain.data, chain.len);
     *p = '\0';
 
-    rc = ngx_http_autocert_cert_not_after((char *) path, &not_after);
+    {
+        int  stored_id = EVP_PKEY_NONE;
+        int  want_id = (key_type == NGX_HTTP_AUTOCERT_KEY_RSA2048
+                        || key_type == NGX_HTTP_AUTOCERT_KEY_RSA3072
+                        || key_type == NGX_HTTP_AUTOCERT_KEY_RSA4096)
+                           ? EVP_PKEY_RSA : EVP_PKEY_EC;
 
-    if (rc == NGX_DECLINED) {
-        ngx_log_debug1(NGX_LOG_DEBUG_CORE, cycle->log, 0,
-                       "autocert: name \"%V\" due because no cert is stored",
-                       name);
-        return 1;                       /* no cert yet -> issue */
-    }
-    if (rc != NGX_OK) {
-        ngx_log_error(NGX_LOG_WARN, cycle->log, 0,
-                      "autocert: cannot read notAfter of \"%s\"; reissuing",
-                      path);
-        return 1;                       /* corrupt/unreadable -> reissue */
+        rc = ngx_http_autocert_cert_not_after((char *) path, &not_after,
+                                              &stored_id);
+
+        if (rc == NGX_DECLINED) {
+            ngx_log_debug1(NGX_LOG_DEBUG_CORE, cycle->log, 0,
+                           "autocert: name \"%V\" due because no cert is stored",
+                           name);
+            return 1;                   /* no cert yet -> issue */
+        }
+        if (rc != NGX_OK) {
+            ngx_log_error(NGX_LOG_WARN, cycle->log, 0,
+                          "autocert: cannot read notAfter of \"%s\"; reissuing",
+                          path);
+            return 1;                   /* corrupt/unreadable -> reissue */
+        }
+
+        /*
+         * The fullchain filename selects the slot (EC = flat, RSA = .rsa.), but
+         * its contents must match the slot's key family. A pre-dual-cert
+         * single-RSA deployment wrote its RSA leaf to the flat fullchain.pem; the
+         * EC slot would otherwise read it, see a valid notAfter, and skip EC
+         * issuance until expiry. Treat a family mismatch as due so the correct
+         * keytype gets issued (its commit seeds-from-live, preserving the other).
+         */
+        if (stored_id != want_id) {
+            ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
+                          "autocert: \"%V\" stored cert is the wrong key family "
+                          "for this keytype; reissuing", name);
+            return 1;
+        }
     }
 
     now = ngx_time();
