@@ -1517,7 +1517,7 @@ ngx_autocert_order_poll_order_done(ngx_autocert_acme_request_t *req,
     ngx_autocert_order_t       *order;
     ngx_autocert_json_value_t  *root;
     ngx_str_t                   status, cert_url;
-    ngx_uint_t                  valid, pending, ready;
+    ngx_uint_t                  valid, pending, ready, transient, status_code;
 
     if (req == NULL) {
         return;
@@ -1528,6 +1528,8 @@ ngx_autocert_order_poll_order_done(ngx_autocert_acme_request_t *req,
     valid = 0;
     pending = 0;
     ready = 0;
+    status_code = req->status;
+    transient = (rc != NGX_OK || req->status != 200);
     ngx_str_null(&cert_url);
 
     ngx_log_debug2(NGX_LOG_DEBUG_CORE, order->log, 0,
@@ -1609,6 +1611,25 @@ ngx_autocert_order_poll_order_done(ngx_autocert_acme_request_t *req,
     }
 
     if (!pending) {
+        /*
+         * A transient poll with no usable response (rc != OK or non-200) must
+         * not discard a fully issued order: the account layer exhausting its
+         * one-shot badNonce retry on this POST-as-GET surfaces here as status 0
+         * (a CA 5xx/blip is the same class). The order resource is durable, so
+         * re-poll instead of failing. order_poll_tries still caps the total, so
+         * a persistently failing CA terminates at the poll timeout rather than
+         * looping forever. A real 200 carrying "invalid" is NOT transient and
+         * stays terminal below.
+         */
+        if (transient) {
+            ngx_log_error(NGX_LOG_WARN, order->log, 0,
+                          "autocert: order poll for \"%V\" got no usable "
+                          "response (rc:%i status:%ui); re-polling",
+                          &order->domain, rc, status_code);
+            ngx_add_timer(&order->order_timer, NGX_AUTOCERT_ORDER_FIN_DELAY);
+            return;
+        }
+
         ngx_log_error(NGX_LOG_ERR, order->log, 0,
                       "autocert: order did not become valid");
         ngx_autocert_order_finish(order, NGX_ERROR);
