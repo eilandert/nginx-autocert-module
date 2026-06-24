@@ -18,7 +18,7 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 
-#include "../src/ngx_http_autocert_crypto.h"
+#include "../../src/ngx_http_autocert_crypto.h"
 
 #include <openssl/ecdsa.h>
 #include <openssl/sha.h>

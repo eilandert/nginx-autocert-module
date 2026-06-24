@@ -4,7 +4,7 @@ Coverage-guided (libFuzzer) fuzzing of the two parsers that read attacker-
 influenceable ACME server bytes: the JSON parser and the HTTP-response parser.
 Both targets are built from the SHIPPED parser source by their `extract_*.sh`
 slicers — no hand-maintained copy and no nginx build tree required.
-`fuzz/build.sh` builds both (`fuzz_json`, `fuzz_http`).
+`tests/fuzz/build.sh` builds both (`fuzz_json`, `fuzz_http`).
 
 ## Targets
 
@@ -67,7 +67,7 @@ parser reads (pool, url/host/port/uri, recv `ngx_buf_t`, headers array, the
 `headers_done` / `chunked` / `content_length` / `body_offset` framing fields)
 plus the `ngx_string` / `ngx_array` / `ngx_atoi` / `ngx_atoof` helpers, with
 identical semantics. The same shim + slice also back the standalone unit test
-`test/test_http.c`.
+`tests/unit/test_http.c`.
 
 `ngx_shim.h` supplies the minimal nginx surface the JSON parser touches:
 `ngx_pool_t` with a malloc-backed allocator, `ngx_pcalloc` / `ngx_pnalloc`,
@@ -83,8 +83,8 @@ heap-buffer-overflow.
 
 ```bash
 # needs clang with libFuzzer (clang >= 6) — no nginx build tree needed
-CC=clang bash fuzz/build.sh          # -> fuzz/fuzz_json + fuzz/fuzz_http
-cd fuzz
+CC=clang bash tests/fuzz/build.sh          # -> tests/fuzz/fuzz_json + tests/fuzz/fuzz_http
+cd tests/fuzz
 ./fuzz_json -max_total_time=120 -print_final_stats=1 corpus/
 ./fuzz_http -max_total_time=120 -print_final_stats=1 corpus_http/
 ```
@@ -92,7 +92,7 @@ cd fuzz
 The valgrind-replay path (plain compile, no sanitizers):
 
 ```bash
-CC=clang CFLAGS='-g -O1' bash fuzz/build.sh
+CC=clang CFLAGS='-g -O1' bash tests/fuzz/build.sh
 ```
 
 A crash drops a `crash-*` reproducer; re-run with `./fuzz_json crash-<id>` to

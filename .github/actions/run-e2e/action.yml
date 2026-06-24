@@ -63,7 +63,7 @@ runs:
         BIN="$NGX/objs/${{ inputs.flavor }}"
         [ -f "$BIN" ] || BIN="$NGX/objs/nginx"
         chmod +x "$BIN"
-        script="$GITHUB_WORKSPACE/tests/${{ inputs.script }}"
+        script="$GITHUB_WORKSPACE/tests/e2e/${{ inputs.script }}"
         if [ "${{ inputs.sudo }}" = "true" ]; then
           sudo env SERVER_BIN="$BIN" NGX_BUILD_DIR="$NGX" \
             CERT_CASE="${{ inputs.cert_case }}" bash "$script"

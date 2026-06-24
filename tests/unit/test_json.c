@@ -15,7 +15,7 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 
-#include "../src/ngx_autocert_json.h"
+#include "../../src/ngx_autocert_json.h"
 
 #include <stdio.h>
 #include <string.h>

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Slice the single pure function ngx_autocert_account_json_safe() out of the
-# shipped ../src/ngx_autocert_account.c into generated_jsonsafe.inc, compiled by
+# shipped ../../src/ngx_autocert_account.c into generated_jsonsafe.inc, compiled by
 # test/test_account_jsonsafe.c against nothing but <ngx_core.h>.
 #
 # Why slice, not include-shim the whole .c: ngx_autocert_account.c is the ACME
@@ -16,7 +16,7 @@
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SRC="$DIR/../src/ngx_autocert_account.c"
+SRC="$DIR/../../src/ngx_autocert_account.c"
 OUT="$DIR/generated_jsonsafe.inc"
 FN="ngx_autocert_account_json_safe"
 

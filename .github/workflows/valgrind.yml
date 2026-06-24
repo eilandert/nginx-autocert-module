@@ -98,12 +98,12 @@ jobs:
           # INC and OBJS are flag/object lists that must word-split.
           # shellcheck disable=SC2086
           gcc -Wall -Wextra -Werror -g3 -O0 $INC -o test_crypto \
-            "$GITHUB_WORKSPACE/test/test_crypto.c" \
+            "$GITHUB_WORKSPACE/tests/unit/test_crypto.c" \
             "$GITHUB_WORKSPACE/src/ngx_http_autocert_crypto.c" \
             $OBJS -lssl -lcrypto
           # shellcheck disable=SC2086
           gcc -Wall -Wextra -Werror -g3 -O0 $INC -o test_json \
-            "$GITHUB_WORKSPACE/test/test_json.c" \
+            "$GITHUB_WORKSPACE/tests/unit/test_json.c" \
             "$GITHUB_WORKSPACE/src/ngx_autocert_json.c" \
             $OBJS
 
