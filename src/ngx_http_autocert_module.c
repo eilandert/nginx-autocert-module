@@ -1726,10 +1726,26 @@ ngx_http_autocert_key_type(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     {
         amcf->key_type = NGX_HTTP_AUTOCERT_KEY_P256;
 
+    } else if (ngx_strcasecmp(value[1].data, (u_char *) "rsa2048") == 0
+               || ngx_strcasecmp(value[1].data, (u_char *) "rsa-2048") == 0)
+    {
+        amcf->key_type = NGX_HTTP_AUTOCERT_KEY_RSA2048;
+
+    } else if (ngx_strcasecmp(value[1].data, (u_char *) "rsa3072") == 0
+               || ngx_strcasecmp(value[1].data, (u_char *) "rsa-3072") == 0
+               || ngx_strcasecmp(value[1].data, (u_char *) "rsa") == 0)
+    {
+        amcf->key_type = NGX_HTTP_AUTOCERT_KEY_RSA3072;
+
+    } else if (ngx_strcasecmp(value[1].data, (u_char *) "rsa4096") == 0
+               || ngx_strcasecmp(value[1].data, (u_char *) "rsa-4096") == 0)
+    {
+        amcf->key_type = NGX_HTTP_AUTOCERT_KEY_RSA4096;
+
     } else {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            "invalid key type \"%V\" in \"autocert_key_type\", "
-                           "expected p384 (secp384r1) or p256 (secp256r1)",
+                           "expected p256, p384, rsa2048, rsa3072 (rsa) or rsa4096",
                            &value[1]);
         return NGX_CONF_ERROR;
     }

@@ -367,7 +367,9 @@ ngx_autocert_kick_handler(ngx_event_t *ev)
         ngx_autocert_test_alpn_seeded = 1;
 
         atmp = ngx_create_pool(4096, cycle->log);
-        akey = ngx_http_autocert_key_generate(acf.key_type);
+        /* Ephemeral tls-alpn-01 challenge cert: always EC, independent of the
+         * configured certificate key type. */
+        akey = ngx_http_autocert_key_generate(NGX_HTTP_AUTOCERT_KEY_P384);
         acert = NULL;
 
         if (atmp != NULL && akey != NULL) {
@@ -518,7 +520,10 @@ ngx_autocert_bootstrap_ca(ngx_cycle_t *cycle, ngx_uint_t ca_idx)
         acct->cycle = cycle;
         acct->log = cycle->log;
         acct->directory_url = state->entry->ca_conf.ca;
-        acct->key_type = acf.key_type;
+        /* The ACME account key signs JWS and is independent of the certificate
+         * key type: account JWS only supports ES256/ES384, so the account key
+         * is always EC (P-384) even when certificates are issued as RSA. */
+        acct->key_type = NGX_HTTP_AUTOCERT_KEY_P384;
         /* Per-CA contact: this CA group's own email, or the legacy first-overall
          * email if the group set none. */
         acct->email = state->entry->email.len ? state->entry->email : acf.email;

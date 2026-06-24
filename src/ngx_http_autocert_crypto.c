@@ -95,12 +95,10 @@ ngx_http_autocert_curve_of(EVP_PKEY *pkey)
 
 
 /*
- * Signing digest for a key. We only ever sign with our own P-256/P-384 keys, so
- * derive the digest from the curve table (P-256 -> SHA-256, P-384 -> SHA-384)
- * rather than guessing from EVP_PKEY_bits: the bits heuristic mis-sizes
- * SHA-2 for any other curve (e.g. P-521's 521 bits would still pick SHA-384).
- * The bits fallback only covers a non-EC / unknown-curve key (the arbitrary
- * dummy-cert path), where no curve fact exists.
+ * Signing digest for a key. EC keys use the curve table (P-256 -> SHA-256,
+ * P-384 -> SHA-384). RSA keys fall through to the bits heuristic: RSA key
+ * sizes are always > 256 bits so they pick SHA-384, which is acceptable.
+ * The bits fallback also covers any non-EC / unknown-curve key.
  */
 static const EVP_MD *
 ngx_http_autocert_sign_md(EVP_PKEY *pkey)
@@ -122,6 +120,32 @@ ngx_http_autocert_key_generate(ngx_uint_t curve)
     const ngx_http_autocert_curve_t  *c;
     EVP_PKEY                         *pkey = NULL;
     EVP_PKEY_CTX                     *ctx;
+
+    if (curve == NGX_HTTP_AUTOCERT_CRYPTO_RSA2048
+        || curve == NGX_HTTP_AUTOCERT_CRYPTO_RSA3072
+        || curve == NGX_HTTP_AUTOCERT_CRYPTO_RSA4096)
+    {
+        int  bits = (curve == NGX_HTTP_AUTOCERT_CRYPTO_RSA2048) ? 2048
+                  : (curve == NGX_HTTP_AUTOCERT_CRYPTO_RSA4096) ? 4096
+                  : 3072;
+
+        ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
+        if (ctx == NULL) {
+            return NULL;
+        }
+
+        if (EVP_PKEY_keygen_init(ctx) != 1
+            || EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, bits) != 1
+            || EVP_PKEY_keygen(ctx, &pkey) != 1)
+        {
+            EVP_PKEY_free(pkey);
+            EVP_PKEY_CTX_free(ctx);
+            return NULL;
+        }
+
+        EVP_PKEY_CTX_free(ctx);
+        return pkey;
+    }
 
     c = ngx_http_autocert_curve_by_id(curve);
     if (c == NULL) {
@@ -711,10 +735,10 @@ ngx_http_autocert_csr_der(ngx_pool_t *pool, EVP_PKEY *pkey, ngx_str_t *domain,
     GENERAL_NAME                      *gn = NULL;
     GENERAL_NAMES                     *gns = NULL;
     ASN1_IA5STRING                    *ia5 = NULL;
-    const ngx_http_autocert_curve_t   *cv;
+    const EVP_MD                      *md;
 
-    cv = ngx_http_autocert_curve_of(pkey);
-    if (cv == NULL || domain->len == 0) {
+    md = ngx_http_autocert_sign_md(pkey);
+    if (md == NULL || domain->len == 0) {
         return NGX_ERROR;
     }
 
@@ -762,7 +786,7 @@ ngx_http_autocert_csr_der(ngx_pool_t *pool, EVP_PKEY *pkey, ngx_str_t *domain,
         goto done;
     }
 
-    if (X509_REQ_sign(req, pkey, cv->md()) == 0) {
+    if (X509_REQ_sign(req, pkey, md) == 0) {
         goto done;
     }
 

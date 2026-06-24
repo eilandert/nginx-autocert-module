@@ -903,6 +903,29 @@ jobs:
           dir: ${{ matrix.dir }}
           script: tls-alpn-issue.sh
 
+  rsa-issue:
+    name: RSA-2048 full issuance (autocert_key_type rsa2048) [${{ matrix.flavor }}]
+    needs: [resolve, build-nginx, build-angie]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: nginx
+            dir: ${{ needs.resolve.outputs.nginx_dir }}
+          - flavor: angie
+            dir: ${{ needs.resolve.outputs.angie_dir }}
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Issue an RSA-2048 certificate against Pebble, assert key algo
+        uses: ./.github/actions/run-e2e
+        with:
+          flavor: ${{ matrix.flavor }}
+          dir: ${{ matrix.dir }}
+          script: rsa-issue.sh
+
   renewal:
     name: ACME renewal + multi-name issuance (M8) [${{ matrix.flavor }}]
     needs: [resolve, build-nginx, build-angie]
