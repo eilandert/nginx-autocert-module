@@ -10,10 +10,10 @@
  * handling, or the chunk-size arithmetic in dechunk would be a worker-crashing
  * OOB read. Coverage-guided fuzzing catches that class; the e2e tests miss it.
  *
- * The real parser bodies live in ../src/ngx_autocert_acme.c and depend on the
- * nginx event/SSL/resolver tree; fuzz/extract_http.sh slices ONLY the
+ * The real parser bodies live in ../../src/ngx_autocert_acme.c and depend on the
+ * nginx event/SSL/resolver tree; tests/fuzz/extract_http.sh slices ONLY the
  * self-contained parser functions into generated_http.inc, compiled here
- * against fuzz/ngx_http_shim.h. We always fuzz the SHIPPED code with no drift.
+ * against tests/fuzz/ngx_http_shim.h. We always fuzz the SHIPPED code with no drift.
  *
  * The harness copies the input into a buffer sized EXACTLY to `size` (no
  * trailing NUL) so ASAN turns any read at/past the end into a heap-buffer-
@@ -22,10 +22,10 @@
  * call), then, if it asked for more, do nothing — a single call already covers
  * the status line + headers + body framing + dechunk paths over this input.
  *
- * Build (see fuzz/build.sh):
- *   CC=clang bash fuzz/build.sh           -> fuzz/fuzz_http (ASan+UBSan+fuzzer)
+ * Build (see tests/fuzz/build.sh):
+ *   CC=clang bash tests/fuzz/build.sh     -> tests/fuzz/fuzz_http (ASan+UBSan+fuzzer)
  * Run:
- *   cd fuzz && ./fuzz_http -max_total_time=120 corpus_http/
+ *   cd tests/fuzz && ./fuzz_http -max_total_time=120 corpus_http/
  */
 
 #include <stddef.h>

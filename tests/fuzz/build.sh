@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
 # Build the autocert libFuzzer targets.
-# Usage: fuzz/build.sh [out-dir]
+# Usage: tests/fuzz/build.sh [out-dir]
 #
-#   - no arg   : build fuzz_json + fuzz_http into fuzz/
+#   - no arg   : build fuzz_json + fuzz_http into tests/fuzz/
 #   - a dir    : build fuzz_json + fuzz_http into that directory
 #                (CI / OSS-Fuzz compat — $OUT/$OUT_DIR convention)
 #
@@ -12,7 +12,7 @@
 #   fuzz_http  — ngx_autocert_acme_parse_response/dechunk (generated_http.inc)
 #
 # No nginx build tree required — each parser's source is sliced from the shipped
-# .c by its extract_*.sh and compiled against the matching fuzz/ngx_*shim.h, so
+# .c by its extract_*.sh and compiled against the matching tests/fuzz/ngx_*shim.h, so
 # the fuzzers always exercise production code with no copy drift.
 #
 # Requires clang with libFuzzer (clang >= 6).

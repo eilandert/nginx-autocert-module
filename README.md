@@ -441,7 +441,7 @@ make
 `AUTOCERT_TEST=1` is consumed at configure time only (it bakes
 `-DNGX_AUTOCERT_TEST=1` into the generated Makefile), so it is set on `./configure`
 and not repeated on `make`. Use a full `make` here — not `make modules` — because
-the e2e suite under `tests/*.sh` runs the actual server binary (`objs/nginx` or
+the e2e suite under `tests/e2e/*.sh` runs the actual server binary (`objs/nginx` or
 `objs/angie`), which `make modules` does not build.
 
 (The e2e harness uses [Pebble](https://github.com/letsencrypt/pebble) as a local

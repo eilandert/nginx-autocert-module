@@ -8,7 +8,7 @@
  *
  * ngx_autocert_timegm is static, so this TU include-shims the whole crypto .c
  * (the same source the server compiles) to reach it — no production hook and no
- * copy drift. The PEM fixture is test/fixture_leaf.pem (notAfter 2099-12-31
+ * copy drift. The PEM fixture is tests/unit/fixture_leaf.pem (notAfter 2099-12-31
  * 23:59:59Z, epoch 4102444799 — past 2038 to exercise 64-bit time_t).
  *
  * Exit 0 = all pass; non-zero on first failure.
@@ -29,7 +29,7 @@ ngx_log_error_core(ngx_uint_t level, ngx_log_t *log, ngx_err_t err,
 
 /* Include-shim: pulls in the static ngx_autocert_timegm + the public
  * ngx_http_autocert_cert_not_after, compiled exactly as shipped. */
-#include "../src/ngx_http_autocert_crypto.c"
+#include "../../src/ngx_http_autocert_crypto.c"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,7 +52,7 @@ static int  failures;
 
 
 /* The committed fixture; epoch of its notAfter (2099-12-31T23:59:59Z). */
-#define FIXTURE_PATH   "test/fixture_leaf.pem"
+#define FIXTURE_PATH   "tests/unit/fixture_leaf.pem"
 #define FIXTURE_EPOCH  ((time_t) 4102444799)
 
 
@@ -139,7 +139,7 @@ test_cert_not_after(void)
 
     /* Missing file -> NGX_DECLINED (no cert stored yet). */
     out = 0;
-    CHECK(ngx_http_autocert_cert_not_after("test/does-not-exist.pem", &out, NULL)
+    CHECK(ngx_http_autocert_cert_not_after("tests/unit/does-not-exist.pem", &out, NULL)
               == NGX_DECLINED,
           "cert_not_after missing file -> NGX_DECLINED");
 

@@ -15,7 +15,7 @@
 
 #include "test_slab.h"
 
-#include "../src/ngx_autocert_alpn.h"
+#include "../../src/ngx_autocert_alpn.h"
 
 #include <stdio.h>
 

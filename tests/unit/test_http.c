@@ -8,9 +8,9 @@
  * self-contained byte crunchers, but the rest of the TU references
  * ngx_event_connect / ngx_resolver / ngx_ssl, which would have to be linked
  * (with their transitive deps) just to satisfy the linker for an include-shim
- * build. So we reuse the fuzz infrastructure: fuzz/extract_http.sh slices the
- * parser bodies into fuzz/generated_http.inc, compiled here against
- * fuzz/ngx_http_shim.h — same idiom as fuzz/fuzz_json.c, and the SAME shipped
+ * build. So we reuse the fuzz infrastructure: tests/fuzz/extract_http.sh slices the
+ * parser bodies into tests/fuzz/generated_http.inc, compiled here against
+ * tests/fuzz/ngx_http_shim.h — same idiom as tests/fuzz/fuzz_json.c, and the SAME shipped
  * code the fuzzer exercises, with no copy drift. (Reported as a deliberate
  * deviation from the include+link route in the PR.)
  *

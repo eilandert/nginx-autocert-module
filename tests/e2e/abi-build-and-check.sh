@@ -3,7 +3,7 @@
 # Self-contained ABI-drift regression. Builds the module against TWO angie trees
 # that differ ONLY by a 32-byte field added to `struct ngx_ssl_s` — mimicking
 # our nginx_dynamic_tls_records.patch (`ngx_ssl_dyn_rec_t dyn_rec`), which shifts
-# ngx_http_ssl_srv_conf_t.certificates 208 -> 240 — then runs tests/abi-matrix.sh
+# ngx_http_ssl_srv_conf_t.certificates 208 -> 240 — then runs tests/e2e/abi-matrix.sh
 # to prove: matched builds work, mismatched builds fail LOUD via the module's ABI
 # guard (never SIGSEGV). Catches the exact class that crashed prod (a module
 # built against the wrong tree), independent of our private deb patches.
@@ -19,7 +19,7 @@
 set -euo pipefail
 
 ANGIE_URL="${ANGIE_URL:?set ANGIE_URL to the angie source tarball}"
-WORKSPACE="${WORKSPACE:-$(cd "$(dirname "$0")/.." && pwd)}"
+WORKSPACE="${WORKSPACE:-$(cd "$(dirname "$0")/../.." && pwd)}"
 WORK="${WORK:-/tmp/abi-check}"
 JOBS="${JOBS:-$(nproc)}"
 
@@ -58,4 +58,4 @@ build enlarged yes
 A_BIN="$WORK/vanilla/objs/angie"   A_BUILD="$WORK/vanilla" \
 B_BIN="$WORK/enlarged/objs/angie"  B_BUILD="$WORK/enlarged" \
 PREFIX="$WORK/matrix" \
-    bash "$WORKSPACE/tests/abi-matrix.sh"
+    bash "$WORKSPACE/tests/e2e/abi-matrix.sh"

@@ -11,7 +11,7 @@ name: Build & Test
 #   ./.github/actions/setup         apt deps + optional ccache restore.
 #   ./.github/actions/build-module  fetch+build one flavor, run the no-network
 #                                   load/serve tests, upload build-<flavor>.
-#   ./.github/actions/run-e2e       restore build-nginx + run one tests/*.sh
+#   ./.github/actions/run-e2e       restore build-nginx + run one tests/e2e/*.sh
 #                                   Pebble e2e (optionally under sudo).
 
 # Neither nginx nor angie is pinned: the `resolve` job scrapes the current
@@ -61,8 +61,8 @@ jobs:
 
       - name: Validate scripts and source
         run: |
-          bash -n tests/*.sh fuzz/*.sh test/*.sh
-          shellcheck tests/*.sh fuzz/*.sh test/*.sh
+          bash -n tests/e2e/*.sh tests/fuzz/*.sh tests/unit/*.sh
+          shellcheck tests/e2e/*.sh tests/fuzz/*.sh tests/unit/*.sh
           # Reject literal NUL bytes in tracked C sources: they make git/rg treat
           # the file as binary and silently drop it from source search / review.
           if LC_ALL=C grep -laP '\x00' src/*.c src/*.h; then
@@ -217,7 +217,7 @@ jobs:
           ANGIE_URL: ${{ needs.resolve.outputs.angie_url }}
         run: |
           set -euo pipefail
-          WORKSPACE="$GITHUB_WORKSPACE" bash tests/abi-build-and-check.sh
+          WORKSPACE="$GITHUB_WORKSPACE" bash tests/e2e/abi-build-and-check.sh
 
   # Prove a PRODUCTION build (no AUTOCERT_TEST) omits the test-only seed
   # directives entirely, so a stray/templated autocert_test_challenge cannot
@@ -322,7 +322,7 @@ jobs:
           # INC and OBJS are flag/object lists that must word-split.
           # shellcheck disable=SC2086
           gcc -Wall -Wextra -Werror $INC -o test_crypto \
-            "$GITHUB_WORKSPACE/test/test_crypto.c" \
+            "$GITHUB_WORKSPACE/tests/unit/test_crypto.c" \
             "$GITHUB_WORKSPACE/src/ngx_http_autocert_crypto.c" \
             $OBJS -lssl -lcrypto
           ./test_crypto
@@ -358,7 +358,7 @@ jobs:
           # INC and OBJS are flag/object lists that must word-split.
           # shellcheck disable=SC2086
           gcc -Wall -Wextra -Werror $INC -o test_json \
-            "$GITHUB_WORKSPACE/test/test_json.c" \
+            "$GITHUB_WORKSPACE/tests/unit/test_json.c" \
             "$GITHUB_WORKSPACE/src/ngx_autocert_json.c" \
             $OBJS
           ./test_json
@@ -384,9 +384,9 @@ jobs:
           # ngx_autocert_acme.c by extract_http.sh and compiled against the
           # fuzz shim — no nginx objects needed (the rest of that TU is
           # event/SSL/resolver machinery the parser does not touch).
-          bash fuzz/extract_http.sh
+          bash tests/fuzz/extract_http.sh
           gcc -Wall -Wextra -Werror -I"$GITHUB_WORKSPACE" \
-            -o test_http "$GITHUB_WORKSPACE/test/test_http.c"
+            -o test_http "$GITHUB_WORKSPACE/tests/unit/test_http.c"
           ./test_http
 
   challenge-unit:
@@ -428,7 +428,7 @@ jobs:
             "$GITHUB_WORKSPACE/src/ngx_autocert_challenge.c" -o challenge.o
           # shellcheck disable=SC2086
           gcc -Wall -Wextra -Werror $INC -c \
-            "$GITHUB_WORKSPACE/test/test_challenge.c" -o test_challenge_tu.o
+            "$GITHUB_WORKSPACE/tests/unit/test_challenge.c" -o test_challenge_tu.o
           # shellcheck disable=SC2086
           gcc -o test_challenge test_challenge_tu.o challenge.o $OBJS
           ./test_challenge
@@ -468,7 +468,7 @@ jobs:
             "$GITHUB_WORKSPACE/src/ngx_autocert_alpn.c" -o alpn.o
           # shellcheck disable=SC2086
           gcc -Wall -Wextra -Werror $INC -c \
-            "$GITHUB_WORKSPACE/test/test_alpn.c" -o test_alpn_tu.o
+            "$GITHUB_WORKSPACE/tests/unit/test_alpn.c" -o test_alpn_tu.o
           # shellcheck disable=SC2086
           gcc -o test_alpn test_alpn_tu.o alpn.o $OBJS
           ./test_alpn
@@ -504,10 +504,10 @@ jobs:
           # _GNU_SOURCE: the test cross-checks ngx_autocert_timegm against libc
           # timegm(3). The test include-shims the crypto .c to reach the static
           # ngx_autocert_timegm, so run it from the repo root (relative fixture
-          # path test/fixture_leaf.pem).
+          # path tests/unit/fixture_leaf.pem).
           # shellcheck disable=SC2086
           gcc -D_GNU_SOURCE -Wall -Wextra -Werror $INC -o test_cert_time \
-            "$GITHUB_WORKSPACE/test/test_cert_time.c" \
+            "$GITHUB_WORKSPACE/tests/unit/test_cert_time.c" \
             $OBJS -lssl -lcrypto
           ./test_cert_time
 
@@ -539,10 +539,10 @@ jobs:
           # Slice just ngx_autocert_account_json_safe from the shipped account
           # source — the function depends only on ngx_str_t, so no nginx objects
           # are linked.
-          bash test/extract_jsonsafe.sh
+          bash tests/unit/extract_jsonsafe.sh
           # shellcheck disable=SC2086
-          gcc -Wall -Wextra -Werror -Itest $INC -o test_account_jsonsafe \
-            "$GITHUB_WORKSPACE/test/test_account_jsonsafe.c"
+          gcc -Wall -Wextra -Werror -Itests/unit $INC -o test_account_jsonsafe \
+            "$GITHUB_WORKSPACE/tests/unit/test_account_jsonsafe.c"
           ./test_account_jsonsafe
 
   # ------------------------------------------------------------ nginx+angie e2e
@@ -1339,4 +1339,4 @@ jobs:
           NGX="$GITHUB_WORKSPACE/${{ matrix.dir }}"
           BIN="$NGX/objs/${{ matrix.flavor }}"; [ -x "$BIN" ] || BIN="$NGX/objs/nginx"
           SERVER_BIN="$BIN" NGX_BUILD_DIR="$NGX" \
-            bash "$GITHUB_WORKSPACE/tests/slowloris-read.sh"
+            bash "$GITHUB_WORKSPACE/tests/e2e/slowloris-read.sh"

@@ -18,7 +18,7 @@
 
 #include "test_slab.h"
 
-#include "../src/ngx_autocert_challenge.h"
+#include "../../src/ngx_autocert_challenge.h"
 
 #include <stdio.h>
 
