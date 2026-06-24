@@ -49,14 +49,38 @@
  * mtime observed at load; a renewal rewrites the files (M6b stores atomically),
  * so a changed mtime triggers a reload on the next handshake.
  */
+/*
+ * Dual-cert (Phase B): a name can have an EC and an RSA cert on disk at once
+ * (different files in the same dir — see order.c). Each is loaded into its own
+ * slot here and ALL present slots are installed on the SSL, so OpenSSL picks the
+ * leaf matching the client's offered sigalgs/ciphers. Slot 0 = EC (legacy flat
+ * files), slot 1 = RSA (.rsa. files). A slot with cert==NULL is simply absent.
+ */
+#define NGX_AUTOCERT_SLOT_EC    0
+#define NGX_AUTOCERT_SLOT_RSA   1
+#define NGX_AUTOCERT_NSLOTS     2
+
 typedef struct {
-    ngx_str_node_t      sn;          /* {node (key=crc32), str=host}; first! */
-    X509               *cert;        /* leaf; NULL when no cert on disk yet */
+    X509               *cert;        /* leaf; NULL when this variant not on disk */
     STACK_OF(X509)     *chain;       /* intermediates (may be empty) */
     EVP_PKEY           *key;
-    time_t              mtime;       /* fullchain.pem mtime at load */
-    time_t              checked;     /* last time we stat()'d, coarse */
+    time_t              mtime;       /* this variant's fullchain mtime at load */
+} ngx_autocert_slot_t;
+
+typedef struct {
+    ngx_str_node_t      sn;          /* {node (key=crc32), str=host}; first! */
+    ngx_autocert_slot_t slots[NGX_AUTOCERT_NSLOTS];   /* EC, RSA */
+    time_t              checked;     /* last time we stat()'d, coarse (all slots) */
 } ngx_autocert_cert_t;
+
+
+/* Per-slot on-disk leaf names. Must match the store writer in order.c. */
+static const char *ngx_autocert_slot_chain_name[NGX_AUTOCERT_NSLOTS] = {
+    "/fullchain.pem", "/fullchain.rsa.pem"
+};
+static const char *ngx_autocert_slot_key_name[NGX_AUTOCERT_NSLOTS] = {
+    "/privkey.pem", "/privkey.rsa.pem"
+};
 
 
 /* cert_cb argument: the store config the worker reads certs from. */
@@ -104,8 +128,8 @@ static ngx_uint_t           ngx_autocert_names_failed;    /* give up building */
 
 static int ngx_http_autocert_cert_cb(SSL *ssl_conn, void *arg);
 static ngx_int_t ngx_http_autocert_cache_reload(ngx_autocert_cert_t *c,
-    ngx_str_t *host, ngx_str_t *verify, ngx_autocert_serve_ctx_t *sctx,
-    ngx_log_t *log);
+    ngx_uint_t slot, ngx_str_t *host, ngx_str_t *verify,
+    ngx_autocert_serve_ctx_t *sctx, ngx_log_t *log);
 static ngx_int_t ngx_http_autocert_install_dummy(SSL_CTX *ctx, ngx_log_t *log);
 static ngx_int_t ngx_http_autocert_read_file(ngx_pool_t *pool,
     u_char *path, ngx_str_t *out, time_t *mtime);
@@ -445,14 +469,19 @@ ngx_autocert_serve_free_cache_certs(ngx_rbtree_node_t *node,
     ngx_autocert_serve_free_cache_certs(node->right, sentinel);
 
     c = (ngx_autocert_cert_t *) node;     /* sn.node is first member */
-    if (c->cert != NULL) {
-        X509_free(c->cert);
-    }
-    if (c->chain != NULL) {
-        sk_X509_pop_free(c->chain, X509_free);
-    }
-    if (c->key != NULL) {
-        EVP_PKEY_free(c->key);
+    {
+        ngx_uint_t  s;
+        for (s = 0; s < NGX_AUTOCERT_NSLOTS; s++) {
+            if (c->slots[s].cert != NULL) {
+                X509_free(c->slots[s].cert);
+            }
+            if (c->slots[s].chain != NULL) {
+                sk_X509_pop_free(c->slots[s].chain, X509_free);
+            }
+            if (c->slots[s].key != NULL) {
+                EVP_PKEY_free(c->slots[s].key);
+            }
+        }
     }
 }
 
@@ -712,7 +741,8 @@ ngx_http_autocert_cert_cb(SSL *ssl_conn, void *arg)
         ngx_memcpy(cert->sn.str.data, store.data, store.len);
         cert->sn.str.len = store.len;
         cert->sn.node.key = store_hash;
-        cert->mtime = -1;             /* force first load */
+        cert->slots[NGX_AUTOCERT_SLOT_EC].mtime = -1;    /* force first load */
+        cert->slots[NGX_AUTOCERT_SLOT_RSA].mtime = -1;
 
         ngx_rbtree_insert(&ngx_autocert_cache_rbtree, &cert->sn.node);
     }
@@ -726,30 +756,74 @@ ngx_http_autocert_cert_cb(SSL *ssl_conn, void *arg)
      * the identity check uses the concrete SNI (host) so a wildcard leaf is
      * matched against the actual requested name.
      */
-    (void) ngx_http_autocert_cache_reload(cert, &store, &host, sctx, c->log);
-
-    if (cert->cert == NULL || cert->key == NULL) {
-        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
-                       "autocert: no cached cert for \"%V\", keeping "
-                       "bootstrap cert", &host);
-        return 1;                         /* nothing issued yet -> bootstrap */
-    }
-
-    /*
-     * Bind the cached cert/key/chain to THIS connection. A partial bind (cert
-     * set, key fails) would hand the client a key that doesn't match the cert,
-     * so on ANY install failure fail the handshake (return 0) rather than serve
-     * a broken pair. Always set the chain — including an empty one — so a stale
-     * intermediate inherited from the ctx never ships with a new leaf.
-     */
-    if (SSL_use_certificate(ssl_conn, cert->cert) != 1
-        || SSL_use_PrivateKey(ssl_conn, cert->key) != 1
-        || SSL_set1_chain(ssl_conn, cert->chain) != 1)
     {
-        ngx_log_error(NGX_LOG_ERR, c->log, 0,
-                      "autocert: installing certificate for \"%V\" failed",
-                      &host);
-        return 0;
+        ngx_uint_t  s, installed = 0;
+        time_t      now = ngx_time();
+
+        /*
+         * Throttle the disk stat/reload of ALL slots to at most once per second
+         * per name (including the never-loaded case so a connection storm
+         * against a not-yet-issued name doesn't stat() every handshake). When
+         * throttled we install whatever the slots already hold. checked starts
+         * at 0, so the first handshake always loads.
+         */
+        if (now != cert->checked) {
+            cert->checked = now;
+            for (s = 0; s < NGX_AUTOCERT_NSLOTS; s++) {
+                (void) ngx_http_autocert_cache_reload(cert, s, &store, &host,
+                                                      sctx, c->log);
+            }
+        }
+
+        if (cert->slots[NGX_AUTOCERT_SLOT_EC].cert == NULL
+            && cert->slots[NGX_AUTOCERT_SLOT_RSA].cert == NULL)
+        {
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                           "autocert: no cached cert for \"%V\", keeping "
+                           "bootstrap cert", &host);
+            return 1;                     /* nothing issued yet -> bootstrap */
+        }
+
+        /*
+         * Install EVERY present slot (EC and/or RSA) on this connection so the
+         * handshake selects by the client's offered sigalgs/ciphers.
+         *
+         * set1_chain acts on the SSL's "current" certificate, which is the one
+         * the immediately preceding use_certificate set. So per slot we MUST
+         * call use_certificate -> use_PrivateKey -> set1_chain in that order,
+         * before moving to the next slot — otherwise the second slot's chain
+         * would overwrite the first slot's. A partial bind would hand the client
+         * a key not matching its cert, so any per-slot failure fails the
+         * handshake. The empty chain is set explicitly so a stale ctx
+         * intermediate never ships with a fresh leaf.
+         */
+        for (s = 0; s < NGX_AUTOCERT_NSLOTS; s++) {
+            ngx_autocert_slot_t  *sl = &cert->slots[s];
+
+            if (sl->cert == NULL || sl->key == NULL) {
+                continue;
+            }
+
+            if (SSL_use_certificate(ssl_conn, sl->cert) != 1
+                || SSL_use_PrivateKey(ssl_conn, sl->key) != 1
+                || SSL_set1_chain(ssl_conn, sl->chain) != 1)
+            {
+                ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                              "autocert: installing certificate for \"%V\" "
+                              "(slot %ui) failed", &host, s);
+                return 0;
+            }
+            installed++;
+        }
+
+        if (installed == 0) {
+            /* Slots had a cert but no matching key (mismatch caught at load
+             * leaves cert==NULL, so this is defensive) — fall back. */
+            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
+                           "autocert: no installable cert for \"%V\", keeping "
+                           "bootstrap cert", &host);
+            return 1;
+        }
     }
 
     return 1;
@@ -763,16 +837,21 @@ ngx_http_autocert_cert_cb(SSL *ssl_conn, void *arg)
  * On any error the previously cached cert (if any) is left intact.
  */
 static ngx_int_t
-ngx_http_autocert_cache_reload(ngx_autocert_cert_t *c, ngx_str_t *host,
-    ngx_str_t *verify, ngx_autocert_serve_ctx_t *sctx, ngx_log_t *log)
+ngx_http_autocert_cache_reload(ngx_autocert_cert_t *c, ngx_uint_t slot,
+    ngx_str_t *host, ngx_str_t *verify, ngx_autocert_serve_ctx_t *sctx,
+    ngx_log_t *log)
 {
     u_char             chain_path[NGX_MAX_PATH], key_path[NGX_MAX_PATH];
     u_char            *p;
     size_t             base;
+    ngx_autocert_slot_t *sl = &c->slots[slot];
+    const char        *chain_leaf = ngx_autocert_slot_chain_name[slot];
+    const char        *key_leaf = ngx_autocert_slot_key_name[slot];
+    size_t             chain_leaf_len = ngx_strlen(chain_leaf);
+    size_t             key_leaf_len = ngx_strlen(key_leaf);
     ngx_str_t          chain_pem, key_pem, seg;
     ngx_file_info_t    fi;
     ngx_fd_t           fd;
-    time_t             now;
     BIO               *bio = NULL;
     X509              *leaf = NULL, *x;
     STACK_OF(X509)    *chain = NULL;
@@ -790,24 +869,13 @@ ngx_http_autocert_cache_reload(ngx_autocert_cert_t *c, ngx_str_t *host,
         return NGX_ERROR;
     }
 
-    /*
-     * Throttle ALL outcomes (hit, miss, or error) to at most one stat per
-     * second per name — including the never-loaded case (mtime == -1) so a
-     * connection storm against a not-yet-issued name doesn't stat() every
-     * handshake. checked starts at 0; the first call always runs.
-     */
-    now = ngx_time();
-    if (now == c->checked) {
-        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, log, 0,
-                       "autocert: cert cache check for \"%V\" throttled",
-                       host);
-        return NGX_OK;                    /* throttled; use what we have */
-    }
-    c->checked = now;
+    /* The once-per-second stat throttle is applied by the caller (cert_cb)
+     * across ALL slots, so we don't gate per-slot here (that would let the
+     * first slot's stat starve the second). */
 
     /*
-     * secure:  <path>/<host>/{fullchain,privkey}.pem
-     * certbot: <path>/live/<host>/{fullchain,privkey}.pem
+     * secure:  <path>/<host>/{fullchain,privkey}[.rsa].pem
+     * certbot: <path>/live/<host>/{fullchain,privkey}[.rsa].pem
      * (serving needs only fullchain + privkey; certbot's extra cert.pem /
      * chain.pem are written for tool compat but not read here.) Paths are
      * bounded by the configured name set; cap to NGX_MAX_PATH defensively.
@@ -820,7 +888,9 @@ ngx_http_autocert_cache_reload(ngx_autocert_cert_t *c, ngx_str_t *host,
     }
 
     base = sctx->path.len + seg.len + 1 + host->len;
-    if (base + sizeof("/fullchain.pem") > NGX_MAX_PATH) {
+    if (base + chain_leaf_len + 1 > NGX_MAX_PATH
+        || base + key_leaf_len + 1 > NGX_MAX_PATH)
+    {
         ngx_log_error(NGX_LOG_ERR, log, 0,
                       "autocert: store path too long for \"%V\"", host);
         return NGX_ERROR;
@@ -832,7 +902,7 @@ ngx_http_autocert_cache_reload(ngx_autocert_cert_t *c, ngx_str_t *host,
     }
     *p++ = '/';
     p = ngx_cpymem(p, host->data, host->len);
-    ngx_memcpy(p, "/fullchain.pem", sizeof("/fullchain.pem"));
+    ngx_memcpy(p, chain_leaf, chain_leaf_len + 1);   /* incl NUL */
 
     p = ngx_cpymem(key_path, sctx->path.data, sctx->path.len);
     if (seg.len) {
@@ -840,15 +910,16 @@ ngx_http_autocert_cache_reload(ngx_autocert_cert_t *c, ngx_str_t *host,
     }
     *p++ = '/';
     p = ngx_cpymem(p, host->data, host->len);
-    ngx_memcpy(p, "/privkey.pem", sizeof("/privkey.pem"));
+    ngx_memcpy(p, key_leaf, key_leaf_len + 1);       /* incl NUL */
 
     /* Pin every store-path component before inspecting the certificate. A plain
      * stat(path) would still follow an attacker-planted ancestor symlink. */
     fd = ngx_autocert_open_file_path((const char *) chain_path, O_RDONLY);
     if (fd == NGX_INVALID_FILE) {
-        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, log, ngx_errno,
-                       "autocert: no stored fullchain for \"%V\"", host);
-        return NGX_ERROR;                 /* no cert yet -> bootstrap */
+        ngx_log_debug2(NGX_LOG_DEBUG_HTTP, log, ngx_errno,
+                       "autocert: no stored fullchain for \"%V\" (slot %ui)",
+                       host, slot);
+        return NGX_ERROR;                 /* this variant not on disk -> skip */
     }
     if (ngx_fd_info(fd, &fi) == NGX_FILE_ERROR) {
         ngx_close_file(fd);
@@ -856,7 +927,7 @@ ngx_http_autocert_cache_reload(ngx_autocert_cert_t *c, ngx_str_t *host,
     }
     ngx_close_file(fd);
 
-    if (c->mtime == ngx_file_mtime(&fi)) {
+    if (sl->mtime == ngx_file_mtime(&fi)) {
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, log, 0,
                        "autocert: stored cert for \"%V\" unchanged", host);
         return NGX_OK;                    /* unchanged */
@@ -956,21 +1027,21 @@ ngx_http_autocert_cache_reload(ngx_autocert_cert_t *c, ngx_str_t *host,
         goto done;
     }
 
-    /* Commit: free the previous generation, adopt the new one. */
-    if (c->cert != NULL) {
-        X509_free(c->cert);
+    /* Commit: free this slot's previous generation, adopt the new one. */
+    if (sl->cert != NULL) {
+        X509_free(sl->cert);
     }
-    if (c->chain != NULL) {
-        sk_X509_pop_free(c->chain, X509_free);
+    if (sl->chain != NULL) {
+        sk_X509_pop_free(sl->chain, X509_free);
     }
-    if (c->key != NULL) {
-        EVP_PKEY_free(c->key);
+    if (sl->key != NULL) {
+        EVP_PKEY_free(sl->key);
     }
 
-    c->cert = leaf;
-    c->chain = chain;
-    c->key = key;
-    c->mtime = ngx_file_mtime(&fi);
+    sl->cert = leaf;
+    sl->chain = chain;
+    sl->key = key;
+    sl->mtime = ngx_file_mtime(&fi);
 
     leaf = NULL;                          /* ownership transferred */
     chain = NULL;
