@@ -97,6 +97,7 @@ ngx_autocert_get_conf(ngx_cycle_t *cycle, ngx_autocert_conf_t *out)
     out->dns_propagation_delay = amcf->dns_propagation_delay;
     out->dns_hook_timeout = amcf->dns_hook_timeout;
     out->key_type = amcf->key_type;
+    out->cert_key_types = amcf->key_types;
     out->store = amcf->store;
     out->path = amcf->path;
     out->renew_before = amcf->renew_before;

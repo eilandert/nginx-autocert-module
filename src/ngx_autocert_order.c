@@ -101,6 +101,8 @@ static ngx_int_t ngx_autocert_order_write_tmp_at(ngx_autocert_order_t *order,
 static ngx_int_t ngx_autocert_order_fsync_dirfd(ngx_autocert_order_t *order,
     int fd, const char *label);
 static void ngx_autocert_order_rm_staging_at(int cfd, const char *leaf);
+static void ngx_autocert_order_seed_staging_at(ngx_autocert_order_t *order,
+    int cfd, const char *dir, int sfd, ngx_uint_t skip_kt);
 static ngx_int_t ngx_autocert_order_swap_dirs_at(ngx_autocert_order_t *order,
     int cfd, const char *staging, const char *dir);
 static ngx_int_t ngx_autocert_order_publish_alpn(ngx_autocert_order_t *order);
@@ -1935,6 +1937,51 @@ ngx_autocert_order_split_chain(ngx_str_t *full, ngx_str_t *leaf, ngx_str_t *rest
 
 
 /*
+ * Dual-cert storage (Phase B). Each keytype owns its own pair of files inside
+ * the shared per-domain <seg> directory so an EC and an RSA cert can coexist:
+ *   - EC  (legacy/back-compat names): privkey.pem / fullchain.pem
+ *                          + certbot: cert.pem / chain.pem
+ *   - RSA:                            privkey.rsa.pem / fullchain.rsa.pem
+ *                          + certbot: cert.rsa.pem / chain.rsa.pem
+ * The EC names are kept flat (no .ecdsa. suffix) so an existing single-cert
+ * store keeps serving without a reissue.
+ */
+#define ngx_autocert_keytype_is_rsa(kt)                                       \
+    ((kt) == NGX_HTTP_AUTOCERT_KEY_RSA2048                                     \
+     || (kt) == NGX_HTTP_AUTOCERT_KEY_RSA3072                                  \
+     || (kt) == NGX_HTTP_AUTOCERT_KEY_RSA4096)
+
+/*
+ * Every file either layout can leave in a <seg> dir, across BOTH keytypes.
+ * Used to (a) seed staging from live so the OTHER keytype's files survive the
+ * whole-dir swap, and (b) sweep a staging dir clean. Order is irrelevant.
+ */
+static const char *ngx_autocert_store_files[] = {
+    "privkey.pem",      "fullchain.pem",      "cert.pem",      "chain.pem",
+    "privkey.rsa.pem",  "fullchain.rsa.pem",  "cert.rsa.pem",  "chain.rsa.pem",
+    NULL
+};
+
+/* Per-keytype PEM leaf names. priv/chain always; leaf/rest are certbot-only. */
+static void
+ngx_autocert_keytype_pem_names(ngx_uint_t kt, const char **priv,
+    const char **chain, const char **leaf, const char **rest)
+{
+    if (ngx_autocert_keytype_is_rsa(kt)) {
+        *priv  = "privkey.rsa.pem";
+        *chain = "fullchain.rsa.pem";
+        *leaf  = "cert.rsa.pem";
+        *rest  = "chain.rsa.pem";
+    } else {
+        *priv  = "privkey.pem";
+        *chain = "fullchain.pem";
+        *leaf  = "cert.pem";
+        *rest  = "chain.pem";
+    }
+}
+
+
+/*
  * Commit the issued pair into the store. TOCTOU-hardened: a single container
  * directory fd (cfd) is pinned with O_DIRECTORY|O_NOFOLLOW and every mutation
  * (mkdirat / openat / renameat2 / fstatat / unlinkat) is performed relative to
@@ -1957,6 +2004,7 @@ ngx_autocert_order_store(ngx_autocert_order_t *order)
     ngx_int_t     rc, swap;
     ngx_uint_t    certbot;
     ngx_str_t     seg;
+    const char   *priv_name, *chain_name, *leaf_name, *rest_name;
     u_char        seg_buf[NGX_AUTOCERT_DOMAIN_SEG_MAX];
 
     if (order->store_path.len == 0) {
@@ -2110,13 +2158,25 @@ ngx_autocert_order_store(ngx_autocert_order_t *order)
         return NGX_ERROR;                                                    \
     } while (0)
 
+    /*
+     * Dual-cert: seed staging from the live dir (hardlink) so the OTHER
+     * keytype's files survive the whole-<seg> atomic swap below. Must run
+     * BEFORE we write this keytype's pair so our writes overwrite the seeded
+     * (stale) copy of our own files; the other keytype's files pass through.
+     */
+    ngx_autocert_order_seed_staging_at(order, cfd, (char *) dir, sfd,
+                                       order->key_type);
+
+    ngx_autocert_keytype_pem_names(order->key_type, &priv_name, &chain_name,
+                                   &leaf_name, &rest_name);
+
     /* Write + fsync both PEMs into the staging dir (openat O_NOFOLLOW leaves). */
-    if (ngx_autocert_order_write_tmp_at(order, sfd, "privkey.pem",
+    if (ngx_autocert_order_write_tmp_at(order, sfd, priv_name,
                                         &order->cert_key_pem, 0600) != NGX_OK)
     {
         NGX_AUTOCERT_STORE_FAIL();
     }
-    if (ngx_autocert_order_write_tmp_at(order, sfd, "fullchain.pem",
+    if (ngx_autocert_order_write_tmp_at(order, sfd, chain_name,
                                         &order->cert_chain, 0644) != NGX_OK)
     {
         NGX_AUTOCERT_STORE_FAIL();
@@ -2140,9 +2200,9 @@ ngx_autocert_order_store(ngx_autocert_order_t *order)
             NGX_AUTOCERT_STORE_FAIL();
         }
 
-        if (ngx_autocert_order_write_tmp_at(order, sfd, "cert.pem", &leaf,
+        if (ngx_autocert_order_write_tmp_at(order, sfd, leaf_name, &leaf,
                                             0644) != NGX_OK
-            || ngx_autocert_order_write_tmp_at(order, sfd, "chain.pem", &rest,
+            || ngx_autocert_order_write_tmp_at(order, sfd, rest_name, &rest,
                                                0644) != NGX_OK)
         {
             NGX_AUTOCERT_STORE_FAIL();
@@ -2285,16 +2345,93 @@ ngx_autocert_order_rm_staging_at(int cfd, const char *leaf)
         return;
     }
 
-    /* Remove every file either layout can leave here: secure has privkey +
-     * fullchain; certbot adds cert + chain. unlinkat on an absent name is a
-     * harmless ENOENT, so always try all four (else a leftover cert.pem/
-     * chain.pem keeps rmdir failing and blocks the next renewal's mkdirat). */
-    (void) unlinkat(fd, "privkey.pem", 0);
-    (void) unlinkat(fd, "fullchain.pem", 0);
-    (void) unlinkat(fd, "cert.pem", 0);
-    (void) unlinkat(fd, "chain.pem", 0);
+    /* Remove every file either layout / either keytype can leave here: secure
+     * has privkey + fullchain; certbot adds cert + chain; RSA adds .rsa.
+     * variants of all four. unlinkat on an absent name is a harmless ENOENT, so
+     * always try them all (else a leftover file keeps rmdir failing and blocks
+     * the next renewal's mkdirat). */
+    {
+        int  i;
+        for (i = 0; ngx_autocert_store_files[i] != NULL; i++) {
+            (void) unlinkat(fd, ngx_autocert_store_files[i], 0);
+        }
+    }
     (void) close(fd);
     (void) unlinkat(cfd, leaf, AT_REMOVEDIR);
+}
+
+
+/*
+ * Dual-cert seed-from-live: hardlink every existing file in the live <dir> into
+ * the fresh staging dir BEFORE this order overwrites its own keytype's pair.
+ *
+ * The commit swaps the WHOLE <seg> directory atomically (RENAME_NOREPLACE on
+ * first issuance, RENAME_EXCHANGE on renewal). Without seeding, a second
+ * keytype's commit would swap in a dir holding ONLY its own pair and destroy
+ * the first keytype's cert. Seeding makes staging start as a copy (by hardlink,
+ * so no data is rewritten) of the live dir; the caller then overwrites just the
+ * two (or four, certbot) files for THIS keytype, leaving the other keytype's
+ * files intact. Single-global-order serialization (order != NULL gate) means no
+ * concurrent staging races this.
+ *
+ * CRITICAL: we MUST NOT seed the files THIS keytype is about to (over)write.
+ * Seeding hardlinks the live inode into staging; the writer then opens that
+ * staging name with O_TRUNC, which would truncate the SHARED inode — destroying
+ * the live cert before the atomic swap. So skip_kt's four names are excluded;
+ * only the OTHER keytype's files are carried forward (their inodes are never
+ * touched by this order, so the hardlink is safe and the swap preserves them).
+ *
+ * Best-effort: a missing live dir (first ever issuance) or a missing individual
+ * file is fine. linkat is done relative to a freshly-pinned live dir fd
+ * (O_DIRECTORY|O_NOFOLLOW) and the staging fd, so a swapped <dir> component
+ * cannot redirect a link outside the store. A symlinked or non-regular live
+ * file is skipped (we only carry forward real cert files).
+ */
+static void
+ngx_autocert_order_seed_staging_at(ngx_autocert_order_t *order, int cfd,
+    const char *dir, int sfd, ngx_uint_t skip_kt)
+{
+    int           lfd, i;
+    struct stat   st;
+    const char   *name;
+    const char   *sp, *sc, *sl, *sr;
+
+    /* This keytype's own names — excluded from seeding (see CRITICAL above). */
+    ngx_autocert_keytype_pem_names(skip_kt, &sp, &sc, &sl, &sr);
+
+    lfd = openat(cfd, dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (lfd == -1) {
+        /* No live dir yet (first issuance), or it is not a real dir — nothing
+         * to carry forward. A non-dir live entry is handled by the commit. */
+        return;
+    }
+
+    for (i = 0; (name = ngx_autocert_store_files[i]) != NULL; i++) {
+
+        if (ngx_strcmp(name, sp) == 0 || ngx_strcmp(name, sc) == 0
+            || ngx_strcmp(name, sl) == 0 || ngx_strcmp(name, sr) == 0)
+        {
+            continue;                   /* this keytype overwrites it; never seed */
+        }
+
+        /* Only hardlink real, regular files; skip symlinks/dirs/specials so a
+         * planted non-regular entry can't be carried into staging. */
+        if (fstatat(lfd, name, &st, AT_SYMLINK_NOFOLLOW) == -1
+            || !S_ISREG(st.st_mode))
+        {
+            continue;
+        }
+
+        if (linkat(lfd, name, sfd, name, 0) == -1 && ngx_errno != NGX_EEXIST) {
+            /* Cross-device or other failure: log and continue. Worst case the
+             * other keytype's file is absent from staging and will be re-issued
+             * by its own renewal cycle; we never lose the live copy here. */
+            ngx_log_error(NGX_LOG_WARN, order->log, ngx_errno,
+                          "autocert: seed staging linkat(\"%s\") failed", name);
+        }
+    }
+
+    (void) close(lfd);
 }
 
 

@@ -117,6 +117,9 @@ typedef struct {
     ngx_str_t    email;             /* account contact (1st enabled vhost), "" */
     time_t       renew_before;      /* seconds before notAfter to renew */
     ngx_uint_t   key_type;          /* ngx_http_autocert_key_type_e */
+    ngx_array_t *key_types;         /* ngx_uint_t list (dual-cert, Phase B);
+                                       key_type above == key_types[0] for the
+                                       not-yet-array-aware consumers. */
     ngx_uint_t   store;             /* ngx_http_autocert_store_e */
     ngx_str_t    path;              /* cert store directory */
     ngx_uint_t   challenge;         /* ngx_http_autocert_challenge_e */

@@ -172,7 +172,7 @@ static ngx_command_t  ngx_http_autocert_commands[] = {
       NULL },
 
     { ngx_string("autocert_key_type"),
-      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+      NGX_HTTP_MAIN_CONF|NGX_CONF_1MORE,
       ngx_http_autocert_key_type,
       NGX_HTTP_MAIN_CONF_OFFSET,
       0,
@@ -413,6 +413,7 @@ ngx_http_autocert_create_main_conf(ngx_conf_t *cf)
      * which the worker-0 driver iterates per CA (M5). No flat amcf->ca_conf. */
     amcf->renew_before = NGX_CONF_UNSET;
     amcf->key_type = NGX_CONF_UNSET_UINT;
+    amcf->key_types = NGX_CONF_UNSET_PTR;
     amcf->store = NGX_CONF_UNSET_UINT;
     amcf->challenge = NGX_CONF_UNSET_UINT;
 
@@ -444,7 +445,20 @@ ngx_http_autocert_init_main_conf(ngx_conf_t *cf, void *conf)
     /* User spec: 7d default (industry-safer 30d noted but honoring request). */
     ngx_conf_init_value(amcf->renew_before, 7 * 24 * 60 * 60);
 
-    ngx_conf_init_uint_value(amcf->key_type, NGX_HTTP_AUTOCERT_KEY_P384);
+    if (amcf->key_types == NGX_CONF_UNSET_PTR) {
+        ngx_uint_t  *kt;
+
+        amcf->key_types = ngx_array_create(cf->pool, 1, sizeof(ngx_uint_t));
+        if (amcf->key_types == NULL) {
+            return NGX_CONF_ERROR;
+        }
+        kt = ngx_array_push(amcf->key_types);
+        if (kt == NULL) {
+            return NGX_CONF_ERROR;
+        }
+        *kt = NGX_HTTP_AUTOCERT_KEY_P384;
+    }
+    amcf->key_type = *(ngx_uint_t *) amcf->key_types->elts;   /* element 0 */
     ngx_conf_init_uint_value(amcf->store, NGX_HTTP_AUTOCERT_STORE_SECURE);
     ngx_conf_init_uint_value(amcf->challenge,
                              NGX_HTTP_AUTOCERT_CHALLENGE_HTTP_01);
@@ -1698,57 +1712,116 @@ ngx_http_autocert_contact(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 }
 
 
+static ngx_int_t
+ngx_http_autocert_map_key_type(ngx_str_t *s, ngx_uint_t *out)
+{
+    if (ngx_strcasecmp(s->data, (u_char *) "secp384r1") == 0
+        || ngx_strcasecmp(s->data, (u_char *) "p384") == 0
+        || ngx_strcasecmp(s->data, (u_char *) "p-384") == 0
+        || ngx_strcasecmp(s->data, (u_char *) "ecdsa-p384") == 0)
+    {
+        *out = NGX_HTTP_AUTOCERT_KEY_P384;  return NGX_OK;
+    }
+    if (ngx_strcasecmp(s->data, (u_char *) "secp256r1") == 0
+        || ngx_strcasecmp(s->data, (u_char *) "prime256v1") == 0
+        || ngx_strcasecmp(s->data, (u_char *) "p256") == 0
+        || ngx_strcasecmp(s->data, (u_char *) "p-256") == 0
+        || ngx_strcasecmp(s->data, (u_char *) "ecdsa-p256") == 0)
+    {
+        *out = NGX_HTTP_AUTOCERT_KEY_P256;  return NGX_OK;
+    }
+    if (ngx_strcasecmp(s->data, (u_char *) "rsa2048") == 0
+        || ngx_strcasecmp(s->data, (u_char *) "rsa-2048") == 0)
+    {
+        *out = NGX_HTTP_AUTOCERT_KEY_RSA2048;  return NGX_OK;
+    }
+    if (ngx_strcasecmp(s->data, (u_char *) "rsa3072") == 0
+        || ngx_strcasecmp(s->data, (u_char *) "rsa-3072") == 0
+        || ngx_strcasecmp(s->data, (u_char *) "rsa") == 0)
+    {
+        *out = NGX_HTTP_AUTOCERT_KEY_RSA3072;  return NGX_OK;
+    }
+    if (ngx_strcasecmp(s->data, (u_char *) "rsa4096") == 0
+        || ngx_strcasecmp(s->data, (u_char *) "rsa-4096") == 0)
+    {
+        *out = NGX_HTTP_AUTOCERT_KEY_RSA4096;  return NGX_OK;
+    }
+    return NGX_ERROR;
+}
+
+static ngx_int_t
+ngx_http_autocert_key_is_rsa(ngx_uint_t kt)
+{
+    return kt == NGX_HTTP_AUTOCERT_KEY_RSA2048
+        || kt == NGX_HTTP_AUTOCERT_KEY_RSA3072
+        || kt == NGX_HTTP_AUTOCERT_KEY_RSA4096;
+}
+
 static char *
 ngx_http_autocert_key_type(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
     ngx_http_autocert_main_conf_t  *amcf = conf;
 
-    ngx_str_t  *value = cf->args->elts;
+    ngx_str_t   *value = cf->args->elts;
+    ngx_uint_t  *kt, kv, i, j;
+    ngx_uint_t   have_ec = 0, have_rsa = 0;
 
-    if (amcf->key_type != NGX_CONF_UNSET_UINT) {
+    if (amcf->key_types != NGX_CONF_UNSET_PTR) {
         return "is duplicate";
     }
 
-    /* Accept friendly aliases alongside the OpenSSL curve names: operators
-     * think "P-384"/"P-256", not "secp384r1"/"secp256r1". */
-    if (ngx_strcasecmp(value[1].data, (u_char *) "secp384r1") == 0
-        || ngx_strcasecmp(value[1].data, (u_char *) "p384") == 0
-        || ngx_strcasecmp(value[1].data, (u_char *) "p-384") == 0
-        || ngx_strcasecmp(value[1].data, (u_char *) "ecdsa-p384") == 0)
-    {
-        amcf->key_type = NGX_HTTP_AUTOCERT_KEY_P384;
+    if (cf->args->nelts - 1 > 4) {
+        return "accepts at most 4 key types";
+    }
 
-    } else if (ngx_strcasecmp(value[1].data, (u_char *) "secp256r1") == 0
-               || ngx_strcasecmp(value[1].data, (u_char *) "prime256v1") == 0
-               || ngx_strcasecmp(value[1].data, (u_char *) "p256") == 0
-               || ngx_strcasecmp(value[1].data, (u_char *) "p-256") == 0
-               || ngx_strcasecmp(value[1].data, (u_char *) "ecdsa-p256") == 0)
-    {
-        amcf->key_type = NGX_HTTP_AUTOCERT_KEY_P256;
-
-    } else if (ngx_strcasecmp(value[1].data, (u_char *) "rsa2048") == 0
-               || ngx_strcasecmp(value[1].data, (u_char *) "rsa-2048") == 0)
-    {
-        amcf->key_type = NGX_HTTP_AUTOCERT_KEY_RSA2048;
-
-    } else if (ngx_strcasecmp(value[1].data, (u_char *) "rsa3072") == 0
-               || ngx_strcasecmp(value[1].data, (u_char *) "rsa-3072") == 0
-               || ngx_strcasecmp(value[1].data, (u_char *) "rsa") == 0)
-    {
-        amcf->key_type = NGX_HTTP_AUTOCERT_KEY_RSA3072;
-
-    } else if (ngx_strcasecmp(value[1].data, (u_char *) "rsa4096") == 0
-               || ngx_strcasecmp(value[1].data, (u_char *) "rsa-4096") == 0)
-    {
-        amcf->key_type = NGX_HTTP_AUTOCERT_KEY_RSA4096;
-
-    } else {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                           "invalid key type \"%V\" in \"autocert_key_type\", "
-                           "expected p256, p384, rsa2048, rsa3072 (rsa) or rsa4096",
-                           &value[1]);
+    amcf->key_types = ngx_array_create(cf->pool, cf->args->nelts - 1,
+                                       sizeof(ngx_uint_t));
+    if (amcf->key_types == NULL) {
         return NGX_CONF_ERROR;
     }
+
+    for (i = 1; i < cf->args->nelts; i++) {
+        if (ngx_http_autocert_map_key_type(&value[i], &kv) != NGX_OK) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "invalid key type \"%V\" in \"autocert_key_type\", "
+                               "expected p256, p384, rsa2048, rsa3072 (rsa) "
+                               "or rsa4096", &value[i]);
+            return NGX_CONF_ERROR;
+        }
+
+        kt = amcf->key_types->elts;
+        for (j = 0; j < amcf->key_types->nelts; j++) {
+            if (kt[j] == kv) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "duplicate key type \"%V\" in "
+                                   "\"autocert_key_type\"", &value[i]);
+                return NGX_CONF_ERROR;
+            }
+        }
+
+        if (ngx_http_autocert_key_is_rsa(kv)) {
+            if (have_rsa) {
+                return "lists more than one RSA key type "
+                       "(at most one RSA + one ECDSA allowed)";
+            }
+            have_rsa = 1;
+        } else {
+            if (have_ec) {
+                return "lists more than one ECDSA key type "
+                       "(at most one RSA + one ECDSA allowed)";
+            }
+            have_ec = 1;
+        }
+
+        kt = ngx_array_push(amcf->key_types);
+        if (kt == NULL) {
+            return NGX_CONF_ERROR;
+        }
+        *kt = kv;
+    }
+
+    /* keep the scalar in sync for the not-yet-array-aware consumers */
+    amcf->key_type = *(ngx_uint_t *) amcf->key_types->elts;
 
     return NGX_CONF_OK;
 }
