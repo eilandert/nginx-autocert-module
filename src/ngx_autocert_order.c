@@ -1354,6 +1354,13 @@ ngx_autocert_order_finalize(ngx_autocert_order_t *order)
      * (P256,P384,RSA2048,RSA3072,RSA4096) — map 1:1 by value. */
     curve = (ngx_uint_t) order->key_type;
 
+    /* A ready->re-finalize cycle (finalize-400 recovery) re-enters here; free
+     * the prior key handle first so it does not leak in the long-lived worker. */
+    if (order->cert_key != NULL) {
+        ngx_http_autocert_key_free(order->cert_key);
+        order->cert_key = NULL;
+    }
+
     order->cert_key = ngx_http_autocert_key_generate(curve);
     if (order->cert_key == NULL) {
         ngx_log_error(NGX_LOG_ERR, order->log, 0,
@@ -2470,9 +2477,19 @@ ngx_autocert_order_seed_staging_at(ngx_autocert_order_t *order, int cfd,
 
     lfd = openat(cfd, dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (lfd == -1) {
-        /* No live dir yet (first issuance), or it is not a real dir — nothing
-         * to carry forward. A non-dir live entry is handled by the commit. */
-        return NGX_OK;
+        /* No live dir yet (first issuance) or it is not a real dir — nothing to
+         * carry forward; the commit handles a non-dir live entry. ONLY ENOENT/
+         * ENOTDIR mean "absent". Any other errno (EACCES, EMFILE, EINTR, …) is a
+         * real failure: swallowing it would seed nothing, then the whole-<seg>
+         * swap would publish a dir missing the OTHER keytype and cleanup would
+         * destroy its only copy. Fail the seed so the caller aborts the store. */
+        if (ngx_errno == NGX_ENOENT || ngx_errno == NGX_ENOTDIR) {
+            return NGX_OK;
+        }
+        ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
+                      "autocert: seed staging openat(\"%s\") failed; aborting "
+                      "store to preserve the other keytype's live cert", dir);
+        return NGX_ERROR;
     }
 
     for (i = 0; (name = ngx_autocert_store_files[i]) != NULL; i++) {
@@ -2485,9 +2502,18 @@ ngx_autocert_order_seed_staging_at(ngx_autocert_order_t *order, int cfd,
 
         /* Only hardlink real, regular files; skip symlinks/dirs/specials so a
          * planted non-regular entry can't be carried into staging. A missing
-         * file (ENOENT) is fine — the other keytype simply has not issued it. */
+         * file (ENOENT) is fine — the other keytype simply has not issued it.
+         * Any other fstatat errno is a real failure on a possibly-PRESENT file:
+         * continuing would silently drop it from staging, so fail the seed. */
         if (fstatat(lfd, name, &st, AT_SYMLINK_NOFOLLOW) == -1) {
-            continue;
+            if (ngx_errno == NGX_ENOENT) {
+                continue;
+            }
+            ngx_log_error(NGX_LOG_ERR, order->log, ngx_errno,
+                          "autocert: seed staging fstatat(\"%s\") failed; "
+                          "aborting store to preserve the live cert", name);
+            (void) close(lfd);
+            return NGX_ERROR;
         }
         if (!S_ISREG(st.st_mode)) {
             continue;

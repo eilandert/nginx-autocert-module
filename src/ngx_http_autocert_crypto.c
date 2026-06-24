@@ -94,6 +94,19 @@ ngx_http_autocert_curve_of(EVP_PKEY *pkey)
 }
 
 
+/* Public: EC curve display name of a key ("P-256"/"P-384"), or NULL for a
+ * non-EC / unsupported-curve key. Used by the account loader to enforce the
+ * "account key stays P-384" invariant (L1). */
+const char *
+ngx_http_autocert_key_curve_name(EVP_PKEY *pkey)
+{
+    const ngx_http_autocert_curve_t  *c;
+
+    c = ngx_http_autocert_curve_of(pkey);
+    return (c != NULL) ? c->jwk_crv : NULL;
+}
+
+
 /*
  * Signing digest for a key. EC keys use the curve table (P-256 -> SHA-256,
  * P-384 -> SHA-384). RSA keys fall through to the bits heuristic: RSA key
@@ -1103,7 +1116,8 @@ ngx_autocert_timegm(const struct tm *tm)
  * for (e.g. a pre-dual-cert RSA leaf sitting under the flat EC filename).
  */
 ngx_int_t
-ngx_http_autocert_cert_not_after(const char *path, time_t *out, int *key_id)
+ngx_http_autocert_cert_not_after(const char *path, time_t *out, int *key_id,
+    const ngx_str_t *verify_name)
 {
     int         fd;
     BIO        *bio;
@@ -1133,6 +1147,25 @@ ngx_http_autocert_cert_not_after(const char *path, time_t *out, int *key_id)
     BIO_free(bio);
     if (leaf == NULL) {
         return NGX_ERROR;
+    }
+
+    /*
+     * Identity check (M2): the freshness path selects the file by name+keytype,
+     * but a wrong-domain leaf with the right key family and an unexpired notAfter
+     * would otherwise read as fresh while serve.c's X509_check_host rejects it —
+     * wedging the vhost with no working cert until expiry. When the caller passes
+     * a verify_name, require the stored leaf to actually cover it; a mismatch is
+     * reported as NGX_ABORT so the caller reissues (distinct from "no cert" so it
+     * can be logged accurately). For a wildcard name the caller passes a concrete
+     * probe label under the wildcard, so default X509_check_host wildcard
+     * matching answers "does this leaf cover the wildcard".
+     */
+    if (verify_name != NULL && verify_name->len != 0
+        && X509_check_host(leaf, (char *) verify_name->data, verify_name->len,
+                           0, NULL) != 1)
+    {
+        X509_free(leaf);
+        return NGX_ABORT;
     }
 
     ngx_memzero(&tm, sizeof(struct tm));

@@ -1076,7 +1076,9 @@ ngx_autocert_name_due(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
     ngx_uint_t  certbot;
     ngx_str_t   seg;
     ngx_str_t   chain;
+    ngx_str_t   verify, *verifyp;
     u_char      seg_buf[NGX_AUTOCERT_DOMAIN_SEG_MAX];
+    u_char      verify_buf[256];
 
     /* Per-keytype fullchain leaf name: EC keeps the legacy flat name, RSA gets
      * the .rsa. variant — must match the store writer (order.c). */
@@ -1153,6 +1155,29 @@ ngx_autocert_name_due(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
     p = ngx_cpymem(p, chain.data, chain.len);
     *p = '\0';
 
+    /*
+     * Identity probe for the freshness SAN check (M2). serve.c rejects a stored
+     * leaf that does not cover the requested name; the scheduler must use the
+     * same criterion or a wrong-domain (but right-family, unexpired) cert reads
+     * as fresh and the vhost wedges. For a wildcard "*.rest" we cannot ask
+     * X509_check_host about the wildcard literal, so probe with a concrete
+     * sub-label "x.rest" — default wildcard matching then answers whether the
+     * leaf's "*.rest" SAN covers it. Oversized names skip the check (verifyp
+     * NULL): they are already rejected as unsafe segments above.
+     */
+    verifyp = NULL;
+    if (name->len < sizeof(verify_buf)) {
+        if (name->len > 2 && name->data[0] == '*' && name->data[1] == '.') {
+            verify.data = verify_buf;
+            verify_buf[0] = 'x';
+            ngx_memcpy(verify_buf + 1, name->data + 1, name->len - 1);
+            verify.len = name->len;     /* '*' -> 'x', same length */
+        } else {
+            verify = *name;
+        }
+        verifyp = &verify;
+    }
+
     {
         int  stored_id = EVP_PKEY_NONE;
         int  want_id = (key_type == NGX_HTTP_AUTOCERT_KEY_RSA2048
@@ -1161,13 +1186,19 @@ ngx_autocert_name_due(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
                            ? EVP_PKEY_RSA : EVP_PKEY_EC;
 
         rc = ngx_http_autocert_cert_not_after((char *) path, &not_after,
-                                              &stored_id);
+                                              &stored_id, verifyp);
 
         if (rc == NGX_DECLINED) {
             ngx_log_debug1(NGX_LOG_DEBUG_CORE, cycle->log, 0,
                            "autocert: name \"%V\" due because no cert is stored",
                            name);
             return 1;                   /* no cert yet -> issue */
+        }
+        if (rc == NGX_ABORT) {
+            ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
+                          "autocert: \"%V\" stored cert does not cover this name "
+                          "(wrong-domain leaf); reissuing", name);
+            return 1;                   /* identity mismatch -> reissue */
         }
         if (rc != NGX_OK) {
             ngx_log_error(NGX_LOG_WARN, cycle->log, 0,

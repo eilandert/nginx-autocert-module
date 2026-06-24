@@ -1,8 +1,9 @@
 /*
  * Unit tests for the crypto TU's certificate-expiry helpers (M8 renewal):
- *   - ngx_http_autocert_cert_not_after(path, &out, &key_id) — read a leaf PEM's notAfter
- *     as a Unix epoch; ENOENT/ENOTDIR -> NGX_DECLINED, a symlinked path ->
- *     NGX_ERROR (O_NOFOLLOW), other failures -> NGX_ERROR.
+ *   - ngx_http_autocert_cert_not_after(path, &out, &key_id, verify_name) — read a
+ *     leaf PEM's notAfter as a Unix epoch; ENOENT/ENOTDIR -> NGX_DECLINED, a
+ *     symlinked path -> NGX_ERROR (O_NOFOLLOW), other failures -> NGX_ERROR; a
+ *     non-NULL verify_name the leaf does not cover -> NGX_ABORT (M2).
  *   - ngx_autocert_timegm(struct tm*) — a self-contained, timezone-independent
  *     UTC tm -> time_t, exercised with a leap day and a year past 2038.
  *
@@ -123,7 +124,8 @@ test_cert_not_after(void)
     time_t  out = 0;
     int     key_id = EVP_PKEY_NONE;
 
-    CHECK(ngx_http_autocert_cert_not_after(FIXTURE_PATH, &out, &key_id) == NGX_OK
+    CHECK(ngx_http_autocert_cert_not_after(FIXTURE_PATH, &out, &key_id, NULL)
+              == NGX_OK
           && out == FIXTURE_EPOCH,
           "cert_not_after reads the fixture's exact notAfter epoch");
 
@@ -133,13 +135,39 @@ test_cert_not_after(void)
 
     /* key_id is optional: a NULL pointer must be accepted. */
     out = 0;
-    CHECK(ngx_http_autocert_cert_not_after(FIXTURE_PATH, &out, NULL) == NGX_OK
+    CHECK(ngx_http_autocert_cert_not_after(FIXTURE_PATH, &out, NULL, NULL) == NGX_OK
           && out == FIXTURE_EPOCH,
           "cert_not_after accepts a NULL key_id out-param");
 
+    /* M2 SAN/identity check. The fixture has CN=fixture.example, no SAN;
+     * X509_check_host falls back to the CN. A matching verify_name passes; a
+     * wrong name returns NGX_ABORT so the scheduler reissues. */
+    {
+        ngx_str_t  good = ngx_string("fixture.example");
+        ngx_str_t  bad  = ngx_string("wrong.example");
+        ngx_str_t  empty = ngx_null_string;
+
+        out = 0;
+        CHECK(ngx_http_autocert_cert_not_after(FIXTURE_PATH, &out, NULL, &good)
+                  == NGX_OK
+              && out == FIXTURE_EPOCH,
+              "cert_not_after accepts a leaf that covers verify_name");
+
+        out = 0;
+        CHECK(ngx_http_autocert_cert_not_after(FIXTURE_PATH, &out, NULL, &bad)
+                  == NGX_ABORT,
+              "cert_not_after returns NGX_ABORT for a wrong-domain leaf");
+
+        /* An empty verify_name is treated as "no check". */
+        out = 0;
+        CHECK(ngx_http_autocert_cert_not_after(FIXTURE_PATH, &out, NULL, &empty)
+                  == NGX_OK,
+              "cert_not_after skips the identity check for an empty verify_name");
+    }
+
     /* Missing file -> NGX_DECLINED (no cert stored yet). */
     out = 0;
-    CHECK(ngx_http_autocert_cert_not_after("tests/unit/does-not-exist.pem", &out, NULL)
+    CHECK(ngx_http_autocert_cert_not_after("tests/unit/does-not-exist.pem", &out, NULL, NULL)
               == NGX_DECLINED,
           "cert_not_after missing file -> NGX_DECLINED");
 
@@ -156,7 +184,7 @@ test_cert_not_after(void)
                 && symlink(abs_target, link) == 0)
             {
                 out = 0;
-                CHECK(ngx_http_autocert_cert_not_after(link, &out, NULL) == NGX_ERROR,
+                CHECK(ngx_http_autocert_cert_not_after(link, &out, NULL, NULL) == NGX_ERROR,
                       "cert_not_after refuses to follow a symlink (O_NOFOLLOW)");
                 unlink(link);
             } else {

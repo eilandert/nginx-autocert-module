@@ -1141,6 +1141,30 @@ jobs:
           script: mock-order-poll-retry.sh
           sudo: "true"
 
+  mock-freshness-wrong-domain:
+    name: wrong-domain stored leaf -> reissue (M2, mock CA) [${{ matrix.flavor }}]
+    needs: [resolve, build-nginx, build-angie]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: nginx
+            dir: ${{ needs.resolve.outputs.nginx_dir }}
+          - flavor: angie
+            dir: ${{ needs.resolve.outputs.angie_dir }}
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: A wrong-domain stored leaf must read as due and be reissued
+        uses: ./.github/actions/run-e2e
+        with:
+          flavor: ${{ matrix.flavor }}
+          dir: ${{ matrix.dir }}
+          script: mock-freshness-wrong-domain.sh
+          sudo: "true"
+
   store-certbot:
     name: certbot store layout (live/<domain>/4 files) [${{ matrix.flavor }}]
     needs: [resolve, build-nginx, build-angie]
