@@ -249,6 +249,7 @@ ngx_autocert_order_start(ngx_autocert_order_t *order)
     order->poll_tries = 0;
     order->order_poll_tries = 0;
     order->finalize_retried = 0;
+    order->download_retried = 0;
     order->retry_after = 0;
     ngx_str_null(&order->order_url);
     ngx_str_null(&order->finalize_url);
@@ -1752,6 +1753,41 @@ ngx_autocert_order_download_done(ngx_autocert_acme_request_t *req, ngx_int_t rc)
                    "body:%uz", rc, req->status, req->body_out.len);
 
     if (rc != NGX_OK || req->status != 200 || req->body_out.len == 0) {
+        /*
+         * A transient download failure is recoverable: the cert URL stays valid
+         * (the order is already "valid"), so a single nonce hiccup -- e.g. a
+         * second badNonce landing on the account layer's one-shot retry, which
+         * surfaces here as a terminal 4xx -- or a brief CA blip should not throw
+         * away a fully issued order. Re-poll the order once: poll_order_done sees
+         * "valid" and re-drives the download with a fresh nonce. A 200 with an
+         * empty/garbage body, or a second failure, stays terminal (the flag also
+         * gates against a CA that keeps failing the download forever).
+         */
+        if (!order->download_retried
+            && (rc != NGX_OK || (req->status >= 400 && req->status != 404)))
+        {
+            order->download_retried = 1;
+            ngx_log_error(NGX_LOG_WARN, order->log, 0,
+                          "autocert: certificate download got status %ui for "
+                          "\"%V\"; re-polling order, then retrying once",
+                          req->status, &order->domain);
+            ngx_destroy_pool(req->pool);
+
+            /* The order poll counter is shared with the finalize->valid poll
+             * that already ran; reset it so the recovery gets the full poll
+             * budget (an order that reached valid on the last allowed try would
+             * otherwise time out on the very first recovery poll). */
+            order->order_poll_tries = 0;
+
+            ngx_memzero(&order->order_timer, sizeof(ngx_event_t));
+            order->order_timer.handler = ngx_autocert_order_poll_order_timer;
+            order->order_timer.data = order;
+            order->order_timer.log = order->log;
+            order->order_timer.cancelable = 1;   /* don't pin exiting worker 0 */
+            ngx_add_timer(&order->order_timer, NGX_AUTOCERT_ORDER_FIN_DELAY);
+            return;
+        }
+
         ngx_log_error(NGX_LOG_ERR, order->log, 0,
                       "autocert: certificate download failed, status %ui",
                       req->status);
