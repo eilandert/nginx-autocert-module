@@ -731,7 +731,9 @@ ngx_autocert_order_publish_alpn(ngx_autocert_order_t *order)
         return NGX_ERROR;
     }
 
-    key = ngx_http_autocert_key_generate(order->key_type);
+    /* Ephemeral tls-alpn-01 challenge cert: always EC, independent of the
+     * certificate key type the order will request. */
+    key = ngx_http_autocert_key_generate(NGX_HTTP_AUTOCERT_KEY_P384);
     if (key == NULL) {
         ngx_log_error(NGX_LOG_ERR, order->log, 0,
                       "autocert: tls-alpn-01 challenge key generation failed");
@@ -1345,10 +1347,9 @@ ngx_autocert_order_finalize(ngx_autocert_order_t *order)
         return NGX_ERROR;
     }
 
-    /* key_type enum (P256=0/P384=1) maps 1:1 onto the crypto curve enum. */
-    curve = (order->key_type == NGX_HTTP_AUTOCERT_KEY_P384)
-            ? NGX_HTTP_AUTOCERT_CRYPTO_P384
-            : NGX_HTTP_AUTOCERT_CRYPTO_P256;
+    /* conf key_type enum and crypto curve enum share identical ordering
+     * (P256,P384,RSA2048,RSA3072,RSA4096) — map 1:1 by value. */
+    curve = (ngx_uint_t) order->key_type;
 
     order->cert_key = ngx_http_autocert_key_generate(curve);
     if (order->cert_key == NULL) {

@@ -26,7 +26,10 @@
 /* Curve selector — values match ngx_http_autocert_key_type_e in the module. */
 typedef enum {
     NGX_HTTP_AUTOCERT_CRYPTO_P256 = 0,
-    NGX_HTTP_AUTOCERT_CRYPTO_P384
+    NGX_HTTP_AUTOCERT_CRYPTO_P384,
+    NGX_HTTP_AUTOCERT_CRYPTO_RSA2048,
+    NGX_HTTP_AUTOCERT_CRYPTO_RSA3072,
+    NGX_HTTP_AUTOCERT_CRYPTO_RSA4096
 } ngx_http_autocert_crypto_curve_e;
 
 
