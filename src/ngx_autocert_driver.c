@@ -96,8 +96,11 @@ typedef struct {
     ngx_autocert_account_t      *account;      /* per-CA registered account */
     ngx_pool_t                  *account_pool;
     ngx_uint_t                   account_live;  /* registration succeeded */
-    ngx_autocert_backoff_t      *backoff;      /* per-name, [entry->names->nelts] */
-    ngx_uint_t                   backoff_n;
+    /* Dual-cert: one backoff slot per (name, keytype). Flat array sized
+     * names*backoff_nkt; slot index = name_i*backoff_nkt + kt_i. */
+    ngx_autocert_backoff_t      *backoff;
+    ngx_uint_t                   backoff_n;     /* total slots (names*nkt) */
+    ngx_uint_t                   backoff_nkt;   /* keytypes per name (stride) */
 } ngx_autocert_ca_state_t;
 
 
@@ -684,17 +687,19 @@ ngx_autocert_account_done(ngx_autocert_account_t *acct, ngx_int_t rc)
 static ngx_event_t              ngx_autocert_sched_timer;
 static ngx_uint_t               ngx_autocert_sched_ca;     /* next CA to scan */
 static ngx_uint_t               ngx_autocert_sched_index;  /* next name in that CA */
+static ngx_uint_t               ngx_autocert_sched_kt;     /* next keytype for that name */
 static ngx_uint_t               ngx_autocert_sched_cur_ca; /* CA index in flight */
-static ngx_uint_t               ngx_autocert_sched_cur;    /* name index in flight */
+static ngx_uint_t               ngx_autocert_sched_cur;    /* backoff slot in flight */
 
 static void ngx_autocert_sched_handler(ngx_event_t *ev);
 static void ngx_autocert_sched_pump(ngx_cycle_t *cycle);
 static ngx_int_t ngx_autocert_name_due(ngx_cycle_t *cycle,
-    ngx_autocert_conf_t *acf, ngx_str_t *name);
+    ngx_autocert_conf_t *acf, ngx_str_t *name, ngx_uint_t key_type);
 static ngx_int_t ngx_autocert_start_order_for(ngx_cycle_t *cycle,
-    ngx_autocert_conf_t *acf, ngx_autocert_ca_state_t *state, ngx_str_t *name);
+    ngx_autocert_conf_t *acf, ngx_autocert_ca_state_t *state, ngx_str_t *name,
+    ngx_uint_t key_type);
 static ngx_int_t ngx_autocert_ca_backoff_ensure(ngx_cycle_t *cycle,
-    ngx_autocert_ca_state_t *state);
+    ngx_autocert_conf_t *acf, ngx_autocert_ca_state_t *state);
 static void ngx_autocert_backoff_record(ngx_autocert_ca_state_t *state,
     ngx_uint_t index, ngx_uint_t success);
 static void ngx_autocert_backoff_hold(ngx_autocert_ca_state_t *state,
@@ -759,6 +764,7 @@ ngx_autocert_sched_handler(ngx_event_t *ev)
                    "autocert: scheduler sweep starting");
     ngx_autocert_sched_ca = 0;
     ngx_autocert_sched_index = 0;
+    ngx_autocert_sched_kt = 0;
     ngx_autocert_sched_pump(cycle);
 }
 
@@ -770,22 +776,33 @@ ngx_autocert_sched_handler(ngx_event_t *ev)
  * NGX_OK with state->backoff valid, or NGX_ERROR (skip this CA this sweep).
  */
 static ngx_int_t
-ngx_autocert_ca_backoff_ensure(ngx_cycle_t *cycle,
+ngx_autocert_ca_backoff_ensure(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
     ngx_autocert_ca_state_t *state)
 {
-    ngx_uint_t  n;
+    ngx_uint_t  names, nkt, n;
 
-    n = (state->entry->names != NULL) ? state->entry->names->nelts : 0;
+    names = (state->entry->names != NULL) ? state->entry->names->nelts : 0;
+    nkt = (acf->cert_key_types != NULL) ? acf->cert_key_types->nelts : 1;
 
-    if (n == 0) {
+    if (names == 0 || nkt == 0) {
         return NGX_ERROR;
     }
 
-    if (state->backoff != NULL && state->backoff_n == n) {
+    /* Guard both multiplies against wrap (both operator-controlled). */
+    if (nkt > NGX_MAX_SIZE_T_VALUE / names) {
+        ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
+                      "autocert: implausible name*keytype count");
+        state->backoff_n = 0;
+        return NGX_ERROR;
+    }
+    n = names * nkt;
+
+    if (state->backoff != NULL && state->backoff_n == n
+        && state->backoff_nkt == nkt)
+    {
         return NGX_OK;
     }
 
-    /* Guard the size multiply against wrap (nelts is operator-controlled). */
     if (n > NGX_MAX_SIZE_T_VALUE / sizeof(ngx_autocert_backoff_t)) {
         ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
                       "autocert: implausible server name count");
@@ -800,6 +817,7 @@ ngx_autocert_ca_backoff_ensure(ngx_cycle_t *cycle,
         return NGX_ERROR;
     }
     state->backoff_n = n;
+    state->backoff_nkt = nkt;
     return NGX_OK;
 }
 
@@ -845,10 +863,18 @@ ngx_autocert_sched_pump(ngx_cycle_t *cycle)
         goto rearm;
     }
 
-    /* Outer cursor: CA engine. Inner cursor: name within that CA. */
+    /*
+     * Cursors: CA engine -> name within that CA -> keytype for that name. Each
+     * (name, keytype) issues independently (its own ACME order + own backoff
+     * slot + own on-disk pair), so an EC and an RSA cert for one name renew on
+     * their own clocks. One order in flight across the whole space.
+     */
     for ( ; ngx_autocert_sched_ca < ngx_autocert_ca_states_n;
-         ngx_autocert_sched_ca++, ngx_autocert_sched_index = 0)
+         ngx_autocert_sched_ca++, ngx_autocert_sched_index = 0,
+         ngx_autocert_sched_kt = 0)
     {
+        ngx_uint_t  *kts, nkt;
+
         state = &ngx_autocert_ca_states[ngx_autocert_sched_ca];
 
         /* A CA whose account never came up is skipped (its names can't issue). */
@@ -858,42 +884,54 @@ ngx_autocert_sched_pump(ngx_cycle_t *cycle)
         if (state->entry->names == NULL || state->entry->names->nelts == 0) {
             continue;
         }
-        if (ngx_autocert_ca_backoff_ensure(cycle, state) != NGX_OK) {
+        if (ngx_autocert_ca_backoff_ensure(cycle, &acf, state) != NGX_OK) {
             continue;
         }
 
         names = state->entry->names->elts;
+        kts = acf.cert_key_types->elts;
+        nkt = state->backoff_nkt;       /* == acf.cert_key_types->nelts */
 
         while (ngx_autocert_sched_index < state->entry->names->nelts) {
-            ngx_uint_t  i = ngx_autocert_sched_index++;
+            ngx_uint_t  i = ngx_autocert_sched_index;
 
             name = &names[i];
 
-            /* Honour the per-name failure backoff before any disk/clock check. */
-            if (state->backoff[i].next_eligible > ngx_time()) {
-                ngx_log_debug2(NGX_LOG_DEBUG_CORE, cycle->log, 0,
-                               "autocert: name \"%V\" held by backoff until %T",
-                               name, state->backoff[i].next_eligible);
-                continue;
+            while (ngx_autocert_sched_kt < nkt) {
+                ngx_uint_t  k = ngx_autocert_sched_kt++;
+                ngx_uint_t  key_type = kts[k];
+                ngx_uint_t  slot = i * nkt + k;
+
+                /* Per-(name,keytype) failure backoff before any disk/clock check. */
+                if (state->backoff[slot].next_eligible > ngx_time()) {
+                    ngx_log_debug2(NGX_LOG_DEBUG_CORE, cycle->log, 0,
+                                   "autocert: name \"%V\" held by backoff until %T",
+                                   name, state->backoff[slot].next_eligible);
+                    continue;
+                }
+
+                if (!ngx_autocert_name_due(cycle, &acf, name, key_type)) {
+                    ngx_log_debug1(NGX_LOG_DEBUG_CORE, cycle->log, 0,
+                                   "autocert: name \"%V\" not due", name);
+                    continue;
+                }
+
+                ngx_autocert_sched_cur_ca = ngx_autocert_sched_ca;
+                ngx_autocert_sched_cur = slot;  /* (CA, name, keytype) in flight */
+
+                if (ngx_autocert_start_order_for(cycle, &acf, state, name,
+                                                 key_type) == NGX_OK)
+                {
+                    return;             /* order_complete will pump again */
+                }
+                /* Launch failed (transient: pool/OOM) — treat as a failure for
+                 * the backoff so we don't spin on it, then try the next variant. */
+                ngx_autocert_backoff_record(state, slot, 0);
             }
 
-            if (!ngx_autocert_name_due(cycle, &acf, name)) {
-                ngx_log_debug1(NGX_LOG_DEBUG_CORE, cycle->log, 0,
-                               "autocert: name \"%V\" not due", name);
-                continue;
-            }
-
-            ngx_autocert_sched_cur_ca = ngx_autocert_sched_ca;
-            ngx_autocert_sched_cur = i;     /* (CA, name) in flight */
-
-            if (ngx_autocert_start_order_for(cycle, &acf, state, name)
-                == NGX_OK)
-            {
-                return;                 /* order_complete will pump again */
-            }
-            /* Launch failed (transient: pool/OOM) — treat as a failure for the
-             * backoff so we don't spin on it, then try the next name. */
-            ngx_autocert_backoff_record(state, i, 0);
+            /* This name's keytypes are exhausted; advance to the next name. */
+            ngx_autocert_sched_index++;
+            ngx_autocert_sched_kt = 0;
         }
     }
 
@@ -1028,7 +1066,7 @@ ngx_autocert_backoff_hold(ngx_autocert_ca_state_t *state, ngx_uint_t index,
  */
 static ngx_int_t
 ngx_autocert_name_due(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
-    ngx_str_t *name)
+    ngx_str_t *name, ngx_uint_t key_type)
 {
     u_char      path[NGX_MAX_PATH];
     u_char     *p;
@@ -1037,7 +1075,18 @@ ngx_autocert_name_due(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
     ngx_int_t   rc;
     ngx_uint_t  certbot;
     ngx_str_t   seg;
+    ngx_str_t   chain;
     u_char      seg_buf[NGX_AUTOCERT_DOMAIN_SEG_MAX];
+
+    /* Per-keytype fullchain leaf name: EC keeps the legacy flat name, RSA gets
+     * the .rsa. variant — must match the store writer (order.c). */
+    ngx_str_set(&chain, "/fullchain.pem");
+    if (key_type == NGX_HTTP_AUTOCERT_KEY_RSA2048
+        || key_type == NGX_HTTP_AUTOCERT_KEY_RSA3072
+        || key_type == NGX_HTTP_AUTOCERT_KEY_RSA4096)
+    {
+        ngx_str_set(&chain, "/fullchain.rsa.pem");
+    }
 
     if (acf->path.len == 0) {
         ngx_log_debug1(NGX_LOG_DEBUG_CORE, cycle->log, 0,
@@ -1088,7 +1137,7 @@ ngx_autocert_name_due(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
     }
 
     base = acf->path.len + (certbot ? sizeof("/live") - 1 : 0)
-           + 1 + seg.len + sizeof("/fullchain.pem");
+           + 1 + seg.len + chain.len + 1 /* NUL */;
     if (base > NGX_MAX_PATH) {
         ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
                       "autocert: store path too long for \"%V\"", name);
@@ -1101,7 +1150,8 @@ ngx_autocert_name_due(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
     }
     *p++ = '/';
     p = ngx_cpymem(p, seg.data, seg.len);
-    ngx_memcpy(p, "/fullchain.pem", sizeof("/fullchain.pem"));
+    p = ngx_cpymem(p, chain.data, chain.len);
+    *p = '\0';
 
     rc = ngx_http_autocert_cert_not_after((char *) path, &not_after);
 
@@ -1142,7 +1192,7 @@ ngx_autocert_name_due(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
  */
 static ngx_int_t
 ngx_autocert_start_order_for(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
-    ngx_autocert_ca_state_t *state, ngx_str_t *name)
+    ngx_autocert_ca_state_t *state, ngx_str_t *name, ngx_uint_t key_type)
 {
     ngx_pool_t            *pool;
     ngx_autocert_order_t  *order;
@@ -1175,7 +1225,7 @@ ngx_autocert_start_order_for(ngx_cycle_t *cycle, ngx_autocert_conf_t *acf,
     order->dns_hook_remove = acf->dns_hook_remove;
     order->dns_propagation_delay = acf->dns_propagation_delay;
     order->dns_hook_timeout = acf->dns_hook_timeout;
-    order->key_type = acf->key_type;
+    order->key_type = key_type;     /* dual-cert: this variant's leaf key type */
     order->store = acf->store;
     order->store_path = acf->path;
     order->handler = ngx_autocert_order_complete;
