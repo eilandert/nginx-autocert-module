@@ -97,15 +97,26 @@ echo "== reject: variable ssl_certificate + autocert on =="
 expect_reject "$PREFIX/conf/neg-var-cert.conf" 'variable .*ssl_certificate'
 
 # helper: subject CN served for a given SNI ("" = no SNI)
+#
+# s_client's exit code is unreliable here: with an empty request body the server
+# may close the connection without a TLS close_notify, so s_client reports
+# "unexpected eof while reading" (rc=1) even though the handshake completed and
+# the peer certificate was received in full. Under `set -euo pipefail` that
+# nonzero exit would abort the script mid-test. We only care about the served
+# leaf, so capture s_client's output tolerantly (|| true) and let the downstream
+# `openssl x509` decide success by whether it parsed a certificate.
 served_subject() {
-    local sni_arg=()
+    local sni_arg=() out
     [ -n "$1" ] && sni_arg=(-servername "$1")
-    echo | openssl s_client -connect "127.0.0.1:$PORT" "${sni_arg[@]}" 2>/dev/null \
-        | openssl x509 -noout -subject 2>/dev/null
+    out=$(echo | openssl s_client -connect "127.0.0.1:$PORT" "${sni_arg[@]}" \
+              2>/dev/null || true)
+    printf '%s\n' "$out" | openssl x509 -noout -subject 2>/dev/null || true
 }
 served_serial() {
-    echo | openssl s_client -connect "127.0.0.1:$PORT" -servername "$1" 2>/dev/null \
-        | openssl x509 -noout -serial 2>/dev/null
+    local out
+    out=$(echo | openssl s_client -connect "127.0.0.1:$PORT" -servername "$1" \
+              2>/dev/null || true)
+    printf '%s\n' "$out" | openssl x509 -noout -serial 2>/dev/null || true
 }
 
 echo "== start (no cert on disk yet) =="

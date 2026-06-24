@@ -74,11 +74,14 @@ echo "== config test =="
 # Served leaf's public-key algorithm for a given client constraint.
 # $1 = SNI ; $2.. = extra openssl s_client args (e.g. -sigalgs ...)
 served_algo() {
-    local sni="$1"; shift
-    echo | openssl s_client -connect "127.0.0.1:$PORT" -servername "$sni" \
-            -tls1_2 "$@" 2>/dev/null \
-        | openssl x509 -noout -text 2>/dev/null \
-        | grep -i 'Public Key Algorithm' | head -1
+    local sni="$1" out; shift
+    # s_client may exit nonzero on a missing close_notify even after a complete
+    # handshake; capture tolerantly so `set -euo pipefail` can't abort the test,
+    # and let the parse below decide success. A no-match grep is fine (-> empty).
+    out=$(echo | openssl s_client -connect "127.0.0.1:$PORT" -servername "$sni" \
+                  -tls1_2 "$@" 2>/dev/null || true)
+    printf '%s\n' "$out" | openssl x509 -noout -text 2>/dev/null \
+        | { grep -i 'Public Key Algorithm' || true; } | head -1
 }
 
 echo "== start with BOTH EC and RSA pairs on disk =="
@@ -106,8 +109,9 @@ echo "$rsa_algo" | grep -qi 'rsaEncryption' \
 echo "✓ RSA-only client served the RSA certificate"
 
 # Unconstrained client: must get SOME valid leaf for the domain.
-any=$(echo | openssl s_client -connect "127.0.0.1:$PORT" -servername "$DOMAIN" \
-        2>/dev/null | openssl x509 -noout -subject 2>/dev/null)
+any_out=$(echo | openssl s_client -connect "127.0.0.1:$PORT" -servername "$DOMAIN" \
+        2>/dev/null || true)
+any=$(printf '%s\n' "$any_out" | openssl x509 -noout -subject 2>/dev/null || true)
 case "$any" in
     *CN*=*"$DOMAIN") echo "✓ unconstrained client served a valid $DOMAIN leaf ($any)";;
     *) echo "::error::unconstrained client got no valid leaf (got '$any')"; exit 1;;
