@@ -796,7 +796,20 @@ ngx_http_autocert_cert_cb(SSL *ssl_conn, void *arg)
          * a key not matching its cert, so any per-slot failure fails the
          * handshake. The empty chain is set explicitly so a stale ctx
          * intermediate never ships with a fresh leaf.
+         *
+         * Clear the inherited certs first: nginx seeds the listener's SSL_CTX
+         * with a bootstrap self-signed (EC) cert so the socket can come up
+         * pre-issuance, and that cert is inherited onto this SSL. If we install
+         * only an RSA leaf (EC slot empty — e.g. a single `autocert_key_type
+         * rsa3072;` config, or before the EC variant issues), the bootstrap EC
+         * cert would LINGER in the SSL's EC slot and an ECDSA-preferring client
+         * would be handed the bootstrap cert instead of our RSA one. Dropping
+         * all inherited certs here means only the slots we install below are
+         * presented. (SSL_certs_clear is per-SSL; the CTX bootstrap is intact
+         * for the next connection that installs nothing and returns 1.)
          */
+        SSL_certs_clear(ssl_conn);
+
         for (s = 0; s < NGX_AUTOCERT_NSLOTS; s++) {
             ngx_autocert_slot_t  *sl = &cert->slots[s];
 
@@ -817,12 +830,15 @@ ngx_http_autocert_cert_cb(SSL *ssl_conn, void *arg)
         }
 
         if (installed == 0) {
-            /* Slots had a cert but no matching key (mismatch caught at load
-             * leaves cert==NULL, so this is defensive) — fall back. */
-            ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
-                           "autocert: no installable cert for \"%V\", keeping "
-                           "bootstrap cert", &host);
-            return 1;
+            /* Defensive: a slot's cert!=NULL but key==NULL. The loader always
+             * sets cert+key+chain together, so this is unreachable in practice;
+             * but we already cleared the inherited bootstrap cert, so we cannot
+             * return 1 (that would hand the client a certificate-less SSL).
+             * Fail the handshake rather than serve nothing. */
+            ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                          "autocert: no installable cert for \"%V\" after "
+                          "clearing inherited certs", &host);
+            return 0;
         }
     }
 

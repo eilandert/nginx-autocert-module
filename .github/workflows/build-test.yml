@@ -926,6 +926,53 @@ jobs:
           dir: ${{ matrix.dir }}
           script: rsa-issue.sh
 
+  dual-cert-issue:
+    name: Dual-cert issuance (autocert_key_type p384 rsa2048) [${{ matrix.flavor }}]
+    needs: [resolve, build-nginx, build-angie]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: nginx
+            dir: ${{ needs.resolve.outputs.nginx_dir }}
+          - flavor: angie
+            dir: ${{ needs.resolve.outputs.angie_dir }}
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Issue BOTH an EC and an RSA cert for one vhost against Pebble
+        uses: ./.github/actions/run-e2e
+        with:
+          flavor: ${{ matrix.flavor }}
+          dir: ${{ matrix.dir }}
+          script: dual-cert-issue.sh
+          sudo: "true"
+
+  dual-cert-serve:
+    name: Dual-cert serving (EC-only vs RSA-only sigalgs) [${{ matrix.flavor }}]
+    needs: [resolve, build-nginx, build-angie]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: nginx
+            dir: ${{ needs.resolve.outputs.nginx_dir }}
+          - flavor: angie
+            dir: ${{ needs.resolve.outputs.angie_dir }}
+    steps:
+      - name: Checkout module
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Drop EC + RSA pairs, assert OpenSSL serves each by client sigalgs
+        uses: ./.github/actions/run-e2e
+        with:
+          flavor: ${{ matrix.flavor }}
+          dir: ${{ matrix.dir }}
+          script: dual-cert-serve.sh
+
   renewal:
     name: ACME renewal + multi-name issuance (M8) [${{ matrix.flavor }}]
     needs: [resolve, build-nginx, build-angie]
