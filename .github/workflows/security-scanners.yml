@@ -88,7 +88,11 @@ jobs:
 
       - name: flawfinder (security risk scanner, SARIF)
         run: |
-          flawfinder --minlevel=1 --sarif \
+          # SARIF (becomes code-scanning alerts) only at the same level we gate
+          # on (4 = high). Levels 1-3 are Flawfinder lexical heuristics with no
+          # dataflow (overwhelmingly false positives here) — kept in the log
+          # artifact for review, but not surfaced as alerts.
+          flawfinder --minlevel=4 --sarif \
             "$GITHUB_WORKSPACE"/src/*.c > flawfinder.sarif 2>/dev/null || true
           flawfinder --minlevel=1 \
             "$GITHUB_WORKSPACE"/src/*.c 2>&1 | tee flawfinder.log
